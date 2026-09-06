@@ -81,7 +81,9 @@ impl PartialDeleteNode {
     }
 }
 
-impl IntrusiveObject for PartialDeleteNode {
+unsafe impl IntrusiveObject for PartialDeleteNode {
+    type Owner = basics::intrusive_pointer::ErasedIntrusiveOwner;
+
     fn intrusive_ref_counts(&self) -> &IntrusiveRefCounts {
         &self.ref_counts
     }
@@ -133,7 +135,9 @@ impl CastBase {
     }
 }
 
-impl IntrusiveObject for CastBase {
+unsafe impl IntrusiveObject for CastBase {
+    type Owner = basics::intrusive_pointer::ErasedIntrusiveOwner;
+
     fn intrusive_ref_counts(&self) -> &IntrusiveRefCounts {
         &self.ref_counts
     }
@@ -169,7 +173,9 @@ impl CastDerived {
     }
 }
 
-impl IntrusiveObject for CastDerived {
+unsafe impl IntrusiveObject for CastDerived {
+    type Owner = basics::intrusive_pointer::ErasedIntrusiveOwner;
+
     fn intrusive_ref_counts(&self) -> &IntrusiveRefCounts {
         &self.base.ref_counts
     }
@@ -265,7 +271,9 @@ impl StressNode {
     }
 }
 
-impl IntrusiveObject for StressNode {
+unsafe impl IntrusiveObject for StressNode {
+    type Owner = basics::intrusive_pointer::CompactIntrusiveOwner;
+
     fn intrusive_ref_counts(&self) -> &IntrusiveRefCounts {
         &self.ref_counts
     }

@@ -32,6 +32,25 @@ pub struct Book {
     pub domain: Option<Uint256>,
 }
 
+/// A ledger offer together with the immutable quality of the directory that
+/// contains it.  `rippled::BookTip` derives this value from the first page's
+/// key and passes it into `TOffer`; it is deliberately not recalculated from
+/// the offer's remaining amounts after a partial fill.
+#[derive(Debug, Clone)]
+struct BookOffer {
+    sle: STLedgerEntry,
+    quality: Quality,
+}
+
+impl BookOffer {
+    fn from_directory(sle: STLedgerEntry, directory: Uint256) -> Self {
+        Self {
+            sle,
+            quality: Quality::from_value(protocol::quality_from_key(directory)),
+        }
+    }
+}
+
 /// Quality uses XRPL's reversed stored-rate ordering; `>=` means an offer is
 /// at least as favorable to the taker as the requested threshold.
 pub(crate) fn quality_satisfies_threshold(
@@ -458,9 +477,10 @@ pub fn execute_book_step_with_options<V: ApplyView>(
     // ends this step before FlowOfferStream advances to them.
     let mut offers = Vec::with_capacity(raw_offers.len());
     let mut found_tip = false;
-    for offer_sle in raw_offers {
+    for offer in raw_offers {
+        let offer_sle = &offer.sle;
         if found_tip {
-            offers.push(offer_sle);
+            offers.push(offer);
             continue;
         }
         let taker_pays = offer_sle.get_field_amount(sf("sfTakerPays"));
@@ -565,7 +585,7 @@ pub fn execute_book_step_with_options<V: ApplyView>(
             }
         }
         found_tip = true;
-        offers.push(offer_sle);
+        offers.push(offer);
     }
 
     // A BookStep consumes one quality directory per call, as in rippled's
@@ -576,12 +596,7 @@ pub fn execute_book_step_with_options<V: ApplyView>(
     // rippled tries AMM liquidity before the cleaned CLOB tip. The AMM offer
     // establishes the one-quality-per-step boundary just like a real offer.
     // Domain books never use AMM liquidity.
-    let clob_tip = offers.first().map(|offer| {
-        Quality::from_amounts(&Amounts::new(
-            offer.get_field_amount(sf("sfTakerPays")),
-            offer.get_field_amount(sf("sfTakerGets")),
-        ))
-    });
+    let clob_tip = offers.first().map(|offer| offer.quality);
     let amm_generation_quality = amm_target_quality(
         clob_tip,
         quality_threshold,
@@ -678,10 +693,13 @@ pub fn execute_book_step_with_options<V: ApplyView>(
     }
 
     if !stop_before_clob {
-        for offer_sle in offers {
+        for offer in offers {
             if offers_consumed >= MAX_OFFERS_TO_CONSUME || remaining_in.signum() <= 0 {
                 break;
             }
+
+            let offer_quality = offer.quality;
+            let offer_sle = offer.sle;
 
             let offer_owner = offer_sle.get_account_id(sf("sfAccount"));
             let taker_pays = offer_sle.get_field_amount(sf("sfTakerPays"));
@@ -760,15 +778,6 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                 offers_consumed += 1;
                 continue;
             }
-
-            // The Book stores offer fields as TakerPays/TakerGets. In this
-            // strand direction, `Quality::from_amounts` must receive that raw
-            // pair (in=TakerPays, out=TakerGets) so its encoded comparison is
-            // on the same scale as OfferCreate's `Quality{takerAmount.out,
-            // sendMax}` threshold. Swapping them makes the reciprocal quality
-            // and admits offers that are worse than the taker's limit.
-            let offer_quality =
-                Quality::from_amounts(&Amounts::new(taker_pays.clone(), taker_gets.clone()));
 
             // `forEachOffer` stops before invoking the derived callback when
             // the stream advances to a second quality after an offer attempt.
@@ -876,6 +885,7 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                 &remaining_out,
                 &taker_pays,
                 &taker_gets,
+                offer_quality,
                 &owner_funds,
                 tr_in,
                 tr_out,
@@ -1640,12 +1650,7 @@ pub(crate) fn book_quality_upper_bound<V: ApplyView>(
     strand_deliver: Asset,
 ) -> Result<Option<Quality>, ViewError> {
     let clob_offers = get_book_offers(view, book, 1)?;
-    let clob = clob_offers.first().map(|offer| {
-        Quality::from_amounts(&Amounts::new(
-            offer.get_field_amount(sf("sfTakerPays")),
-            offer.get_field_amount(sf("sfTakerGets")),
-        ))
-    });
+    let clob = clob_offers.first().map(|offer| offer.quality);
     let generation_quality = amm_target_quality(
         clob,
         quality_threshold,
@@ -1689,12 +1694,7 @@ pub(crate) fn book_quality_function<V: ApplyView>(
     strand_deliver: Asset,
 ) -> Result<Option<QualityFunction>, ViewError> {
     let clob_offers = get_book_offers(view, book, 1)?;
-    let clob = clob_offers.first().map(|offer| {
-        Quality::from_amounts(&Amounts::new(
-            offer.get_field_amount(sf("sfTakerPays")),
-            offer.get_field_amount(sf("sfTakerGets")),
-        ))
-    });
+    let clob = clob_offers.first().map(|offer| offer.quality);
     let target = amm_target_quality(
         clob,
         quality_threshold,
@@ -1942,7 +1942,7 @@ fn get_book_offers<V: ApplyView>(
     view: &mut V,
     book: &Book,
     max: u32,
-) -> Result<Vec<STLedgerEntry>, ViewError> {
+) -> Result<Vec<BookOffer>, ViewError> {
     let mut offers = Vec::new();
 
     // Offers are stored under their executable TakerPays -> TakerGets book,
@@ -1995,20 +1995,46 @@ fn get_book_offers<V: ApplyView>(
             continue;
         };
 
-        // Read offers from this page's sfIndexes
-        if dir.is_field_present(sf("sfIndexes")) {
-            let indexes = dir.get_field_v256(sf("sfIndexes"));
-            for &offer_key in indexes.value() {
-                if offers.len() >= max as usize {
-                    break;
-                }
-                let offer_keylet =
-                    protocol::Keylet::new(protocol::LedgerEntryType::Offer, offer_key);
-                let offer_sle = view.peek(offer_keylet)?;
-                if let Some(offer_sle) = offer_sle {
-                    offers.push(offer_sle.as_ref().clone());
+        // `dirFirst`/`dirNext` traverse every linked page belonging to this
+        // quality directory. Only the root key is in the book key range, so
+        // using `succ` alone would silently omit overflow pages.
+        let root_keylet =
+            protocol::Keylet::new(protocol::LedgerEntryType::DirectoryNode, next_page);
+        let mut page = 0_u64;
+        let mut visited = std::collections::BTreeSet::new();
+        let mut current_dir = Some(dir);
+        while let Some(dir) = current_dir {
+            if !visited.insert(page) {
+                return Err(ViewError::Conversion(
+                    "Book directory chain contains a cycle".into(),
+                ));
+            }
+            if dir.is_field_present(sf("sfIndexes")) {
+                let indexes = dir.get_field_v256(sf("sfIndexes"));
+                for &offer_key in indexes.value() {
+                    if offers.len() >= max as usize {
+                        break;
+                    }
+                    let offer_keylet =
+                        protocol::Keylet::new(protocol::LedgerEntryType::Offer, offer_key);
+                    if let Some(offer_sle) = view.peek(offer_keylet)? {
+                        offers.push(BookOffer::from_directory(
+                            offer_sle.as_ref().clone(),
+                            next_page,
+                        ));
+                    }
                 }
             }
+
+            if offers.len() >= max as usize {
+                break;
+            }
+            let next = dir.get_field_u64(sf("sfIndexNext"));
+            if next == 0 {
+                break;
+            }
+            page = next;
+            current_dir = view.peek(protocol::page_keylet(root_keylet, page))?;
         }
 
         // Move past this page for next iteration
@@ -2153,6 +2179,7 @@ fn compute_offer_consumption(
     remaining_out: &STAmount,
     taker_pays: &STAmount,
     taker_gets: &STAmount,
+    offer_quality: Quality,
     owner_funds: &STAmount,
     transfer_rate_in: u32,
     transfer_rate_out: u32,
@@ -2167,11 +2194,9 @@ fn compute_offer_consumption(
     let mut owner_gives = mul_ratio_amount(&ofr_out, transfer_rate_out, QUALITY_ONE, false);
     let mut actual_ofr_in = ofr_in;
     let mut actual_ofr_out = ofr_out;
-    // TOffer retains the quality calculated from the original ledger offer.
-    // Every subsequent limitIn/limitOut operation uses that stored quality,
-    // even after owner-funding has reduced the working offer amounts.
-    let offer_quality =
-        Quality::from_amounts(&Amounts::new(taker_pays.clone(), taker_gets.clone()));
+    // This is `TOffer::quality_`: the immutable book-directory quality from
+    // when the offer was placed. Every limit operation must continue using it
+    // after partial fills or funding reductions.
 
     // reference: if (funds < ownerGives) — limit by owner funding
     if *owner_funds < owner_gives {
@@ -2363,9 +2388,9 @@ mod tests {
 
     use super::*;
     use basics::base_uint::{Uint192, Uint256};
-    use protocol::{ApplyFlags, Currency, MPTIssue, STArray, STObject, StBase};
+    use protocol::{ApplyFlags, Currency, MPTIssue, STArray, STObject, STVector256, StBase};
 
-    use crate::{ApplyViewImpl, Fees, Ledger, LedgerHeader, ReadView, ReadViewTx, Rules};
+    use crate::{ApplyViewImpl, Fees, Ledger, LedgerHeader, RawView, ReadView, ReadViewTx, Rules};
 
     #[derive(Debug)]
     struct FaultingReadView {
@@ -2429,6 +2454,70 @@ mod tests {
 
         assert!(offer_owner_authorized(&view, &iou, &owner).is_err());
         assert!(offer_owner_authorized(&view, &mpt, &owner).is_err());
+    }
+
+    #[test]
+    fn book_offer_scan_preserves_quality_and_walks_overflow_pages() {
+        let issuer = AccountID::from_array([0x21; 20]);
+        let book = Book {
+            r#in: Asset::Issue(protocol::xrp_issue()),
+            out: Asset::Issue(protocol::Issue::new(
+                protocol::currency_from_string("USD"),
+                issuer,
+            )),
+            domain: None,
+        };
+        let proto_book = protocol::Book {
+            r#in: book.r#in,
+            out: book.out,
+            domain: None,
+        };
+        let quality_value = 0x590B_D7A6_2540_5556;
+        let root = protocol::quality_keylet(protocol::book_keylet(proto_book), quality_value);
+        let page = protocol::page_keylet(root, 1);
+        let first_key = Uint256::from_array([0x31; 32]);
+        let second_key = Uint256::from_array([0x32; 32]);
+
+        let mut root_sle = STLedgerEntry::new(root);
+        root_sle.set_field_h256(sf("sfRootIndex"), root.key);
+        root_sle.set_field_v256(
+            sf("sfIndexes"),
+            STVector256::from_values(sf("sfIndexes"), vec![first_key]),
+        );
+        root_sle.set_field_u64(sf("sfIndexNext"), 1);
+        root_sle.set_field_u64(sf("sfIndexPrevious"), 1);
+
+        let mut page_sle = STLedgerEntry::new(page);
+        page_sle.set_field_h256(sf("sfRootIndex"), root.key);
+        page_sle.set_field_v256(
+            sf("sfIndexes"),
+            STVector256::from_values(sf("sfIndexes"), vec![second_key]),
+        );
+        page_sle.set_field_u64(sf("sfIndexNext"), 0);
+        page_sle.set_field_u64(sf("sfIndexPrevious"), 0);
+
+        let mut first =
+            STLedgerEntry::from_type_and_key(protocol::LedgerEntryType::Offer, first_key);
+        first.set_field_h256(sf("sfBookDirectory"), root.key);
+        let mut second =
+            STLedgerEntry::from_type_and_key(protocol::LedgerEntryType::Offer, second_key);
+        second.set_field_h256(sf("sfBookDirectory"), root.key);
+
+        let mut base = Ledger::from_ledger_seq_and_close_time(1, 1, false);
+        for sle in [root_sle, page_sle, first, second] {
+            base.raw_insert(Arc::new(sle)).expect("seed book entry");
+        }
+        let mut view = ApplyViewImpl::new(Arc::new(base), ApplyFlags::NONE);
+        let offers = get_book_offers(&mut view, &book, 10).expect("scan book");
+
+        assert_eq!(offers.len(), 2);
+        assert_eq!(*offers[0].sle.key(), first_key);
+        assert_eq!(*offers[1].sle.key(), second_key);
+        assert!(
+            offers
+                .iter()
+                .all(|offer| offer.quality == Quality::from_value(quality_value))
+        );
     }
 
     #[test]
@@ -3068,6 +3157,14 @@ mod tests {
                 protocol::IOUAmount::from_parts(1_000, 0).expect("canonical offer output"),
                 issue,
             ),
+            Quality::from_amounts(&Amounts::new(
+                STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(3_300_000_000)),
+                STAmount::from_iou_amount(
+                    sf("sfAmount"),
+                    protocol::IOUAmount::from_parts(1_000, 0).expect("canonical offer output"),
+                    issue,
+                ),
+            )),
             &STAmount::from_iou_amount(
                 sf("sfAmount"),
                 protocol::IOUAmount::from_parts(1_000, 0).expect("funded offer output"),
@@ -3103,6 +3200,10 @@ mod tests {
             &taker_gets,
             &STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(50_000_000)),
             &taker_gets,
+            Quality::from_amounts(&Amounts::new(
+                STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(50_000_000)),
+                taker_gets.clone(),
+            )),
             &taker_gets,
             QUALITY_ONE,
             QUALITY_ONE,
@@ -3115,6 +3216,61 @@ mod tests {
             (taker_gets - consumption.offer_out).iou().to_string(),
             "49.75000000000002"
         );
+    }
+
+    #[test]
+    fn partial_offer_uses_immutable_directory_quality_for_one_drop_rounding() {
+        // Canonical Testnet ledgers 20,517,622 and 20,518,045 exposed this
+        // exact shape. The remaining 6,666,666-drop / 200-USD amounts no
+        // longer reproduce the quality established when the offer was
+        // created. rippled carries 0x590BD7A625405556 from BookTip into
+        // TOffer, so delivering 100 USD consumes 3,333,334 drops.
+        let issuer = AccountID::from_array([0x44; 20]);
+        let issue = protocol::Issue::new(protocol::currency_from_string("USD"), issuer);
+        let remaining_offer_out = STAmount::from_iou_amount(
+            sf("sfAmount"),
+            protocol::IOUAmount::from_parts(200, 0).expect("200 USD"),
+            issue,
+        );
+        let requested_out = STAmount::from_iou_amount(
+            sf("sfAmount"),
+            protocol::IOUAmount::from_parts(100, 0).expect("100 USD"),
+            issue,
+        );
+        let directory_quality = Quality::from_value(0x590B_D7A6_2540_5556);
+        assert_eq!(
+            directory_quality,
+            Quality::from_amounts(&Amounts::new(
+                STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(10_000_000)),
+                STAmount::from_iou_amount(
+                    sf("sfAmount"),
+                    protocol::IOUAmount::from_parts(300, 0).expect("original 300 USD"),
+                    issue,
+                ),
+            )),
+            "fixture quality is the original 10-XRP / 300-USD directory quality"
+        );
+        let recomputed = Quality::from_amounts(&Amounts::new(
+            STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(6_666_666)),
+            remaining_offer_out.clone(),
+        ));
+        assert_ne!(directory_quality, recomputed);
+
+        let consumption = compute_offer_consumption(
+            &STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(10_000_000)),
+            &requested_out,
+            &STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(6_666_666)),
+            &remaining_offer_out,
+            directory_quality,
+            &remaining_offer_out,
+            QUALITY_ONE,
+            QUALITY_ONE,
+            true,
+        );
+
+        assert_eq!(consumption.offer_in.xrp().drops(), 3_333_334);
+        assert_eq!(consumption.offer_out.iou().to_string(), "100");
+        assert_eq!(6_666_666 - consumption.offer_in.xrp().drops(), 3_333_332);
     }
 
     #[test]

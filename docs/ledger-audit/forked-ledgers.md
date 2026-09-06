@@ -5,6 +5,35 @@ diagnostics, not state-transition counts. The retained journal contains 33
 confirmed incompatible children from 2–4 September 2026. In every case the
 local child shares the canonical parent and uses the same transaction-ID set.
 
+## Immutable offer-quality parity (6 September)
+
+Three retained incompatible children from the current deployment were reduced
+to the first transaction whose serialized metadata differs from the canonical
+Testnet ledger:
+
+| Ledger | Exact transaction | Canonical difference |
+| ---: | --- | --- |
+| 20,517,622 | `B978DA5848B8EF60C3602C027550E2ED4775D4768DCAF02E77F3E84925A1DC1F` | A second partial fill consumes 3,333,334 drops and leaves 3,333,332; Quaxar consumed 3,333,333 and left 3,333,333. |
+| 20,517,766 | `3AEA384FC7AAB1EF80C910B0D2094F87DDC46D5A424BB57C616904D3911B6A0E` | Quaxar stopped the same-quality stream early and failed to delete four canonical consumed offers. |
+| 20,518,045 | `2455ADF9919863BC60BA514CF39C627EC429BBD835252C12577A14252A82EF04` | The same one-drop partial-fill mismatch as ledger 20,517,622. |
+
+The preceding transactions in each candidate have metadata identical to the
+canonical ledger, including the sequence-zero/Batch transactions. The common
+defect was in book iteration. `rippled::BookTip` extracts quality from the
+quality-directory root and passes it into `TOffer`, whose quality never changes
+for the offer's lifetime. Quaxar discarded that value and recomputed quality
+from the remaining `TakerPays`/`TakerGets` after every partial fill. That both
+changed consensus-significant rounding by one drop and made offers from one
+directory appear to have different qualities. Quaxar's scan also read only the
+root page of each quality directory, whereas `rippled::dirFirst/dirNext` follows
+all `sfIndexNext` overflow pages.
+
+The correction carries the immutable directory quality through CLOB/AMM tip
+selection, quality gates, and every `limitIn`/`limitOut` operation, and walks
+the complete linked directory. Regressions cover the exact one-drop rounding,
+repeated partial fills, immutable same-directory quality, and overflow-page
+enumeration.
+
 ## OfferCreate flow-result parity (5 September)
 
 Four later incompatible children shared the canonical parent and candidate

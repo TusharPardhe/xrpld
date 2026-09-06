@@ -234,6 +234,67 @@ fn payment_xrp_to_iou_partial_self_payment_preserves_strict_offer_remainder() {
     );
 }
 
+#[test]
+fn repeated_partial_fill_retains_original_offer_quality() {
+    // Canonical Testnet ledgers 20,517,622 and 20,518,045 diverged after a
+    // second fill of this shape. The offer's remaining amounts do not encode
+    // its original quality exactly; rippled retains the book-directory
+    // quality for every later fill.
+    let taker = acct(0x41);
+    let maker = acct(0x42);
+    let issuer = acct(0x43);
+    let usd = usd_currency();
+    let mut ledger = build_ledger(vec![
+        account_root(taker, 100_000_000, 3, 0),
+        account_root(maker, 100_000_000, 6, 0),
+        account_root(issuer, 10_000_000_000, 0, 0),
+        trust_line(taker, issuer, usd, 0, 1_000_000_000, 0),
+        trust_line(maker, issuer, usd, 1_000, 1_000_000_000, 0),
+    ]);
+    ledger.set_rules(protocol::Rules::new([protocol::feature_id(
+        "fixReducedOffersV2",
+    )]));
+    let mut view = new_view(ledger);
+
+    let offer = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), maker);
+        tx.set_field_amount(sf("sfTakerPays"), xrp(10_000_000));
+        tx.set_field_amount(sf("sfTakerGets"), iou(issuer, usd, 300));
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(
+        handle_real_dispatch(&mut view, &offer, TxType::OFFER_CREATE, None),
+        Ter::TES_SUCCESS
+    );
+
+    for sequence in 1..=2 {
+        let payment = STTx::new(TxType::PAYMENT, |tx| {
+            tx.set_account_id(sf("sfAccount"), taker);
+            tx.set_account_id(sf("sfDestination"), taker);
+            tx.set_field_amount(sf("sfAmount"), iou(issuer, usd, 100));
+            tx.set_field_amount(sf("sfSendMax"), xrp(10_000_000));
+            tx.set_field_amount(sf("sfFee"), xrp(10));
+            tx.set_field_u32(sf("sfFlags"), 0x0002_0000);
+            tx.set_field_u32(sf("sfSequence"), sequence);
+        });
+        assert_eq!(
+            full_apply(&mut view, &payment, TxType::PAYMENT),
+            Ter::TES_SUCCESS
+        );
+    }
+
+    let offer = view
+        .read(protocol::offer_keylet(acct_id(maker), 1))
+        .expect("offer read")
+        .expect("one third of the original offer remains");
+    assert_eq!(offer.get_field_amount(sf("sfTakerPays")), xrp(3_333_332));
+    assert_eq!(
+        offer.get_field_amount(sf("sfTakerGets")).iou().to_string(),
+        "100"
+    );
+}
+
 /// C++ Payment — XRP payment to nonexistent creates account.
 #[test]
 fn payment_xrp_creates_account() {

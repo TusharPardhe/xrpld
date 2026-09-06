@@ -1268,7 +1268,9 @@ mod tests {
         }
     }
 
-    impl IntrusiveObject for IntrusiveCacheNode {
+    unsafe impl IntrusiveObject for IntrusiveCacheNode {
+        type Owner = crate::intrusive_pointer::ErasedIntrusiveOwner;
+
         fn intrusive_ref_counts(&self) -> &IntrusiveRefCounts {
             &self.ref_counts
         }
