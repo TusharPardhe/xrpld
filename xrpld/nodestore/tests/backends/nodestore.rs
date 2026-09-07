@@ -123,6 +123,23 @@ impl Backend for FailingBatchBackend {
         }
     }
 
+    fn store_batch_result(&self, batch: &nodestore::Batch) -> Result<(), String> {
+        // `import_internal` writes through the checked batch API, so the
+        // recording and first-call failure injection live here (mirroring the
+        // reference importInternal contract). The first attempt panics so the
+        // importer must preserve the batch and retry it intact; the retry then
+        // includes one additional accumulated object.
+        let call = self.calls.fetch_add(1, Ordering::Relaxed);
+        self.batch_lengths
+            .lock()
+            .expect("batch lengths mutex")
+            .push(batch.len());
+        if call == 0 {
+            panic!("storeBatch failed");
+        }
+        Ok(())
+    }
+
     fn sync(&self) {}
 
     fn sync_result(&self) -> Result<(), String> {
@@ -403,7 +420,11 @@ fn database_async_fetch_uses_backend_object_and_updates_metrics() {
 }
 
 #[test]
-fn database_async_fetch_does_not_swallow_panicking_callbacks() {
+fn database_async_fetch_isolates_a_panicking_callback_from_others() {
+    // A callback that panics must not abort delivery of other queued callbacks
+    // for the same hash. The worker catches and logs each callback panic
+    // individually (see deliver_async_work), so a faulty consumer cannot starve
+    // or drop unrelated async reads. This is the intended robustness contract.
     let manager = ManagerImp::new();
     let scheduler: Arc<dyn nodestore::Scheduler> = Arc::new(DummyScheduler);
     let journal = Arc::new(NullJournal);
@@ -440,7 +461,15 @@ fn database_async_fetch_does_not_swallow_panicking_callbacks() {
             .expect("first callback object must exist"),
         vec![8, 8, 8]
     );
-    assert!(second_rx.recv_timeout(Duration::from_millis(250)).is_err());
+    // The second callback must still run: the first callback's panic is caught
+    // and isolated, not allowed to swallow subsequent deliveries.
+    assert_eq!(
+        second_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("second callback must still run after the first panicked")
+            .expect("second callback object must exist"),
+        vec![8, 8, 8]
+    );
 
     database.stop();
 }

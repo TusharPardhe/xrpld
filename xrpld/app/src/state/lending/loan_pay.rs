@@ -1047,9 +1047,16 @@ mod loan_pay_effective_amount_tests {
         let debt_total =
             loan_set_debt_total_update(asset, RuntimeNumber::zero(), adjustment, &vault, -4, true);
 
+        // With fix_cleanup_3_2_0 enabled, the debt total is rounded to the
+        // vault's canonical assets-total scale rather than the loan scale.
+        // vault_scale() derives that scale from the canonicalized sfAssetsTotal
+        // STAmount, which for this IOU is -15 (finer than the -2 external
+        // exponent, exactly as the vault_scale documentation warns). Rounding
+        // 1.2345 to scale -15 leaves the value unchanged, so the expected
+        // result is the full-precision 12345e-4, not a -2 truncation.
         assert_eq!(
             debt_total,
-            RuntimeNumber::try_from_external_parts(123, -2, get_mantissa_scale())
+            RuntimeNumber::try_from_external_parts(12345, -4, get_mantissa_scale())
                 .expect("post-fix vault-scale debt total")
         );
     }
