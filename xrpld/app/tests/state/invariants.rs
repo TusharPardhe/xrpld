@@ -406,7 +406,12 @@ fn offer_entry(
     );
     sle.set_field_amount(
         sf("sfTakerGets"),
-        STAmount::from_xrp_amount(XRPAmount::from_drops(2)),
+        STAmount::from_iou_amount(
+            sf("sfTakerGets"),
+            IOUAmount::from_parts(2_000_000_000_000_000, -15)
+                .expect("canonical invariant offer amount"),
+            Issue::new(iou_currency(b"USD"), account),
+        ),
     );
     if flags != 0 {
         sle.set_field_u32(sf("sfFlags"), flags);
@@ -707,28 +712,35 @@ fn invariant_rejects_malformed_hybrid_offer() {
 
 #[test]
 fn invariant_allows_empty_hybrid_additional_books_before_cleanup_3_1_3() {
-    with_flow(|flow| {
-        let account = acct(0x13);
-        let domain = Uint256::from_u64(13);
-        let mut offer = offer_entry(
-            Uint256::from_u64(14),
-            account,
-            protocol::lsfHybrid,
-            Some(domain),
-        );
-        set_additional_books(&mut offer, 0);
+    // Later cleanup amendments are not a valid stand-in for the historical
+    // pre-fixCleanup3_1_3 ruleset: fixCleanup3_2_0 also enables directory-root
+    // integrity checks. Keep this fixture on the exact amendment boundary it
+    // claims to exercise, as rippled's amendment tests do.
+    let mut ledger = test_ledger();
+    ledger.set_rules(Rules::new([]));
+    let base = Arc::new(ledger);
+    let mut parent = Sandbox::new(base, ApplyFlags::default());
+    let mut flow = FlowSandbox::new(&mut parent);
+    let account = acct(0x13);
+    let domain = Uint256::from_u64(13);
+    let mut offer = offer_entry(
+        Uint256::from_u64(14),
+        account,
+        protocol::lsfHybrid,
+        Some(domain),
+    );
+    set_additional_books(&mut offer, 0);
 
-        flow.insert(Arc::new(offer)).expect("insert offer");
-        assert_eq!(
-            check_invariants(
-                flow,
-                TxType::OFFER_CREATE,
-                Ter::TES_SUCCESS,
-                XRPAmount::from_drops(10)
-            ),
-            Ter::TES_SUCCESS
-        );
-    });
+    flow.insert(Arc::new(offer)).expect("insert offer");
+    assert_eq!(
+        check_invariants(
+            &flow,
+            TxType::OFFER_CREATE,
+            Ter::TES_SUCCESS,
+            XRPAmount::from_drops(10)
+        ),
+        Ter::TES_SUCCESS
+    );
 }
 
 #[test]
@@ -1805,8 +1817,9 @@ fn invariant_allows_vault_pseudo_mpt_holding_deleted_by_vault_delete() {
     );
     let issuance = mpt_issuance_entry(issuer, 1, 0, 0);
     let token = mptoken_entry(pseudo, issuer, 1, 0);
+    let pseudo_root = vault_pseudo_account_root(pseudo, vault_id);
     parent
-        .insert(Arc::new(vault_pseudo_account_root(pseudo, vault_id)))
+        .insert(Arc::new(pseudo_root.clone()))
         .expect("insert pseudo root");
     parent
         .insert(Arc::new(vault.clone()))
@@ -1819,6 +1832,11 @@ fn invariant_allows_vault_pseudo_mpt_holding_deleted_by_vault_delete() {
         .expect("insert mptoken");
 
     let mut flow = FlowSandbox::new(&mut parent);
+    // A successful rippled VaultDelete has MustDeleteAcct privilege and must
+    // delete exactly the vault pseudo AccountRoot along with the vault and its
+    // share issuance. Omitting this made the fixture itself invariant-invalid.
+    flow.erase(Arc::new(pseudo_root))
+        .expect("erase pseudo root");
     flow.erase(Arc::new(vault)).expect("erase vault");
     flow.erase(Arc::new(issuance)).expect("erase issuance");
     flow.erase(Arc::new(token)).expect("erase mptoken");

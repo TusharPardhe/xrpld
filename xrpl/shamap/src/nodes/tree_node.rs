@@ -8,7 +8,9 @@
 
 use crate::item::SHAMapItem;
 use basics::base_uint::Uint256;
-use basics::intrusive_pointer::{IntrusiveObject, SharedIntrusive, make_shared_intrusive};
+use basics::intrusive_pointer::{
+    CompactIntrusiveOwner, IntrusiveObject, SharedIntrusive, make_shared_intrusive,
+};
 use basics::intrusive_ref_counts::IntrusiveRefCounts;
 use basics::sha_map_hash::SHAMapHash;
 use parking_lot::RwLock;
@@ -85,7 +87,7 @@ impl TaggedPointer {
         unsafe {
             for index in 0..capacity {
                 ptr::write(hashes.add(index), SHAMapHash::default());
-                ptr::write(children.add(index), None);
+                ptr::write(children.add(index), SharedIntrusive::new());
             }
         }
         let raw = ptr.as_ptr() as usize;
@@ -118,7 +120,7 @@ impl TaggedPointer {
         self.ptr().as_ptr().cast::<SHAMapHash>()
     }
 
-    fn children(&self) -> *mut Option<SharedIntrusive<SHAMapTreeNode>> {
+    fn children(&self) -> *mut SharedIntrusive<SHAMapTreeNode> {
         children_ptr(self.ptr(), self.capacity())
     }
 
@@ -150,27 +152,27 @@ impl TaggedPointer {
 
     fn get_child_at_index(&self, index: usize) -> Option<SharedIntrusive<SHAMapTreeNode>> {
         debug_assert!(index < self.capacity());
-        unsafe { (&*self.children().add(index)).clone() }
+        let child = unsafe { &*self.children().add(index) };
+        (!child.is_null()).then(|| child.clone())
     }
 
     unsafe fn get_child_ptr_at_index(&self, index: usize) -> Option<*const SHAMapTreeNode> {
         debug_assert!(index < self.capacity());
         unsafe {
-            (&*self.children().add(index))
-                .as_ref()
-                .map(|si| &**si as *const SHAMapTreeNode)
+            let child = &*self.children().add(index);
+            (!child.is_null()).then(|| &**child as *const SHAMapTreeNode)
         }
     }
 
     fn has_child_at_index(&self, index: usize) -> bool {
         debug_assert!(index < self.capacity());
-        unsafe { (&*self.children().add(index)).is_some() }
+        unsafe { !(&*self.children().add(index)).is_null() }
     }
 
     fn set_child_at_index(&self, index: usize, child: Option<SharedIntrusive<SHAMapTreeNode>>) {
         debug_assert!(index < self.capacity());
         unsafe {
-            *self.children().add(index) = child;
+            *self.children().add(index) = child.unwrap_or_default();
         }
     }
 
@@ -250,7 +252,10 @@ impl TaggedPointer {
                 ((src_branches & ((1u16 << branch) - 1)).count_ones()) as usize
             };
             let hash = unsafe { *self.hashes().add(src_index) };
-            let child = unsafe { (&mut *self.children().add(src_index)).take() };
+            let child = unsafe {
+                let child = std::mem::take(&mut *self.children().add(src_index));
+                (!child.is_null()).then_some(child)
+            };
             let effective_dst_index = if dst_dense { branch } else { dst_index };
             next.set_hash_at_index(effective_dst_index, hash);
             next.set_child_at_index(effective_dst_index, child);
@@ -349,6 +354,21 @@ pub struct SHAMapTreeNode {
 // sync scans. All other fields are already Sync (RwLock, Atomic).
 unsafe impl Sync for SHAMapTreeNode {}
 unsafe impl Send for SHAMapTreeNode {}
+
+// SHAMap ownership is concrete: every handle points to the same enum-backed
+// allocation type. Keep the hot pointer representations to one machine word,
+// matching rippled's intrusive SHAMap pointers.
+const _: () = {
+    assert!(std::mem::size_of::<SharedIntrusive<SHAMapTreeNode>>() == std::mem::size_of::<usize>());
+    assert!(
+        std::mem::size_of::<basics::intrusive_pointer::WeakIntrusive<SHAMapTreeNode>>()
+            == std::mem::size_of::<usize>()
+    );
+    assert!(
+        std::mem::size_of::<basics::intrusive_pointer::SharedWeakUnion<SHAMapTreeNode>>()
+            == std::mem::size_of::<usize>()
+    );
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SHAMapCodecError {
@@ -1062,7 +1082,9 @@ impl SHAMapTreeNode {
     }
 }
 
-impl IntrusiveObject for SHAMapTreeNode {
+unsafe impl IntrusiveObject for SHAMapTreeNode {
+    type Owner = CompactIntrusiveOwner;
+
     fn intrusive_ref_counts(&self) -> &IntrusiveRefCounts {
         &self.ref_counts
     }
@@ -1105,7 +1127,7 @@ fn boundary_index(num_children: usize) -> usize {
 
 fn tagged_arrays_layout(capacity: usize) -> Layout {
     let hashes = Layout::array::<SHAMapHash>(capacity).expect("valid hash array layout");
-    let children = Layout::array::<Option<SharedIntrusive<SHAMapTreeNode>>>(capacity)
+    let children = Layout::array::<SharedIntrusive<SHAMapTreeNode>>(capacity)
         .expect("valid child array layout");
     let (layout, _) = hashes
         .extend(children)
@@ -1115,7 +1137,7 @@ fn tagged_arrays_layout(capacity: usize) -> Layout {
 
 fn child_offset(capacity: usize) -> usize {
     let hashes = Layout::array::<SHAMapHash>(capacity).expect("valid hash array layout");
-    let children = Layout::array::<Option<SharedIntrusive<SHAMapTreeNode>>>(capacity)
+    let children = Layout::array::<SharedIntrusive<SHAMapTreeNode>>(capacity)
         .expect("valid child array layout");
     let (_, offset) = hashes
         .extend(children)
@@ -1132,7 +1154,7 @@ fn allocate_tagged_arrays(capacity: usize) -> (NonNull<u8>, Layout) {
     (ptr, layout)
 }
 
-fn children_ptr(ptr: NonNull<u8>, capacity: usize) -> *mut Option<SharedIntrusive<SHAMapTreeNode>> {
+fn children_ptr(ptr: NonNull<u8>, capacity: usize) -> *mut SharedIntrusive<SHAMapTreeNode> {
     unsafe { ptr.as_ptr().add(child_offset(capacity)).cast() }
 }
 
@@ -1424,6 +1446,7 @@ mod tests {
         BRANCH_FACTOR, HASH_PREFIX_INNER_NODE, HASH_PREFIX_LEAF_NODE, HASH_PREFIX_TX_NODE,
         SHAMapCodecError, SHAMapItem, SHAMapNodeType, SHAMapTreeNode, SHAMapTreeNodeKind,
         TaggedPointer, WIRE_TYPE_ACCOUNT_STATE, WIRE_TYPE_COMPRESSED_INNER, WIRE_TYPE_INNER,
+        tagged_arrays_layout,
     };
     use basics::base_uint::Uint256;
     use basics::intrusive_pointer::{IntrusiveObject, make_shared_intrusive};
@@ -1621,6 +1644,19 @@ mod tests {
         assert_eq!(parent.get_child_hash(1), sample_hash(5));
         assert!(parent.get_child(1).is_none());
         assert!(!parent.is_empty_branch(1));
+    }
+
+    #[test]
+    fn compact_pointer_and_tagged_array_layout_matches_reference_shape() {
+        use basics::intrusive_pointer::{SharedIntrusive, SharedWeakUnion, WeakIntrusive};
+
+        assert_eq!(std::mem::size_of::<SharedIntrusive<SHAMapTreeNode>>(), 8);
+        assert_eq!(std::mem::size_of::<WeakIntrusive<SHAMapTreeNode>>(), 8);
+        assert_eq!(std::mem::size_of::<SharedWeakUnion<SHAMapTreeNode>>(), 8);
+        assert_eq!(tagged_arrays_layout(2).size(), 80);
+        assert_eq!(tagged_arrays_layout(4).size(), 160);
+        assert_eq!(tagged_arrays_layout(6).size(), 240);
+        assert_eq!(tagged_arrays_layout(16).size(), 640);
     }
 
     #[test]

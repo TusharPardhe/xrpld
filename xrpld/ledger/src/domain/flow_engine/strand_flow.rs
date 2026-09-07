@@ -104,6 +104,7 @@ pub fn execute_strands<V: ApplyView>(
             strand_src,
             strand_dst,
             strand_deliver: deliver.asset(),
+            offer_crossing: offer_crossing != OfferCrossing::No,
             quality_threshold,
             self_cross_cancellation: self_cross_cancellation.clone(),
             amm_context: amm_context.clone(),
@@ -140,6 +141,7 @@ pub fn execute_strands<V: ApplyView>(
         let mut next_active = vec![false; strands.len()];
         for (candidate_position, (strand_index, _)) in candidates.iter().copied().enumerate() {
             let strand = &strands[strand_index];
+
             let (strand_out, adjusted_remaining_out) = if candidates.len() == 1 {
                 let limited = match quality_threshold {
                     Some(limit) => match limit_single_strand_out(
@@ -165,6 +167,31 @@ pub fn execute_strands<V: ApplyView>(
                 (remaining_out.clone(), false)
             };
 
+            // ActiveStrands deliberately avoids estimating/sorting when only
+            // one strand is active. rippled still computes limitOut and then
+            // performs this second OfferCreate qualityUpperBound check before
+            // executing the candidate. Without it, a lone below-limit book
+            // enters FlowOfferStream and can permanently prune expired or
+            // unfunded offers that rippled never reaches.
+            if offer_crossing != OfferCrossing::No
+                && let Some(limit) = quality_threshold
+            {
+                let upper_bound =
+                    match strand_quality_upper_bound(&mut aggregate, strand, &ordering_context) {
+                        Ok(quality) => quality,
+                        Err(_) => {
+                            return FlowResult {
+                                ter: Ter::TEF_BAD_LEDGER,
+                                actual_in: total_in.zeroed(),
+                                actual_out: total_out.zeroed(),
+                            };
+                        }
+                    };
+                if !offer_crossing_candidate_meets_limit(offer_crossing, Some(limit), upper_bound) {
+                    continue;
+                }
+            }
+
             // Every candidate, including a dry probe, owns a child sandbox.
             // No mutation reaches `view` unless this candidate produced a
             // valid amount and was selected below.
@@ -177,6 +204,7 @@ pub fn execute_strands<V: ApplyView>(
                 strand_src,
                 strand_dst,
                 quality_threshold,
+                offer_crossing != OfferCrossing::No,
                 self_cross_cancellation.clone(),
                 amm_context.clone(),
                 adjusted_remaining_out,
@@ -319,6 +347,7 @@ fn execute_single_strand<V: ApplyView>(
     strand_src: &AccountID,
     strand_dst: &AccountID,
     quality_threshold: Option<Quality>,
+    offer_crossing: bool,
     self_cross_cancellation: Option<SelfCrossCancellation>,
     amm_context: AmmContext,
     adjusted_remaining_out: bool,
@@ -330,6 +359,7 @@ fn execute_single_strand<V: ApplyView>(
         strand_src,
         strand_dst,
         strand_deliver: requested_out.asset(),
+        offer_crossing,
         quality_threshold,
         self_cross_cancellation,
         amm_context,
@@ -578,6 +608,16 @@ fn sort_candidates(candidates: &mut [(usize, Quality)]) {
 
 fn quality_estimation_required(active_count: usize) -> bool {
     active_count > 1
+}
+
+fn offer_crossing_candidate_meets_limit(
+    offer_crossing: OfferCrossing,
+    limit: Option<Quality>,
+    upper_bound: Option<Quality>,
+) -> bool {
+    offer_crossing == OfferCrossing::No
+        || limit.is_none()
+        || upper_bound.is_some_and(|quality| quality >= limit.expect("limit checked above"))
 }
 
 fn activate_candidates(
@@ -974,6 +1014,41 @@ mod tests {
         .expect("single-strand activation bypasses estimation");
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].0, 7);
+    }
+
+    #[test]
+    fn single_offer_crossing_strand_still_requires_the_execution_quality_gate() {
+        let limit = quality(1, 1);
+        let worse = quality(2, 1);
+        let equal = limit;
+
+        // ActiveStrands intentionally bypasses estimation for one strand, but
+        // rippled StrandFlow checks the bound again before opening the stream.
+        let candidates = activate_candidates(vec![7], |_| {
+            panic!("single-strand activation must still bypass sorting estimation")
+        })
+        .expect("single candidate remains active until the execution gate");
+        assert_eq!(candidates.len(), 1);
+        assert!(!offer_crossing_candidate_meets_limit(
+            OfferCrossing::Yes,
+            Some(limit),
+            Some(worse),
+        ));
+        assert!(!offer_crossing_candidate_meets_limit(
+            OfferCrossing::Yes,
+            Some(limit),
+            None,
+        ));
+        assert!(offer_crossing_candidate_meets_limit(
+            OfferCrossing::Yes,
+            Some(limit),
+            Some(equal),
+        ));
+        assert!(offer_crossing_candidate_meets_limit(
+            OfferCrossing::No,
+            Some(limit),
+            Some(worse),
+        ));
     }
 
     #[test]

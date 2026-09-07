@@ -38,6 +38,58 @@ fn offer_tx(from: AccountID, pays: STAmount, gets: STAmount, seq: u32) -> STTx {
     })
 }
 
+#[test]
+fn repeated_offer_cross_retains_original_directory_quality() {
+    // OfferCreate form of the canonical 20,517,622/20,518,045 divergence.
+    // Each crossing receives 100 USD from an original 10-XRP/300-USD offer.
+    // Its immutable directory quality rounds each input to 3,333,334 drops.
+    let maker = acct(0x71);
+    let taker = acct(0x72);
+    let issuer = acct(0x73);
+    let usd = usd_currency();
+    let ledger = build_ledger_with_features(
+        vec![
+            account_root(maker, 100_000_000, 6, 0),
+            account_root(taker, 100_000_000, 3, 0),
+            account_root(issuer, 10_000_000_000, 0, 0),
+            trust_line(maker, issuer, usd, 1_000, 1_000_000_000, 0),
+            trust_line(taker, issuer, usd, 0, 1_000_000_000, 0),
+        ],
+        vec!["fixReducedOffersV2"],
+    );
+    let mut view = new_view(ledger);
+
+    let resting = offer_tx(maker, xrp(10_000_000), iou(issuer, usd, 300), 1);
+    assert_eq!(
+        handle_real_dispatch(&mut view, &resting, TxType::OFFER_CREATE, None),
+        Ter::TES_SUCCESS
+    );
+
+    for sequence in 1..=2 {
+        let crossing = offer_tx(taker, iou(issuer, usd, 100), xrp(10_000_000), sequence);
+        assert_eq!(
+            full_apply(&mut view, &crossing, TxType::OFFER_CREATE),
+            Ter::TES_SUCCESS
+        );
+    }
+
+    let remainder = view
+        .read(protocol::offer_keylet(acct_id(maker), 1))
+        .expect("resting offer read")
+        .expect("one third of the resting offer remains");
+    assert_eq!(
+        remainder.get_field_amount(sf("sfTakerPays")),
+        xrp(3_333_332)
+    );
+    assert_eq!(
+        remainder
+            .get_field_amount(sf("sfTakerGets"))
+            .iou()
+            .to_string(),
+        "100"
+    );
+}
+
 fn get_owner_count(view: &impl ReadView, account: AccountID) -> u32 {
     view.read(account_keylet(acct_id(account)))
         .ok()
@@ -1195,7 +1247,9 @@ fn offer_globally_frozen_issuer() {
     // OfferCreate.cpp:190-212 rejects GlobalFreeze before accountFunds;
     // Freeze_test.cpp:480-489 expects tecFROZEN in both offer directions.
     let tx = offer_tx(alice, xrp(1_000_000_000), iou(gw, usd, 1000), 1);
-    let result = handle_real_dispatch(&mut view, &tx, TxType::OFFER_CREATE, None);
+    // GlobalFreeze is an OfferCreate preclaim decision in rippled, so this
+    // fixture must use the complete shell rather than the doApply-only helper.
+    let result = full_apply(&mut view, &tx, TxType::OFFER_CREATE);
     assert_eq!(result, Ter::TEC_FROZEN);
 }
 

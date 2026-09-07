@@ -28,12 +28,16 @@ fn brrl_to_rlusd_limited_input_is_a_generic_iou_book_fill() {
     );
     let remaining_brrl = iou_amount(1_000, brrl);
     let available_rlusd = iou_amount(50_000, rlusd);
+    let offer_in = iou_amount(255_960, brrl);
+    let offer_quality =
+        Quality::from_amounts(&Amounts::new(offer_in.clone(), available_rlusd.clone()));
 
     let consumed = compute_offer_consumption(
         &remaining_brrl,
         &available_rlusd,
-        &iou_amount(255_960, brrl),
+        &offer_in,
         &available_rlusd,
+        offer_quality,
         &available_rlusd,
         QUALITY_ONE,
         QUALITY_ONE,

@@ -243,6 +243,19 @@ pub fn do_offer_create<V: ledger::ApplyView>(
     // significant for AMM liquidity: using the unadjusted TakerGets admits
     // pools whose effective quality (including the gateway fee) is worse than
     // the offer's limit.
+    // rippled checks funding before transfer-rate lookup or path construction.
+    // This is the only crossing failure which flowCross propagates directly;
+    // failures returned by flow itself leave the offer unchanged and are
+    // placed.
+    let (in_start_balance, disallow_unfunded) =
+        match crossing_account_funds(view, &account, &taker_gets) {
+            Ok(value) => value,
+            Err(ter) => return ter,
+        };
+    if disallow_unfunded && in_start_balance.signum() <= 0 {
+        return Ter::TEC_UNFUNDED_OFFER;
+    }
+
     let gateway_rate = match taker_gets.asset() {
         protocol::Asset::Issue(issue) if !issue.native() && account != issue.issuer() => {
             match ledger::ripple_state_helpers::try_transfer_rate(view, &issue.issuer()) {
@@ -260,6 +273,11 @@ pub fn do_offer_create<V: ledger::ApplyView>(
         // quality ordering instead of approximating with floating point.
         quality_threshold.increment();
     }
+    let effective_send_max = if send_max > in_start_balance {
+        in_start_balance
+    } else {
+        send_max.clone()
+    };
 
     let mut crossed = false;
     let (remaining_gets, remaining_pays) = {
@@ -272,11 +290,16 @@ pub fn do_offer_create<V: ledger::ApplyView>(
         let mut cross_paths = protocol::STPathSet::new(sf("sfPaths"));
         if !taker_gets.native() && !taker_pays.native() {
             let mut xrp_path = protocol::STPath::new();
-            xrp_path.push_back(protocol::STPathElement::inferred(
-                protocol::AccountID::default(),
+            // rippled: path.emplaceBack(std::nullopt, xrpCurrency(),
+            //                          std::nullopt)
+            // XRP is explicitly present as the path asset.  `inferred(...,
+            // force_asset=false)` instead encodes TypeNone for XRP, which is
+            // not the synthetic bridge constructed by OfferCreate::flowCross.
+            xrp_path.push_back(protocol::STPathElement::raw(
+                protocol::STPathElement::TYPE_CURRENCY,
+                protocol::AccountID::zero(),
                 protocol::xrp_currency(),
-                protocol::AccountID::default(),
-                false,
+                protocol::AccountID::zero(),
             ));
             cross_paths.push_back(xrp_path);
         }
@@ -297,139 +320,128 @@ pub fn do_offer_create<V: ledger::ApplyView>(
                 true, // offer crossing
                 domain_id,
             );
-        // `flow()` returns a failed `toStrands` result immediately.  Continuing
-        // with a hand-built BookStep changes both the TER and the state changes
-        // for malformed or otherwise unavailable crossing paths.
+        // OfferCreate::flowCross intentionally treats a failed flow as a dry
+        // crossing: the original offer is still valid and is placed unchanged.
+        // This includes failures while constructing strands (for example
+        // terNO_RIPPLE and temBAD_PATH_LOOP). Propagating this internal TER
+        // omits a canonical OfferCreate from the ledger.
         if !is_tes_success(strands_ter) {
-            return strands_ter;
-        }
-
-        let self_cross_cancellations = ledger::flow_engine::SelfCrossCancellation::default();
-
-        let (in_start_balance, disallow_unfunded) =
-            match crossing_account_funds(view, &account, &taker_gets) {
-                Ok(value) => value,
-                Err(ter) => return ter,
-            };
-        if disallow_unfunded && in_start_balance.signum() <= 0 {
-            return Ter::TEC_UNFUNDED_OFFER;
-        }
-        let effective_send_max = if send_max > in_start_balance {
-            in_start_balance
-        } else {
-            send_max.clone()
-        };
-        let cross_deliver = if is_sell {
-            sell_cross_deliver_limit(&taker_pays)
-        } else {
-            taker_pays.clone()
-        };
-
-        // Execute strands
-        // reference: flow(deliver=takerAmount.out, sendMax=takerAmount.in)
-        let flow_result = ledger::flow_engine::strand_flow::execute_strands(
-            view,
-            &strands,
-            &cross_deliver,
-            (tx_flags & TF_FILL_OR_KILL) == 0,
-            if is_sell {
-                ledger::ripple_calc::OfferCrossing::Sell
-            } else {
-                ledger::ripple_calc::OfferCrossing::Yes
-            },
-            Some(&effective_send_max),
-            &account,
-            &account,
-            Some(quality_threshold),
-            Some(self_cross_cancellations.clone()),
-        );
-
-        let cancellation_result = self_cross_cancellations.apply_to(view);
-        if cancellation_result != Ter::TES_SUCCESS {
-            return cancellation_result;
-        }
-
-        let actual_in = flow_result.actual_in;
-        let actual_out = flow_result.actual_out;
-
-        // even after fee deduction), propagate that directly — do not override with tecKILLED.
-        // This matches reference the reference source:359 where flowCross returns {tecUNFUNDED_OFFER, takerAmount}.
-        if flow_result.ter == Ter::TEC_UNFUNDED_OFFER
-            && actual_in.signum() == 0
-            && actual_out.signum() == 0
-        {
-            return Ter::TEC_UNFUNDED_OFFER;
-        }
-
-        if actual_in.signum() > 0 || actual_out.signum() > 0 {
-            crossed = true;
-        }
-
-        // Compute the residual offer using rippled's flow result convention:
-        // actual_in is TakerGets consumed and actual_out is TakerPays delivered.
-        // A dry flow leaves the offer unchanged. Besides matching rippled's
-        // post-cross result, this avoids converting an otherwise unused
-        // encoded rate back into an amount.
-        let (post_cross_balance, _) = match crossing_account_funds(view, &account, &taker_gets) {
-            Ok(value) => value,
-            Err(ter) => return ter,
-        };
-        let (rem_gets, rem_pays) = if disallow_unfunded && post_cross_balance.signum() <= 0 {
-            (taker_gets.zeroed(), taker_pays.zeroed())
-        } else if actual_in.signum() <= 0 && actual_out.signum() <= 0 {
             (taker_gets.clone(), taker_pays.clone())
-        } else if is_sell {
-            // tfSell reduces the input side, TakerGets.
-            let non_gateway_in = if gateway_rate != 1_000_000_000 {
-                let rate = STAmount::new_with_asset(
-                    sf("sfAmount"),
-                    protocol::no_issue(),
-                    gateway_rate as u64,
-                    -9,
-                    false,
-                );
-                match amount_or_exception(actual_in.try_divide(&rate, taker_gets.asset())) {
-                    Ok(amount) => amount,
-                    Err(ter) => return ter,
-                }
-            } else {
-                actual_in
-            };
-            let mut rem_gets = taker_gets.clone() - non_gateway_in;
-            if rem_gets.signum() < 0 {
-                rem_gets.clear();
-            }
-            let rem_pays = if rem_gets.signum() <= 0 {
-                taker_pays.zeroed()
-            } else {
-                // C++: divRoundStrict(afterCross.in,
-                // Quality{takerAmount.out, takerAmount.in}.rate(), out, false)
-                let rate =
-                    Quality::from_amounts(&Amounts::new(taker_gets.clone(), taker_pays.clone()))
-                        .rate();
-                protocol::div_round_strict(&rem_gets, &rate, taker_pays.asset(), false)
-            };
-            (rem_gets, rem_pays)
         } else {
-            // Non-sell reduces the output side, TakerPays, then recomputes
-            // TakerGets at the original offer quality.
-            let mut rem_pays = taker_pays.clone() - actual_out;
-            if rem_pays.signum() < 0 {
-                rem_pays.clear();
-            }
-            let rem_gets = if rem_pays.signum() <= 0 {
-                taker_gets.zeroed()
+            let self_cross_cancellations = ledger::flow_engine::SelfCrossCancellation::default();
+            let cross_deliver = if is_sell {
+                sell_cross_deliver_limit(&taker_pays)
             } else {
-                // C++: mulRound(afterCross.out,
-                // Quality{takerAmount.out, takerAmount.in}.rate(), in, true)
-                let rate =
-                    Quality::from_amounts(&Amounts::new(taker_gets.clone(), taker_pays.clone()))
-                        .rate();
-                rem_pays.mul_round(&rate, taker_gets.asset(), true)
+                taker_pays.clone()
             };
-            (rem_gets, rem_pays)
-        };
-        (rem_gets, rem_pays)
+
+            // Execute strands
+            // reference: flow(deliver=takerAmount.out, sendMax=takerAmount.in)
+            let flow_result = ledger::flow_engine::strand_flow::execute_strands(
+                view,
+                &strands,
+                &cross_deliver,
+                (tx_flags & TF_FILL_OR_KILL) == 0,
+                if is_sell {
+                    ledger::ripple_calc::OfferCrossing::Sell
+                } else {
+                    ledger::ripple_calc::OfferCrossing::Yes
+                },
+                Some(&effective_send_max),
+                &account,
+                &account,
+                Some(quality_threshold),
+                Some(self_cross_cancellations.clone()),
+            );
+
+            let cancellation_result = self_cross_cancellations.apply_to(view);
+            if cancellation_result != Ter::TES_SUCCESS {
+                return cancellation_result;
+            }
+
+            if !is_tes_success(flow_result.ter) {
+                (taker_gets.clone(), taker_pays.clone())
+            } else {
+                let actual_in = flow_result.actual_in;
+                let actual_out = flow_result.actual_out;
+
+                if actual_in.signum() > 0 || actual_out.signum() > 0 {
+                    crossed = true;
+                }
+
+                // Compute the residual offer using rippled's flow result convention:
+                // actual_in is TakerGets consumed and actual_out is TakerPays delivered.
+                // A dry flow leaves the offer unchanged. Besides matching rippled's
+                // post-cross result, this avoids converting an otherwise unused
+                // encoded rate back into an amount.
+                let (post_cross_balance, _) =
+                    match crossing_account_funds(view, &account, &taker_gets) {
+                        Ok(value) => value,
+                        Err(ter) => return ter,
+                    };
+                let (rem_gets, rem_pays) = if disallow_unfunded && post_cross_balance.signum() <= 0
+                {
+                    (taker_gets.zeroed(), taker_pays.zeroed())
+                } else if actual_in.signum() <= 0 && actual_out.signum() <= 0 {
+                    (taker_gets.clone(), taker_pays.clone())
+                } else if is_sell {
+                    // tfSell reduces the input side, TakerGets.
+                    let non_gateway_in = if gateway_rate != 1_000_000_000 {
+                        let rate = STAmount::new_with_asset(
+                            sf("sfAmount"),
+                            protocol::no_issue(),
+                            gateway_rate as u64,
+                            -9,
+                            false,
+                        );
+                        match amount_or_exception(actual_in.try_divide(&rate, taker_gets.asset())) {
+                            Ok(amount) => amount,
+                            Err(ter) => return ter,
+                        }
+                    } else {
+                        actual_in
+                    };
+                    let mut rem_gets = taker_gets.clone() - non_gateway_in;
+                    if rem_gets.signum() < 0 {
+                        rem_gets.clear();
+                    }
+                    let rem_pays = if rem_gets.signum() <= 0 {
+                        taker_pays.zeroed()
+                    } else {
+                        // C++: divRoundStrict(afterCross.in,
+                        // Quality{takerAmount.out, takerAmount.in}.rate(), out, false)
+                        let rate = Quality::from_amounts(&Amounts::new(
+                            taker_gets.clone(),
+                            taker_pays.clone(),
+                        ))
+                        .rate();
+                        protocol::div_round_strict(&rem_gets, &rate, taker_pays.asset(), false)
+                    };
+                    (rem_gets, rem_pays)
+                } else {
+                    // Non-sell reduces the output side, TakerPays, then recomputes
+                    // TakerGets at the original offer quality.
+                    let mut rem_pays = taker_pays.clone() - actual_out;
+                    if rem_pays.signum() < 0 {
+                        rem_pays.clear();
+                    }
+                    let rem_gets = if rem_pays.signum() <= 0 {
+                        taker_gets.zeroed()
+                    } else {
+                        // C++: mulRound(afterCross.out,
+                        // Quality{takerAmount.out, takerAmount.in}.rate(), in, true)
+                        let rate = Quality::from_amounts(&Amounts::new(
+                            taker_gets.clone(),
+                            taker_pays.clone(),
+                        ))
+                        .rate();
+                        rem_pays.mul_round(&rate, taker_gets.asset(), true)
+                    };
+                    (rem_gets, rem_pays)
+                };
+                (rem_gets, rem_pays)
+            }
+        }
     };
 
     // --- Fully crossed check ---

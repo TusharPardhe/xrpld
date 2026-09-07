@@ -10,6 +10,7 @@
 
 use std::sync::Arc;
 
+use super::fixtures::trust_line;
 use super::pipeline::full_apply;
 use basics::base_uint::{Uint160, Uint256};
 use ledger::{ApplyView, ApplyViewImpl, Ledger, LedgerHeader, ReadView};
@@ -725,6 +726,140 @@ fn offer_create_passive_flag() {
     let tx = offer_create_tx_with_flags(alice, usd, xrp(1_000_000_000), 1, 0x00010000);
     let result = full_apply(&mut view, &tx, TxType::OFFER_CREATE);
     assert_eq!(result, Ter::TES_SUCCESS);
+}
+
+#[test]
+fn offer_create_passive_same_currency_receiving_own_issue_matches_testnet() {
+    // Testnet ledger 20,500,630, transaction 5E177243...18AE2. The offer
+    // creator holds the TakerGets issue and receives its own issue. rippled
+    // places the residual passive offer with tesSUCCESS. An internal
+    // crossing-path loop result is a dry cross here; it must not escape the
+    // OfferCreate transactor.
+    let account = acct(0x11);
+    let gets_issuer = acct(0x22);
+    let currency = protocol::currency_from_string("MOM");
+    let ledger = make_ledger(vec![
+        account_root(account, 100_000_000, 1, 0),
+        account_root(gets_issuer, 100_000_000, 0, 0),
+        trust_line(account, gets_issuer, currency, 600, 1_000, 0),
+    ]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let taker_pays = STAmount::from_iou_amount(
+        sf_generic(),
+        IOUAmount::from_parts(150, 0).expect("canonical amount"),
+        Issue::new(currency, account),
+    );
+    let taker_gets = STAmount::from_iou_amount(
+        sf_generic(),
+        IOUAmount::from_parts(150, 0).expect("canonical amount"),
+        Issue::new(currency, gets_issuer),
+    );
+    let tx = offer_create_tx_with_flags(account, taker_pays, taker_gets, 1, 0x0001_0000);
+
+    assert_eq!(
+        full_apply(&mut view, &tx, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS
+    );
+    assert_eq!(get_owner_count(&view, account), 2);
+}
+
+#[test]
+fn offer_create_iou_to_iou_residual_matches_testnet() {
+    // Testnet ledgers 20,496,487 and 20,499,545 contain this shape: the
+    // creator holds TakerGets, has an empty TakerPays line, and rippled places
+    // the untouched residual offer with tesSUCCESS.
+    let account = acct(0x11);
+    let gets_issuer = acct(0x22);
+    let pays_issuer = acct(0x33);
+    let gets_currency = protocol::currency_from_string("GET");
+    let pays_currency = protocol::currency_from_string("PAY");
+    let mut gets_line = trust_line(account, gets_issuer, gets_currency, 40, 1_000, 0);
+    let mut pays_line = trust_line(account, pays_issuer, pays_currency, 0, 1_000, 0);
+    // The issuer-side NoRipple flags make the crossing strands unavailable.
+    // rippled's flowCross treats that as a dry crossing and places the
+    // residual offer. This is the orientation from ledger 20,499,545
+    // (transaction 035CEE56...E38E58).
+    gets_line.set_field_u32(
+        sf("sfFlags"),
+        protocol::lsfLowReserve | protocol::lsfHighNoRipple,
+    );
+    pays_line.set_field_u32(
+        sf("sfFlags"),
+        protocol::lsfLowReserve | protocol::lsfHighNoRipple,
+    );
+    let ledger = make_ledger(vec![
+        account_root(account, 100_000_000, 2, 0),
+        account_root(gets_issuer, 100_000_000, 0, 0),
+        account_root(pays_issuer, 100_000_000, 0, 0),
+        gets_line,
+        pays_line,
+    ]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let taker_pays = STAmount::from_iou_amount(
+        sf_generic(),
+        IOUAmount::from_parts(10, 0).expect("canonical amount"),
+        Issue::new(pays_currency, pays_issuer),
+    );
+    let taker_gets = STAmount::from_iou_amount(
+        sf_generic(),
+        IOUAmount::from_parts(20, 0).expect("canonical amount"),
+        Issue::new(gets_currency, gets_issuer),
+    );
+    let tx = offer_create_tx(account, taker_pays, taker_gets, 1);
+
+    assert_eq!(
+        full_apply(&mut view, &tx, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS
+    );
+    assert_eq!(get_owner_count(&view, account), 3);
+}
+
+#[test]
+fn offer_create_iou_to_iou_residual_with_low_side_no_ripple_matches_testnet() {
+    // Ledger 20,496,487 (transaction 711C83C4...83694A) has the inverse
+    // account ordering: both issuers are low and the offer creator is high.
+    // Exercise that flag orientation independently so neither comparison nor
+    // the dry-crossing result contract can regress.
+    let gets_issuer = acct(0x11);
+    let pays_issuer = acct(0x22);
+    let account = acct(0x33);
+    let gets_currency = protocol::currency_from_string("GET");
+    let pays_currency = protocol::currency_from_string("PAY");
+    let mut gets_line = trust_line(gets_issuer, account, gets_currency, -40, 0, 1_000);
+    let mut pays_line = trust_line(pays_issuer, account, pays_currency, 0, 0, 1_000);
+    gets_line.set_field_u32(
+        sf("sfFlags"),
+        protocol::lsfLowNoRipple | protocol::lsfHighReserve,
+    );
+    pays_line.set_field_u32(
+        sf("sfFlags"),
+        protocol::lsfLowNoRipple | protocol::lsfHighReserve,
+    );
+    let ledger = make_ledger(vec![
+        account_root(account, 100_000_000, 2, 0),
+        account_root(gets_issuer, 100_000_000, 0, 0),
+        account_root(pays_issuer, 100_000_000, 0, 0),
+        gets_line,
+        pays_line,
+    ]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let taker_pays = STAmount::from_iou_amount(
+        sf_generic(),
+        IOUAmount::from_parts(10, 0).expect("canonical amount"),
+        Issue::new(pays_currency, pays_issuer),
+    );
+    let taker_gets = STAmount::from_iou_amount(
+        sf_generic(),
+        IOUAmount::from_parts(20, 0).expect("canonical amount"),
+        Issue::new(gets_currency, gets_issuer),
+    );
+    let tx = offer_create_tx(account, taker_pays, taker_gets, 1);
+
+    assert_eq!(
+        full_apply(&mut view, &tx, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS
+    );
+    assert_eq!(get_owner_count(&view, account), 3);
 }
 
 /// C++ Offer_test — cancel nonexistent offer succeeds (no-op).

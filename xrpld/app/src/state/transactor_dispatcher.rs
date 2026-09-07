@@ -892,7 +892,14 @@ fn escrow_mpt_unlock_amounts<V: ledger::ApplyView>(
             .map(|net| STAmount::from_mpt_amount(sf("sfAmount"), net, issue))
             .map_err(|_| Ter::TEC_INTERNAL)?
         } else {
-            protocol::divide_round(amount, rate, true)
+            // Preserve rippled's legacy two-subtraction path exactly. For an
+            // integral MPT this is observably different from returning the
+            // rounded quotient directly: divideRound rounds the fee basis up,
+            // then STAmount subtraction charges only the resulting integral
+            // fee. fixCleanup3_4_0 deliberately replaces this with the direct
+            // round-down mulRatio path above.
+            let transfer_fee = amount.clone() - protocol::divide_round(amount, rate, true);
+            amount.clone() - transfer_fee
         };
         return Ok((net_amount, amount.clone()));
     }

@@ -162,7 +162,9 @@ impl TestIntrusiveNode {
     }
 }
 
-impl IntrusiveObject for TestIntrusiveNode {
+unsafe impl IntrusiveObject for TestIntrusiveNode {
+    type Owner = basics::intrusive_pointer::ErasedIntrusiveOwner;
+
     fn intrusive_ref_counts(&self) -> &IntrusiveRefCounts {
         &self.ref_counts
     }

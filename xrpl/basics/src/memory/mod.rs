@@ -4,4 +4,3 @@ pub mod intrusive_ref_counts;
 pub mod key_cache;
 pub mod malloc_trim;
 pub mod shared_weak_cache_pointer;
-pub mod slab_allocator;

@@ -36,8 +36,22 @@ fn to_strand_with_domain(
     offer_crossing: bool,
     domain: Option<Uint256>,
 ) -> (Ter, Strand) {
-    if src.is_zero() || dst.is_zero() {
+    if src.is_zero()
+        || dst.is_zero()
+        || *src == protocol::no_account()
+        || *dst == protocol::no_account()
+        || !asset_is_consistent(*deliver)
+        || send_max_asset.is_some_and(|asset| !asset_is_consistent(*asset))
+        || deliver.issuer() == protocol::no_account()
+        || send_max_asset.is_some_and(|asset| asset.issuer() == protocol::no_account())
+    {
         return (Ter::TEM_BAD_PATH, Vec::new());
+    }
+
+    for (index, element) in path.iter().enumerate() {
+        if validate_path_element(index, path, element) != Ter::TES_SUCCESS {
+            return (Ter::TEM_BAD_PATH, Vec::new());
+        }
     }
 
     let initial_asset = match *send_max_asset.unwrap_or(deliver) {
@@ -236,6 +250,48 @@ fn to_strand_with_domain(
     }
 
     (Ter::TES_SUCCESS, strand)
+}
+
+fn asset_is_consistent(asset: Asset) -> bool {
+    match asset {
+        Asset::Issue(issue) => protocol::is_consistent(issue),
+        Asset::MPTIssue(issue) => !issue.issuer().is_zero(),
+    }
+}
+
+/// Validate the serialized path surface before normalization. This is the
+/// ordered guard sequence in rippled PaySteps.cpp::toStrand; in particular a
+/// TypeNone element must not be silently interpreted as an offer node.
+fn validate_path_element(index: usize, path: &STPath, element: &protocol::STPathElement) -> Ter {
+    let node_type = element.node_type();
+    if (node_type & !protocol::STPathElement::TYPE_ALL) != 0
+        || node_type == protocol::STPathElement::TYPE_NONE
+    {
+        return Ter::TEM_BAD_PATH;
+    }
+
+    let has_account = (node_type & protocol::STPathElement::TYPE_ACCOUNT) != 0;
+    let has_issuer = (node_type & protocol::STPathElement::TYPE_ISSUER) != 0;
+    let has_currency = (node_type & protocol::STPathElement::TYPE_CURRENCY) != 0;
+    let has_mpt = (node_type & protocol::STPathElement::TYPE_MPT) != 0;
+    let has_asset = (node_type & protocol::STPathElement::TYPE_ASSET) != 0;
+
+    if has_account && (has_issuer || has_currency)
+        || has_issuer && element.issuer_id().is_zero()
+        || has_account && element.account_id().is_zero()
+        || has_currency
+            && has_issuer
+            && (protocol::is_xrp_currency(element.currency()) != element.issuer_id().is_zero())
+        || has_issuer && element.issuer_id() == protocol::no_account()
+        || has_account && element.account_id() == protocol::no_account()
+        || has_mpt && (has_currency || has_account)
+        || has_mpt && has_issuer && element.issuer_id() != Asset::from(element.mpt_id()).issuer()
+        || index > 0 && path[index - 1].has_mpt() && (has_account || (has_issuer && !has_asset))
+    {
+        return Ter::TEM_BAD_PATH;
+    }
+
+    Ter::TES_SUCCESS
 }
 
 pub fn to_strands(
@@ -1123,6 +1179,35 @@ mod tests {
 
         assert_eq!(ter, Ter::TEM_RIPPLE_EMPTY);
         assert!(strands.is_empty());
+    }
+
+    #[test]
+    fn type_none_explicit_path_is_rejected_before_normalization() {
+        let src = make_account(1);
+        let dst = make_account(2);
+        let gateway = make_account(3);
+        let deliver = Asset::Issue(Issue::new(make_currency("USD"), gateway));
+        let mut path = protocol::STPath::new();
+        path.push_back(protocol::STPathElement::inferred(
+            AccountID::zero(),
+            protocol::xrp_currency(),
+            AccountID::zero(),
+            false,
+        ));
+
+        let (ter, strand) = to_strand(
+            &src,
+            &dst,
+            &deliver,
+            Some(&Asset::Issue(xrp_issue())),
+            &path,
+            false,
+            false,
+        );
+
+        assert_eq!(path[0].node_type(), protocol::STPathElement::TYPE_NONE);
+        assert_eq!(ter, Ter::TEM_BAD_PATH);
+        assert!(strand.is_empty());
     }
 
     #[test]

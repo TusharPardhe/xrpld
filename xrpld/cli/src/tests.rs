@@ -16,6 +16,22 @@ mod tests {
     }
 
     #[test]
+    fn cli_ledger_audit_parses_network_ledger_and_output() {
+        let cli = Cli::try_parse_from([
+            "quaxar",
+            "ledger-audit",
+            "--network",
+            "testnet",
+            "--ledger",
+            "20296265",
+            "--output",
+            "/tmp/quaxar-audit",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command, Some(Command::LedgerAudit { .. })));
+    }
+
+    #[test]
     fn cli_health_parses() {
         let cli = Cli::try_parse_from(["quaxar", "health"]).unwrap();
         assert!(matches!(cli.command, Some(Command::Health)));

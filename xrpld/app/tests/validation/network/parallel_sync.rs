@@ -121,12 +121,11 @@ fn hash_mismatch_node_rejected() {
     assert_ne!(actual_hash, wrong_hash);
 }
 
-/// Test: Empty payload node is handled gracefully.
+/// Test: Empty payloads cannot form account-state SHAMap leaves.
 #[test]
-fn empty_payload_node_handled() {
-    let node = leaf_node(key(0x33), &[]);
-    // Should still produce a valid (non-zero) hash
-    assert_ne!(node.get_hash(), SHAMapHash::default());
+#[should_panic(expected = "SHAMap leaf item payload below minimum size")]
+fn empty_payload_leaf_is_rejected() {
+    let _ = leaf_node(key(0x33), &[]);
 }
 
 /// Test: Maximum size payload node works.

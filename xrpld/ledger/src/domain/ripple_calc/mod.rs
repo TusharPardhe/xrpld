@@ -241,16 +241,6 @@ fn ripple_calculate_inner<V: ApplyView>(
     paths: &STPathSet,
     input: &RippleCalcInput,
 ) -> Result<RippleCalcOutput, ViewError> {
-    if frozen_iou_endpoint(view, dst_amount, src_account, dst_account)?
-        || frozen_iou_endpoint(view, max_source_amount, src_account, dst_account)?
-    {
-        return Ok(RippleCalcOutput {
-            result: Ter::TEC_PATH_DRY,
-            actual_amount_in: max_source_amount.zeroed(),
-            actual_amount_out: dst_amount.zeroed(),
-        });
-    }
-
     // This replaces the simplified try_default_path approach.
     let deliver_asset = dst_amount.asset();
     let send_max_asset = if max_source_amount.asset() != dst_amount.asset() {
@@ -332,26 +322,6 @@ fn ripple_calculate_inner<V: ApplyView>(
         actual_amount_in: max_source_amount.zeroed(),
         actual_amount_out: dst_amount.zeroed(),
     })
-}
-
-fn frozen_iou_endpoint<V: ApplyView>(
-    view: &mut V,
-    amount: &STAmount,
-    src_account: &AccountID,
-    dst_account: &AccountID,
-) -> Result<bool, ViewError> {
-    let Asset::Issue(issue) = amount.asset() else {
-        return Ok(false);
-    };
-
-    if amount.native() || *src_account == issue.account || *dst_account == issue.account {
-        return Ok(false);
-    }
-
-    Ok(
-        crate::domain::ripple_state_helpers::try_is_frozen(view, src_account, &issue)?
-            || crate::domain::ripple_state_helpers::try_is_frozen(view, dst_account, &issue)?,
-    )
 }
 
 #[allow(dead_code)]
@@ -870,9 +840,78 @@ fn try_explicit_path<V: ApplyView>(
 }
 #[cfg(test)]
 mod tests {
-    use protocol::{STAmount, Ter, XRPAmount};
+    use basics::{base_uint::Uint256, string_utilities::str_unhex};
+    use protocol::{
+        ApplyFlags, LedgerHeader, STAmount, STTx, SerialIter, Ter, XRPAmount, get_field_by_symbol,
+    };
+    use shamap::{
+        item::SHAMapItem,
+        mutation::MutableTree,
+        sync::{SHAMapType, SyncState, SyncTree},
+        tree_node::SHAMapNodeType,
+    };
+    use std::sync::Arc;
 
-    use super::preserves_partial_flow_result;
+    use super::{RippleCalcInput, preserves_partial_flow_result, ripple_calculate};
+
+    fn canonical_20453340_payment_view() -> (crate::ApplyViewImpl<crate::Ledger>, STTx) {
+        let entries = [
+            (
+                "F6814EDE3FE7E0B5760D9C24C5E320467270F2D48357B7506A58F139E7623300",
+                "110061220000000024013817CD25013817CF2D0000000155310CE7E99B26450F597D2F039A5726786E3364633F9642C2D9C75A7104BEBB44624000000005F5E0F181149FEB510FBD0FA510A4DF8545EBEC9E6B489DE63E",
+            ),
+            (
+                "588CCD89EE8F7176AA0E796B6CB3AAE3F19D7DF539E3F9BEDDAFD23181A7DC75",
+                "110061220000000024013817D125013817DB2D00000001552601FBB558FB41697E155829A4C32EB6DC851DAEBCC9F741B355613E15E0E049624000000005F5E0B58114A8BCBDD8E9BD995D962F4A2EEAEDAC0B9D93D7BA",
+            ),
+            (
+                "F5A3371E1A0E2C39596C06330913154E3A5F078A412F712A1A8175D842709E29",
+                "110061220080000024013817CC25013817D52D0000000155D180562EF98C0EE6C8C98959E991D6C4DA40159F447119D160018EA7E340009D624000000005F5E0D38114B2FAE10016981B1BBABE8DD63958DBFB4CDCB5AC",
+            ),
+            (
+                "90D9474DA52FCA1188FFEEF0019DAFFB715F72271B5E9A1AB3CEDBAE2576DD35",
+                "110072220011000025013817D3370000000000000000380000000000000000557A25F37A13EA479C8C7B4AF95CD45248A81FB19BDFD98CD8153615807541A46662D551C37937E080007573640000000000000000000000000000000000000000000000000000000000000000000000000166D5838D7EA4C6800075736400000000000000000000000000000000009FEB510FBD0FA510A4DF8545EBEC9E6B489DE63E6780000000000000007573640000000000000000000000000000000000B2FAE10016981B1BBABE8DD63958DBFB4CDCB5AC",
+            ),
+            (
+                "24E247061AD981274F83DAF4CC2D1AF814532DF5C3CDED20B828F88180FA3E3D",
+                "110072220093000025013817D937000000000000000038000000000000000055354ECEE39F6145578FBF29A638FD0F93249A68200E14AB2265D8DE5D7C6F21E66280000000000000007573640000000000000000000000000000000000000000000000000000000000000000000000000166D5838D7EA4C680007573640000000000000000000000000000000000A8BCBDD8E9BD995D962F4A2EEAEDAC0B9D93D7BA6780000000000000007573640000000000000000000000000000000000B2FAE10016981B1BBABE8DD63958DBFB4CDCB5AC",
+            ),
+        ];
+        let mut tree = MutableTree::new(1);
+        for (key, raw) in entries {
+            tree.add_item(
+                SHAMapNodeType::AccountState,
+                SHAMapItem::new(
+                    Uint256::from_hex(key).expect("canonical ledger key"),
+                    str_unhex(raw).expect("canonical ledger entry"),
+                ),
+            )
+            .expect("unique canonical ledger entry");
+        }
+        let state = SyncTree::from_root_with_type(
+            tree.root(),
+            SHAMapType::State,
+            false,
+            20_453_340,
+            SyncState::Immutable,
+        );
+        let txs = SyncTree::new_with_type(SHAMapType::Transaction, false, 20_453_340);
+        let ledger = crate::Ledger::from_maps(
+            LedgerHeader {
+                seq: 20_453_340,
+                close_time: 841_762_460,
+                ..LedgerHeader::default()
+            },
+            state,
+            txs,
+        );
+        let tx_raw = str_unhex("12000024013817CD61D551C37937E080007573640000000000000000000000000000000000B2FAE10016981B1BBABE8DD63958DBFB4CDCB5AC68400000000000000F7321ED7EC3E83B1D1967DFAAD276D02DF3D6176DF8A849EB755472AA98CA9888E9219E744064AF66FB90E79236367D3B494212D9B00C58F64520FBF133037E2CD072C3346AA20805A7796961415A4ABF3EF991851DF5763BA1049C1FD71BBB9FC3FC2F190C81149FEB510FBD0FA510A4DF8545EBEC9E6B489DE63E8314A8BCBDD8E9BD995D962F4A2EEAEDAC0B9D93D7BA").expect("canonical transaction");
+        let tx = STTx::from_serial_iter(&mut SerialIter::new(&tx_raw));
+        (
+            crate::ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE),
+            tx,
+        )
+    }
 
     #[test]
     fn preserves_nonzero_partial_flow_result_without_committing_its_sandbox() {
@@ -889,6 +928,33 @@ mod tests {
             Ter::TEC_PATH_PARTIAL,
             &delivered.zeroed()
         ));
+    }
+
+    #[test]
+    fn canonical_holder_to_holder_iou_payment_is_not_path_dry() {
+        let (mut view, tx) = canonical_20453340_payment_view();
+        let amount = tx.get_field_amount(get_field_by_symbol("sfAmount"));
+        let source = tx.get_account_id(get_field_by_symbol("sfAccount"));
+        let destination = tx.get_account_id(get_field_by_symbol("sfDestination"));
+        let result = ripple_calculate(
+            &mut view,
+            &amount,
+            &amount,
+            &destination,
+            &source,
+            &protocol::STPathSet::new(get_field_by_symbol("sfPaths")),
+            &RippleCalcInput {
+                partial_payment_allowed: false,
+                default_paths_allowed: true,
+                limit_quality: false,
+                is_ledger_open: false,
+                domain_id: None,
+            },
+        )
+        .expect("canonical parent state is readable");
+        assert_eq!(result.result, Ter::TES_SUCCESS);
+        assert_eq!(result.actual_amount_in, amount);
+        assert_eq!(result.actual_amount_out, amount);
     }
 }
 

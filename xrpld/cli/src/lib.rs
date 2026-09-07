@@ -9,6 +9,7 @@ pub mod doctor;
 pub mod fee;
 pub mod health;
 pub mod interactive;
+pub mod ledger_audit;
 pub mod ledger_cmd;
 pub mod log_level;
 pub mod logo;
@@ -119,6 +120,22 @@ pub enum Command {
     Ledger {
         /// Ledger sequence (omit for validated)
         seq: Option<u64>,
+    },
+    /// Download an immutable canonical-ledger audit fixture for offline replay
+    #[command(name = "ledger-audit")]
+    LedgerAudit {
+        /// Canonical network to query
+        #[arg(long, value_parser = ["testnet", "mainnet"])]
+        network: String,
+        /// Ledger sequence or 64-character ledger hash
+        #[arg(long)]
+        ledger: String,
+        /// Directory to create for the immutable capture
+        #[arg(long)]
+        output: std::path::PathBuf,
+        /// Override the canonical JSON-RPC endpoint
+        #[arg(long)]
+        source_url: Option<String>,
     },
     /// Show account info
     Account {

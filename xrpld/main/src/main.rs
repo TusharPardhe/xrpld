@@ -421,6 +421,7 @@ fn try_cli_subcommand() -> Option<ExitCode> {
         "amendments",
         "fee",
         "ledger",
+        "ledger-audit",
         "account",
         "stop",
         "connect",
@@ -547,6 +548,12 @@ fn try_cli_subcommand() -> Option<ExitCode> {
         quaxar_cli::Command::Amendments => quaxar_cli::amendments::run(url),
         quaxar_cli::Command::Fee => quaxar_cli::fee::run(url),
         quaxar_cli::Command::Ledger { seq } => quaxar_cli::ledger_cmd::run(url, seq),
+        quaxar_cli::Command::LedgerAudit {
+            network,
+            ledger,
+            output,
+            source_url,
+        } => quaxar_cli::ledger_audit::run(&network, &ledger, &output, source_url.as_deref()),
         quaxar_cli::Command::Account { address } => quaxar_cli::account::run(url, &address),
         quaxar_cli::Command::Stop => quaxar_cli::stop::run(url),
         quaxar_cli::Command::Connect { address } => {

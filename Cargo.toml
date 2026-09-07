@@ -27,4 +27,4 @@ resolver = "2"
 [workspace.package]
 # Single release source for every Quaxar workspace crate and the protocol
 # version advertised through server_info and peer handshakes.
-version = "0.8.0"
+version = "0.8.1"

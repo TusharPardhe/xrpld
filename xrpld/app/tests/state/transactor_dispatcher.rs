@@ -1266,15 +1266,15 @@ fn escrow_finish_mpt_cleanup_3_4_rounds_transfer_fee_down() {
     let issuance_id = share_id_for(issuer, 1);
     let amount = STAmount::from_mpt_amount(
         sf("sfAmount"),
-        MPTAmount::from_value(10_000),
+        MPTAmount::from_value(10_011),
         MPTIssue::new(issuance_id),
     );
 
     let mut issuance =
         mpt_issuance_entry_with_transfer_fee(issuer, 1, 100_000, MPT_CAN_TRANSFER_FLAG, 100);
-    issuance.set_field_u64(sf("sfLockedAmount"), 10_000);
-    let mut owner_token = mptoken_entry(owner, issuance_id, 90_000);
-    owner_token.set_field_u64(sf("sfLockedAmount"), 10_000);
+    issuance.set_field_u64(sf("sfLockedAmount"), 10_011);
+    let mut owner_token = mptoken_entry(owner, issuance_id, 89_989);
+    owner_token.set_field_u64(sf("sfLockedAmount"), 10_011);
     let escrow_keylet = protocol::escrow_keylet(raw_account_id(owner), 1);
     let mut escrow = STLedgerEntry::from_type_and_key(LedgerEntryType::Escrow, escrow_keylet.key);
     escrow.set_account_id(sf("sfAccount"), owner);
@@ -1284,7 +1284,7 @@ fn escrow_finish_mpt_cleanup_3_4_rounds_transfer_fee_down() {
     escrow.set_field_u64(sf("sfOwnerNode"), 0);
 
     for (cleanup_3_4, expected_delivered, expected_outstanding) in
-        [(false, 9_991, 99_991), (true, 9_990, 99_990)]
+        [(false, 10_001, 99_990), (true, 10_000, 99_989)]
     {
         let mut ledger = ledger_with_header(
             LedgerHeader {
@@ -1402,6 +1402,7 @@ fn escrow_finish_created_mpt_records_its_issuance_id() {
         protocol::feature_id("fixTokenEscrowV1"),
         protocol::feature_id("fixCleanup3_4_0"),
         protocol::feature_id("TokenEscrow"),
+        protocol::feature_id("MPTokensV2"),
     ]));
     let tx = STTx::new(TxType::ESCROW_FINISH, |object| {
         object.set_account_id(sf("sfAccount"), destination);
@@ -3864,7 +3865,7 @@ fn check_create_rejects_mpt_when_transfer_is_disabled() {
         object.set_field_u32(get_field_by_symbol("sfSequence"), 2);
     });
 
-    let result = handle_real_dispatch(&mut view, &tx, TxType::CHECK_CREATE, None);
+    let result = dispatch_with_pre_fee_balance(&mut view, &tx, TxType::CHECK_CREATE);
 
     assert_eq!(result, Ter::TEC_NO_AUTH);
     assert!(
@@ -5134,7 +5135,7 @@ fn mpt_escrow_create_then_finish_tracks_gross_lock_across_fix_token_escrow_v1() 
         });
         let mut finish_view = Sandbox::new(Arc::new(ledger.clone()), ApplyFlags::NONE);
         assert_eq!(
-            handle_real_dispatch(&mut finish_view, &finish, TxType::ESCROW_FINISH, None),
+            dispatch_with_pre_fee_balance(&mut finish_view, &finish, TxType::ESCROW_FINISH),
             Ter::TES_SUCCESS,
             "MPT escrow finish must succeed with amendment enabled={amendment_enabled}"
         );
@@ -5273,7 +5274,7 @@ fn mpt_escrow_create_then_cancel_enforces_boundary_and_releases_full_lock() {
         });
         let mut boundary_view = Sandbox::new(Arc::new(ledger.clone()), ApplyFlags::NONE);
         assert_eq!(
-            handle_real_dispatch(&mut boundary_view, &cancel, TxType::ESCROW_CANCEL, None),
+            dispatch_with_pre_fee_balance(&mut boundary_view, &cancel, TxType::ESCROW_CANCEL),
             Ter::TEC_NO_PERMISSION,
             "CancelAfter is not cancellable at its exact boundary"
         );
@@ -5283,7 +5284,7 @@ fn mpt_escrow_create_then_cancel_enforces_boundary_and_releases_full_lock() {
         ledger.set_ledger_info(header);
         let mut cancel_view = Sandbox::new(Arc::new(ledger.clone()), ApplyFlags::NONE);
         assert_eq!(
-            handle_real_dispatch(&mut cancel_view, &cancel, TxType::ESCROW_CANCEL, None),
+            dispatch_with_pre_fee_balance(&mut cancel_view, &cancel, TxType::ESCROW_CANCEL),
             Ter::TES_SUCCESS,
             "MPT escrow cancel must succeed after CancelAfter with amendment enabled={amendment_enabled}"
         );
@@ -5401,7 +5402,7 @@ fn mpt_escrow_cancel_missing_owner_holding_matches_cleanup_3_2_0_boundary() {
         ledger.set_rules(protocol::Rules::new(features));
         let mut view = Sandbox::new(Arc::new(ledger), ApplyFlags::NONE);
         assert_eq!(
-            handle_real_dispatch(&mut view, &cancel, TxType::ESCROW_CANCEL, None),
+            dispatch_with_pre_fee_balance(&mut view, &cancel, TxType::ESCROW_CANCEL),
             expected,
             "fixCleanup3_2_0 enabled={cleanup_enabled}"
         );
@@ -5439,7 +5440,7 @@ fn payment_transfers_mpt_without_rewriting_issue() {
         object.set_field_u32(get_field_by_symbol("sfSequence"), 1);
     });
 
-    let result = handle_real_dispatch(&mut view, &tx, TxType::PAYMENT, None);
+    let result = dispatch_with_pre_fee_balance(&mut view, &tx, TxType::PAYMENT);
 
     assert_eq!(result, Ter::TES_SUCCESS);
     let source_token = view
@@ -5682,7 +5683,7 @@ fn payment_recycles_max_issued_mpt_between_holders() {
     });
 
     assert_eq!(
-        handle_real_dispatch(&mut view, &tx, TxType::PAYMENT, None),
+        dispatch_with_pre_fee_balance(&mut view, &tx, TxType::PAYMENT),
         Ter::TES_SUCCESS
     );
     assert_eq!(
@@ -12156,11 +12157,10 @@ fn vault_create_dispatch_requires_mptokens_v1_before_apply() {
     )]));
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
 
-    let result = handle_real_dispatch(
+    let result = dispatch_with_pre_fee_balance(
         &mut view,
         &vault_create_tx(owner, Asset::Issue(xrp_issue()), 1),
         TxType::VAULT_CREATE,
-        None,
     );
 
     assert_eq!(result, protocol::Ter::TEM_DISABLED);
@@ -12284,11 +12284,10 @@ fn vault_create_sets_share_reference_holding_for_mpt_after_cleanup_3_2_0() {
     ]));
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
 
-    let result = handle_real_dispatch(
+    let result = dispatch_with_pre_fee_balance(
         &mut view,
         &vault_create_tx(owner, asset, 1),
         TxType::VAULT_CREATE,
-        None,
     );
 
     assert_eq!(result, protocol::Ter::TES_SUCCESS);
@@ -13115,7 +13114,7 @@ fn vault_deposit_empty_iou_vault_mints_scale_adjusted_shares() {
         );
     });
 
-    let result = handle_real_dispatch(&mut view, &tx, TxType::VAULT_DEPOSIT, None);
+    let result = dispatch_with_pre_fee_balance(&mut view, &tx, TxType::VAULT_DEPOSIT);
 
     assert_eq!(result, protocol::Ter::TES_SUCCESS);
     let share = view

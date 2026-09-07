@@ -628,6 +628,14 @@ pub(super) fn validates_mpt_lifecycle_counts(
         return true;
     }
 
+    // EscrowFinish may create the destination holder's MPToken while
+    // releasing an MPT escrow. rippled permits that lifecycle change here,
+    // after the amendment-gated authorization checks above, rather than
+    // assigning EscrowFinish the broader MayAuthorizeMpt privilege.
+    if txn_type == protocol::TxType::ESCROW_FINISH {
+        return true;
+    }
+
     if has_may_delete_mpt_privilege(txn_type)
         && lifecycle.tokens_created == 0
         && lifecycle.issuances_created == 0
