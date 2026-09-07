@@ -30,6 +30,27 @@ pub trait Backend: Send + Sync + 'static {
 
     fn fetch(&self, hash: &Uint256) -> (Option<Arc<NodeObject>>, Status);
 
+    /// Fast, conservative membership pre-check for a key.
+    ///
+    /// Returns `false` only when the backend can prove the key is absent (for
+    /// example via a Bloom filter), allowing callers to skip an authoritative
+    /// [`Backend::fetch`]. Returns `true` when the key might be present or when
+    /// the backend has no membership index. The default is `true`, preserving
+    /// existing behavior: callers must always perform the real fetch.
+    ///
+    /// A `false` result must never be returned for a stored key (no false
+    /// negatives), so it is always safe to skip the fetch on `false`.
+    fn may_contain(&self, _hash: &Uint256) -> bool {
+        true
+    }
+
+    /// Evicts any in-memory membership filter (e.g. a Bloom filter) to reclaim
+    /// RAM. Default is a no-op for backends without one. Called when a
+    /// transient filter built to accelerate a bounded phase (such as history
+    /// backfill) is no longer needed. Safe at any time: subsequent
+    /// [`Backend::may_contain`] calls simply revert to `true` (must-check).
+    fn evict_membership_filter(&self) {}
+
     fn fetch_batch(&self, hashes: &[Uint256]) -> (Vec<Option<Arc<NodeObject>>>, Status);
 
     /// Stores one object, reporting backend failures to the caller so it does

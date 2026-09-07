@@ -5,6 +5,7 @@ use crate::{
 use arc_swap::ArcSwapOption;
 use basics::base_uint::Uint256;
 use basics::basic_config::Section;
+use basics::memory::bloom::BloomFilter;
 use dashmap::DashMap;
 use rayon::prelude::*;
 use std::any::Any;
@@ -630,6 +631,18 @@ pub struct NuDbBackendConfig {
     pub path: String,
     pub block_size: usize,
     pub layout: NuDbLayout,
+    /// When true, the backend maintains an in-memory Bloom filter of stored
+    /// keys so callers can skip authoritative reads for guaranteed-absent
+    /// keys. Default false: no behavior change unless explicitly enabled via
+    /// `bloom_filter = 1` in the node_db section.
+    pub bloom_enabled: bool,
+    /// Bits per key for the Bloom filter sizing (accuracy vs memory). Default
+    /// 10 (~1% false-positive rate). Ignored when `bloom_enabled` is false.
+    pub bloom_bits_per_key: usize,
+    /// Expected key count used to size the Bloom filter at open time when the
+    /// live count is not yet known. Default 0 lets the backend derive size
+    /// from the on-disk key count during the build pass.
+    pub bloom_expected_keys: usize,
 }
 
 impl NuDbBackendConfig {
@@ -651,12 +664,36 @@ impl NuDbBackendConfig {
         let block_size = parse_nudb_block_size(parameters, journal)?;
         let layout = NuDbLayout::from_base_path(&path);
 
+        // Bloom filter is opt-in and defaults off so behavior is unchanged
+        // unless an operator enables it. `bloom_filter` accepts 1/true; any
+        // other value (or absence) leaves it disabled.
+        let bloom_enabled = parameters
+            .get::<String>("bloom_filter")
+            .ok()
+            .flatten()
+            .map(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+        let bloom_bits_per_key = parameters
+            .get::<usize>("bloom_bits_per_key")
+            .ok()
+            .flatten()
+            .filter(|bits| *bits > 0)
+            .unwrap_or(10);
+        let bloom_expected_keys = parameters
+            .get::<usize>("bloom_expected_keys")
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+
         Ok(Self {
             key_bytes,
             burst_size,
             path,
             block_size,
             layout,
+            bloom_enabled,
+            bloom_bits_per_key,
+            bloom_expected_keys,
         })
     }
 
@@ -802,6 +839,9 @@ pub struct NuDbMetrics {
     pub burst_flush_ns: AtomicU64,
     pub burst_sync_ns: AtomicU64,
     pub burst_commit_count: AtomicUsize,
+    /// Number of fetches short-circuited to NotFound by the Bloom skip gate
+    /// (guaranteed-absent keys that avoided a bucket/data read).
+    pub bloom_skipped_reads: AtomicUsize,
 }
 
 struct StoreLockTiming<'a> {
@@ -851,6 +891,13 @@ pub struct NuDbBackend {
     key_file_size: AtomicU64,
     /// When true, store() skips existence checks and burst checkpoints for fast bulk loading.
     bulk_importing: AtomicBool,
+    /// Optional in-memory Bloom filter of stored keys. Present only when
+    /// `config.bloom_enabled` is true. Consulted in `fetch`/`fetch_batch`/
+    /// `may_contain` to skip guaranteed-absent reads, and updated on every
+    /// successful store. Wrapped in `ArcSwapOption` so it can be rebuilt at
+    /// open time and evicted (set to `None`) to reclaim RAM when no longer
+    /// needed (for example after history backfill completes).
+    bloom: ArcSwapOption<BloomFilter>,
     pub metrics: Arc<NuDbMetrics>,
 }
 
@@ -929,6 +976,7 @@ impl NuDbBackend {
             data_file_size: AtomicU64::new(0),
             key_file_size: AtomicU64::new(0),
             bulk_importing: AtomicBool::new(false),
+            bloom: ArcSwapOption::empty(),
             metrics: Arc::new(NuDbMetrics::default()),
         })
     }
@@ -1070,6 +1118,85 @@ impl NuDbBackend {
         let uid = now_nanos ^ counter.rotate_left(17) ^ (pid << 32);
         let salt = now_nanos.rotate_left(7) ^ counter.rotate_left(29) ^ pid;
         NuDbOpenArgs::quaxar_default(uid.max(1), salt.max(1))
+    }
+
+    /// Builds the in-memory Bloom filter from the current on-disk key set when
+    /// `config.bloom_enabled` is true. Called after the backend is open (so the
+    /// runtime lock is released and `for_each` can acquire its own locks). This
+    /// is O(number of stored keys); it is a no-op when the filter is disabled.
+    ///
+    /// The filter is sized from `bloom_expected_keys` if configured, otherwise
+    /// from a first counting pass over the store, so it is right-sized without
+    /// requiring the operator to know the key count.
+    fn build_bloom_if_enabled(&self) {
+        if !self.config.bloom_enabled {
+            return;
+        }
+        let started = Instant::now();
+
+        // Determine capacity: prefer the configured hint, else count keys.
+        let expected = if self.config.bloom_expected_keys > 0 {
+            self.config.bloom_expected_keys
+        } else {
+            let mut count = 0usize;
+            self.for_each(&mut |_object| {
+                count += 1;
+            });
+            count.max(1)
+        };
+
+        let filter = BloomFilter::with_capacity(expected, self.config.bloom_bits_per_key);
+        let mut inserted = 0usize;
+        self.for_each(&mut |object| {
+            filter.insert(object.get_hash());
+            inserted += 1;
+        });
+        let memory_bytes = filter.memory_bytes();
+        self.bloom.store(Some(Arc::new(filter)));
+        tracing::info!(
+            target: "nodestore",
+            path = %self.config.path,
+            keys = inserted,
+            memory_bytes,
+            bits_per_key = self.config.bloom_bits_per_key,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "NuDB bloom filter built"
+        );
+    }
+
+    /// Records a key into the Bloom filter if one is active. Cheap no-op when
+    /// the filter is disabled or not yet built. Called on every successful
+    /// store so the filter never lags behind the durable key set.
+    #[inline]
+    fn bloom_insert(&self, hash: &Uint256) {
+        if let Some(filter) = self.bloom.load().as_deref() {
+            filter.insert(hash);
+        }
+    }
+
+    /// Evicts the Bloom filter, freeing its RAM. Used when a transient filter
+    /// (for example one built to accelerate history backfill) is no longer
+    /// needed. Safe to call at any time: subsequent `may_contain` calls simply
+    /// return `true` (must-check) until a filter is rebuilt.
+    pub fn evict_bloom(&self) {
+        if self.bloom.load().is_some() {
+            self.bloom.store(None);
+            tracing::info!(target: "nodestore", path = %self.config.path, "NuDB bloom filter evicted");
+        }
+    }
+
+    /// Returns whether a Bloom filter is currently active for this backend.
+    pub fn has_bloom(&self) -> bool {
+        self.bloom.load().is_some()
+    }
+
+    /// Returns the Bloom filter's resident bytes, or 0 when none is active.
+    pub fn bloom_memory_bytes(&self) -> usize {
+        self.bloom
+            .load()
+            .as_deref()
+            .map(BloomFilter::memory_bytes)
+            .unwrap_or(0)
     }
 
     fn create_file_set(&self, plan: &NuDbOpenPlan) -> Result<NuDbKeyFileHeader, String> {
@@ -2381,7 +2508,9 @@ impl Backend for NuDbBackend {
             create_if_missing,
             self.default_open_args
                 .unwrap_or_else(|| self.build_random_open_args()),
-        )
+        )?;
+        self.build_bloom_if_enabled();
+        Ok(())
     }
 
     fn open_deterministic(
@@ -2394,7 +2523,9 @@ impl Backend for NuDbBackend {
         self.open_with_args(
             create_if_missing,
             NuDbOpenArgs::deterministic(app_type, uid, salt),
-        )
+        )?;
+        self.build_bloom_if_enabled();
+        Ok(())
     }
 
     fn is_open(&self) -> bool {
@@ -2487,6 +2618,16 @@ impl Backend for NuDbBackend {
 
     fn fetch(&self, _hash: &Uint256) -> (Option<Arc<NodeObject>>, Status) {
         let hash = _hash;
+        // Bloom skip gate: when a filter is active and proves the key absent,
+        // return NotFound without touching the bucket/data files. No false
+        // negatives, so this is safe; a false positive simply falls through to
+        // the normal lookup below.
+        if let Some(filter) = self.bloom.load().as_deref() {
+            if !filter.may_contain(hash) {
+                self.metrics.bloom_skipped_reads.fetch_add(1, Ordering::Relaxed);
+                return (None, Status::NotFound);
+            }
+        }
         match self.find_bucket_entry(hash.data()) {
             Ok(Some(entry)) => {
                 let value = match self.read_data_record_value(entry) {
@@ -2520,6 +2661,20 @@ impl Backend for NuDbBackend {
                 (None, Status::BackendError)
             }
         }
+    }
+
+    fn may_contain(&self, hash: &Uint256) -> bool {
+        // Only answers `false` when a filter is active and proves absence.
+        // Without a filter, defaults to `true` (must check), matching the
+        // trait default.
+        match self.bloom.load().as_deref() {
+            Some(filter) => filter.may_contain(hash),
+            None => true,
+        }
+    }
+
+    fn evict_membership_filter(&self) {
+        self.evict_bloom();
     }
 
     fn fetch_batch(&self, hashes: &[Uint256]) -> (Vec<Option<Arc<NodeObject>>>, Status) {
@@ -2780,6 +2935,12 @@ impl Backend for NuDbBackend {
             }
             Ok(())
         })();
+        // On a successful (or already-present) store, record the key in the
+        // Bloom filter so subsequent skip-gate probes observe it. No-op when
+        // the filter is disabled.
+        if result.is_ok() {
+            self.bloom_insert(object.get_hash());
+        }
         result.map_err(|error| self.fail_stop_write_if_checkpointed(error))
     }
 
@@ -2936,6 +3097,16 @@ impl Backend for NuDbBackend {
             tracing::debug!(target: "nodestore", objects_written, batch_size_bytes, "Batch flush complete");
             Ok(())
         })();
+        // Record every batched key in the Bloom filter on success. Idempotent
+        // and a no-op when the filter is disabled. Keeps the filter consistent
+        // for the high-volume acquisition/backfill write path.
+        if result.is_ok() {
+            if let Some(filter) = self.bloom.load().as_deref() {
+                for object in batch {
+                    filter.insert(object.get_hash());
+                }
+            }
+        }
         result.map_err(|error| self.fail_stop_write_if_checkpointed(error))
     }
 

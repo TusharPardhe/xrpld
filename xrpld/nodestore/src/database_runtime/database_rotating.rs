@@ -247,9 +247,22 @@ impl DatabaseDelegate for DatabaseRotatingCore {
         };
 
         let (mut writable, archive) = self.backends();
-        let mut node_object = fetch(&writable);
+        // Skip the writable probe when its Bloom filter proves the key absent.
+        // may_contain defaults to true for backends without a filter, so this
+        // preserves behavior when the filter is disabled. No false negatives,
+        // so a false skip cannot drop a present node.
+        let mut node_object = if writable.may_contain(hash) {
+            fetch(&writable)
+        } else {
+            None
+        };
         if node_object.is_none() {
-            node_object = fetch(&archive);
+            // Likewise skip the archive probe on a guaranteed miss.
+            node_object = if archive.may_contain(hash) {
+                fetch(&archive)
+            } else {
+                None
+            };
             if let Some(node_object_ref) = &node_object {
                 let copy_forward = !duplicate
                     && self
@@ -854,6 +867,13 @@ impl DatabaseTrait for DatabaseRotatingImp {
             writable_backend: Arc::clone(&state.writable_backend),
             archive_backend: Arc::clone(&state.archive_backend),
         }))
+    }
+
+    fn evict_membership_filter(&self) {
+        // Intentional no-op: a rotating database relies on its writable and
+        // archive membership filters to skip cross-store probes in steady
+        // state, so they must not be evicted after backfill. Their memory is
+        // reclaimed naturally when a backend generation is dropped on rotation.
     }
 }
 

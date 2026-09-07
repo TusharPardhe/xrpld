@@ -74,6 +74,12 @@ impl DatabaseDelegate for DatabaseNodeImpCore {
         }
         node_object
     }
+
+    fn evict_membership_filter(&self) {
+        // Single-store delegate: forward to the backend so its transient
+        // (e.g. backfill-acceleration) Bloom filter memory is reclaimed.
+        self.backend.evict_membership_filter();
+    }
 }
 
 pub struct DatabaseNodeImp {

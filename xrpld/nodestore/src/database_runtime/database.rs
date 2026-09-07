@@ -225,6 +225,20 @@ pub trait Database: DatabaseSource + DatabaseImporter + Send + Sync + 'static {
     fn export_backend(&self) -> Option<Arc<dyn Backend>> {
         None
     }
+
+    /// Evicts an in-memory membership filter (e.g. a Bloom filter) on the
+    /// primary backend to reclaim RAM once a transient accelerator (such as a
+    /// history-backfill filter on a single store) is no longer needed.
+    ///
+    /// The default forwards to the primary [`export_backend`], which is correct
+    /// for a single non-rotating store. Rotating databases override this to a
+    /// no-op because they still need the writable/archive filters to skip
+    /// cross-store probes in steady state.
+    fn evict_membership_filter(&self) {
+        if let Some(backend) = self.export_backend() {
+            backend.evict_membership_filter();
+        }
+    }
 }
 
 /// reference-style rotating owner extension.
@@ -275,6 +289,12 @@ pub trait DatabaseDelegate: Send + Sync + 'static {
         duplicate: bool,
         journal: &dyn NodeStoreJournal,
     ) -> Option<Arc<NodeObject>>;
+
+    /// Evicts an in-memory membership filter (e.g. a Bloom filter) on the
+    /// underlying backend to reclaim RAM. Default is a no-op; concrete
+    /// single-store delegates override this to forward to their backend, while
+    /// rotating delegates keep the default no-op so their filters survive.
+    fn evict_membership_filter(&self) {}
 }
 
 struct AsyncReadRequest {
@@ -783,6 +803,15 @@ impl DatabaseRuntime {
 
     pub fn get_store_count(&self) -> u64 {
         self.inner.store_count.load(Ordering::Relaxed)
+    }
+
+    /// Evicts the primary backend's in-memory membership filter to reclaim
+    /// RAM. Intended to be called once history backfill completes: on a single
+    /// (non-rotating) store the Bloom filter was only a sync accelerator and is
+    /// dead weight in steady state, whereas rotating databases override this to
+    /// a no-op and keep their filters. Safe when no filter is present.
+    pub fn evict_membership_filter(&self) {
+        self.inner.delegate.evict_membership_filter();
     }
 
     pub fn get_fetch_total_count(&self) -> u64 {
