@@ -51,6 +51,18 @@ impl SHAMapStoreNodeStore {
             Self::Rotating(database) => database.export_backend(),
         }
     }
+
+    /// Evicts an in-memory membership (Bloom) filter to reclaim RAM once a
+    /// transient backfill accelerator is no longer needed. Single stores free
+    /// the filter; rotating stores keep theirs (the rotating implementation
+    /// overrides this to a no-op) because they need it for steady-state
+    /// cross-store probe skipping.
+    pub fn evict_membership_filter(&self) {
+        match self {
+            Self::Single(database) => database.evict_membership_filter(),
+            Self::Rotating(database) => database.evict_membership_filter(),
+        }
+    }
 }
 
 pub struct SHAMapStoreBackendBundle {

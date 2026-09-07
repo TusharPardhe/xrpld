@@ -2744,6 +2744,19 @@ fn fill_verified_history_range(
         stop_reason = ?plan.stop_reason,
         "materialized verified contiguous history range"
     );
+
+    // Once the trusted contiguous history backwalk reaches its floor, the
+    // node-store membership (Bloom) filter has served its purpose as a
+    // backfill/acquisition accelerator: steady-state reads see a negligible
+    // miss rate, so the filter is dead weight. Evict it to reclaim RAM. This
+    // is a safe, idempotent no-op for single stores without a filter and for
+    // rotating stores (which keep their filters for cross-store probe skips).
+    if matches!(
+        plan.stop_reason,
+        ledger::LedgerHistoryFillStopReason::ReachedGenesis
+    ) {
+        root.evict_node_store_membership_filter();
+    }
 }
 
 fn persist_completed_inbound_ledger(

@@ -9283,6 +9283,20 @@ impl ApplicationRoot {
         self.load_fee_track.is_loaded_local()
     }
 
+    /// Evicts the node store's in-memory membership (Bloom) filter, if any.
+    ///
+    /// Intended to be called once history backfill has completed: for a single
+    /// (non-rotating) store the filter was only a sync/backfill accelerator and
+    /// provides negligible steady-state benefit, so freeing it reclaims RAM.
+    /// Rotating stores keep their filters (the rotating store treats this as a
+    /// no-op) because they still use them to skip cross-store probes. Safe when
+    /// no node store or no filter is configured.
+    pub fn evict_node_store_membership_filter(&self) {
+        if let Some(node_store) = self.node_store().as_ref() {
+            node_store.evict_membership_filter();
+        }
+    }
+
     /// Returns the active NodeStore write backlog. Before the store is
     /// attached there is no pending persistence work, so return zero.
     /// Matches rippled's `app_.getNodeStore().getWriteLoad()`.
