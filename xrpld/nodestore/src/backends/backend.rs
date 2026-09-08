@@ -51,6 +51,19 @@ pub trait Backend: Send + Sync + 'static {
     /// [`Backend::may_contain`] calls simply revert to `true` (must-check).
     fn evict_membership_filter(&self) {}
 
+    /// Starts building the in-memory membership filter in the background, if the
+    /// backend supports one and it is enabled. Takes an `Arc<Self>` so the build
+    /// can run on a spawned thread without blocking the caller (notably node
+    /// startup). Default is a no-op. Callers invoke this once, immediately after
+    /// [`Backend::open`], from a context that holds the backend as an `Arc`.
+    ///
+    /// Until the background build completes, reads must not treat the filter as
+    /// authoritative (a partially populated filter could otherwise report a
+    /// present key as absent); the implementation is responsible for gating
+    /// read consultation on build completion. Concurrent writes during the
+    /// build still populate the filter so no newly stored key is missed.
+    fn start_membership_filter_build(self: Arc<Self>) {}
+
     fn fetch_batch(&self, hashes: &[Uint256]) -> (Vec<Option<Arc<NodeObject>>>, Status);
 
     /// Stores one object, reporting backend failures to the caller so it does

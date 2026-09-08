@@ -121,22 +121,31 @@ skip a backend without knowing its internals.
 
 ### 3.3 Lifecycle (the hard part)
 
-- **Build at open:** iterate existing keys via the store's `for_each`
-  key-iteration to populate the filter, OR rebuild lazily. With `fast_load=1`
-  the node already walks the tree at startup, so a build pass is affordable but
-  must be measured (29M keys @ 10 bits ≈ 36 MiB, build is O(n) key reads).
-- **Update on write:** every `store`/`store_batch_result` sets bits under
-  `store_mutex` *before* releasing, so a subsequent local scan sees them.
-- **Rotation:** the new writable backend starts with an empty (or freshly built)
-  filter; the archive keeps its filter until dropped. The existing
-  "copy archive-served reads forward into writable" path must also set the
-  writable filter bit for the copied key.
+- **Build at open (non-blocking):** at store open, `init_bloom_if_enabled`
+  publishes an EMPTY, right-sized filter (sized from `bloom_expected_keys` or a
+  default constant — never a counting scan) and marks it `bloom_ready = false`.
+  This does NOT scan the store and does NOT block startup. A background thread
+  (`start_membership_filter_build`, holding an `Arc<NuDbBackend>`) then does a
+  single-pass `for_each` populate of the existing key set and flips
+  `bloom_ready = true` on completion.
+- **Reads gated on readiness:** `fetch`/`may_contain` only consult the filter
+  when `bloom_ready` is true. A partially populated filter is never trusted, so
+  it can never report a stored key as absent (no read-layer false negative).
+- **Writes always populate:** every `store`/`store_batch_result` sets bits on
+  the published filter immediately (even during the background build), so no
+  key stored after open is ever missed. Insert is an atomic `fetch_or`, so the
+  background populate and concurrent writes race safely on the same filter.
+- **Startup is never blocked:** the earlier synchronous, two-pass, main-thread
+  build blocked node boot on a large store; this design fixes that.
+- **Rotation:** the new writable backend starts with an empty filter and its
+  own background build; the archive keeps its filter until dropped. Archive
+  copy-forward goes through `writable.store`, which sets the writable filter
+  bit automatically.
 - **Backfill writes:** history fill writes go through the same `store` path, so
   the filter stays consistent automatically.
 - **Saturation:** bloom FPR degrades as it fills beyond its designed capacity.
-  Size to expected node count for the configured `node_size`/history; if a store
-  exceeds capacity, either grow (rebuild larger) or accept degraded FPR (still
-  correct, just less skipping).
+  Size via `bloom_expected_keys` for the deployment; over/under-sizing only
+  affects FPR, never correctness.
 
 ### 3.4 Safety argument
 
