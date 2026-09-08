@@ -125,6 +125,92 @@ impl BloomFilter {
         self.hashes
     }
 
+    /// Serializes the filter to a self-describing byte buffer for persistence.
+    ///
+    /// Layout (all little-endian):
+    /// - magic: 8 bytes `BLOOMFL1`
+    /// - version: u32
+    /// - hashes (`k`): u32
+    /// - block_count: u64
+    /// - word_count: u64 (== block_count * BLOCK_WORDS, stored for validation)
+    /// - words: `word_count` * u64 (the bit array, snapshot via atomic loads)
+    ///
+    /// The snapshot is taken with relaxed atomic loads; callers should persist
+    /// when the filter is quiescent (e.g. on clean shutdown) so the on-disk
+    /// image is coherent. A slightly stale snapshot is still safe on reload
+    /// because [`Self::load`] validation plus the ready-gate ensure the filter
+    /// is only trusted when it fully covers the store.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let word_count = self.words.len();
+        let mut out = Vec::with_capacity(32 + word_count * 8);
+        out.extend_from_slice(Self::MAGIC);
+        out.extend_from_slice(&Self::FORMAT_VERSION.to_le_bytes());
+        out.extend_from_slice(&self.hashes.to_le_bytes());
+        out.extend_from_slice(&(self.block_count as u64).to_le_bytes());
+        out.extend_from_slice(&(word_count as u64).to_le_bytes());
+        for word in self.words.iter() {
+            out.extend_from_slice(&word.load(Ordering::Relaxed).to_le_bytes());
+        }
+        out
+    }
+
+    /// Reconstructs a filter from bytes produced by [`Self::to_bytes`].
+    ///
+    /// Returns `None` (rather than a partial/garbage filter) if the magic,
+    /// version, or size fields are invalid or inconsistent, so a corrupt or
+    /// mismatched on-disk image is safely ignored and the caller can rebuild.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        // Header: 8 (magic) + 4 (version) + 4 (hashes) + 8 (block_count) + 8 (word_count) = 32
+        if bytes.len() < 32 || &bytes[0..8] != Self::MAGIC {
+            return None;
+        }
+        let read_u32 = |o: usize| -> u32 {
+            let mut b = [0u8; 4];
+            b.copy_from_slice(&bytes[o..o + 4]);
+            u32::from_le_bytes(b)
+        };
+        let read_u64 = |o: usize| -> u64 {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&bytes[o..o + 8]);
+            u64::from_le_bytes(b)
+        };
+        let version = read_u32(8);
+        if version != Self::FORMAT_VERSION {
+            return None;
+        }
+        let hashes = read_u32(12);
+        let block_count = read_u64(16) as usize;
+        let word_count = read_u64(24) as usize;
+        // Consistency: word_count must equal block_count * BLOCK_WORDS and the
+        // buffer must contain exactly that many words after the header.
+        if block_count == 0
+            || word_count != block_count * BLOCK_WORDS
+            || bytes.len() != 32 + word_count * 8
+            || hashes == 0
+            || hashes > 16
+        {
+            return None;
+        }
+        let mut words = Vec::with_capacity(word_count);
+        for i in 0..word_count {
+            let off = 32 + i * 8;
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&bytes[off..off + 8]);
+            words.push(AtomicU64::new(u64::from_le_bytes(b)));
+        }
+        Some(Self {
+            words: words.into_boxed_slice(),
+            block_count,
+            hashes,
+        })
+    }
+
+    /// Magic marker identifying a persisted filter image.
+    const MAGIC: &'static [u8; 8] = b"BLOOMFL1";
+    /// On-disk format version. Bump when the layout or hashing changes so old
+    /// images are rejected and rebuilt rather than misinterpreted.
+    const FORMAT_VERSION: u32 = 1;
+
     /// Derives the base hash pair for a key.
     ///
     /// The node-store key is already a 256-bit cryptographic hash, so its bytes

@@ -119,33 +119,45 @@ Expose an optional `Backend::may_contain(hash) -> bool` trait method
 (default `true` = "no filter, must check") so callers (rotation, broker) can
 skip a backend without knowing its internals.
 
-### 3.3 Lifecycle (the hard part)
+### 3.3 Lifecycle (persisted, full-coverage design)
 
-- **Build at open (non-blocking):** at store open, `init_bloom_if_enabled`
-  publishes an EMPTY, right-sized filter (sized from `bloom_expected_keys` or a
-  default constant — never a counting scan) and marks it `bloom_ready = false`.
-  This does NOT scan the store and does NOT block startup. A background thread
-  (`start_membership_filter_build`, holding an `Arc<NuDbBackend>`) then does a
-  single-pass `for_each` populate of the existing key set and flips
-  `bloom_ready = true` on completion.
-- **Reads gated on readiness:** `fetch`/`may_contain` only consult the filter
-  when `bloom_ready` is true. A partially populated filter is never trusted, so
-  it can never report a stored key as absent (no read-layer false negative).
-- **Writes always populate:** every `store`/`store_batch_result` sets bits on
-  the published filter immediately (even during the background build), so no
-  key stored after open is ever missed. Insert is an atomic `fetch_or`, so the
-  background populate and concurrent writes race safely on the same filter.
-- **Startup is never blocked:** the earlier synchronous, two-pass, main-thread
-  build blocked node boot on a large store; this design fixes that.
-- **Rotation:** the new writable backend starts with an empty filter and its
-  own background build; the archive keeps its filter until dropped. Archive
-  copy-forward goes through `writable.store`, which sets the writable filter
-  bit automatically.
-- **Backfill writes:** history fill writes go through the same `store` path, so
-  the filter stays consistent automatically.
-- **Saturation:** bloom FPR degrades as it fills beyond its designed capacity.
-  Size via `bloom_expected_keys` for the deployment; over/under-sizing only
-  affects FPR, never correctness.
+The filter must have COMPLETE coverage of the on-disk key set to be safe on the
+shared read path (a write-only filter is unsafe: it would report pre-existing
+on-disk keys as absent to consensus/RPC readers). Completeness requires a
+one-time scan; persistence avoids paying that scan on every restart.
+
+- **Load at open (fast path):** `init_bloom_if_enabled` first tries to read the
+  persisted image `nudb.bloom` (versioned `BLOOMFL1` header, validated for
+  magic/version/size). If valid, it publishes the filter and marks it READY
+  immediately — no scan, startup not blocked, skip-gate usable at once.
+- **Build on first run only (slow path):** if there is no valid image, publish
+  an empty filter (NOT ready). A background thread runs `populate_bloom`, a
+  single I/O-THROTTLED pass over the existing key set (sleeps briefly every
+  `BLOOM_BUILD_THROTTLE_BATCH` keys so it never starves live consensus /
+  acquisition I/O on the shared store — the earlier unthrottled scan did). On
+  completion it PERSISTS the image (atomic temp+rename) and flips ready.
+- **Persist on shutdown:** `close()` writes the current built filter so the
+  next start takes the fast load path instead of rescanning.
+- **Writes always populate:** `store`/`store_batch_result` set bits on the
+  live filter (loaded or building), so coverage stays complete for keys written
+  after the persisted snapshot; atomic `fetch_or` makes this race-safe.
+- **Reads gated on readiness:** `fetch`/`may_contain` consult the filter only
+  when `bloom_ready` (complete coverage). A loaded or fully-built filter is
+  authoritative, so `DefinitelyAbsent` is safe to act on (skip the read); a
+  partially-built filter is never consulted.
+- **Eviction:** `evict_bloom` (e.g. after backfill on a single store) drops the
+  in-memory filter AND removes the persisted image, so an evicted filter is
+  never reloaded as authoritative.
+- **Rotation:** each generation persists/loads its own image; rotating stores
+  keep their filters (their `evict` is a no-op).
+- **Corruption/mismatch safety:** any invalid persisted image is ignored and
+  the filter is rebuilt, never misinterpreted.
+
+Known refinement: the background build currently starts right after open; the
+throttle prevents I/O starvation during catch-up, and persistence means it runs
+at most once ever. Gating the build to start only after the node reaches Full
+is a further improvement (requires an app-layer readiness signal into the
+store).
 
 ### 3.4 Safety argument
 

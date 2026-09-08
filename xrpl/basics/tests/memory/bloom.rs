@@ -107,3 +107,42 @@ fn hashes_within_block_bounds() {
     // k for 10 bits/key = round(10 * ln2) = 7.
     assert_eq!(filter.hashes(), 7);
 }
+
+#[test]
+fn serialize_round_trip_preserves_membership() {
+    let count = 20_000usize;
+    let filter = BloomFilter::with_capacity(count, 10);
+    for i in 0..count as u64 {
+        filter.insert(&key_from_seed(i));
+    }
+    let bytes = filter.to_bytes();
+    let restored = BloomFilter::from_bytes(&bytes).expect("round-trip must decode");
+    // Every inserted key must still be possibly-present after reload.
+    for i in 0..count as u64 {
+        assert_eq!(
+            restored.probe(&key_from_seed(i)),
+            Membership::PossiblyPresent,
+            "reloaded filter lost inserted key seed {i}"
+        );
+    }
+    assert_eq!(restored.hashes(), filter.hashes());
+    assert_eq!(restored.memory_bytes(), filter.memory_bytes());
+}
+
+#[test]
+fn from_bytes_rejects_corrupt_or_mismatched_images() {
+    let filter = BloomFilter::with_capacity(1_000, 10);
+    let good = filter.to_bytes();
+    // Too short.
+    assert!(BloomFilter::from_bytes(&good[..16]).is_none());
+    // Bad magic.
+    let mut bad_magic = good.clone();
+    bad_magic[0] = b'X';
+    assert!(BloomFilter::from_bytes(&bad_magic).is_none());
+    // Truncated body (drop trailing words).
+    assert!(BloomFilter::from_bytes(&good[..good.len() - 8]).is_none());
+    // Empty buffer.
+    assert!(BloomFilter::from_bytes(&[]).is_none());
+    // A valid image still decodes.
+    assert!(BloomFilter::from_bytes(&good).is_some());
+}
