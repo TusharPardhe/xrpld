@@ -2321,6 +2321,15 @@ fn check_accept_and_advance(
             );
             tracing::info!(target: "app", ?current_mode, ?next_mode, "strand: operating mode promoted");
             root.set_network_ops_operating_mode_with_reason(next_mode, "accept_promotion");
+            // Once the node has reached Full it is settled: startup load,
+            // replay, and catch-up acquisition are done, so disk demand is low.
+            // This is the safe moment to kick off the one-time node-store
+            // membership (Bloom) filter build, whose store scan must never
+            // compete with those heavy phases. Idempotent: a no-op if the
+            // filter is already built/loaded or bloom is disabled.
+            if next_mode == NetworkOpsOperatingMode::Full {
+                root.trigger_node_store_membership_build();
+            }
         }
     }
 

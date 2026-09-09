@@ -9297,6 +9297,18 @@ impl ApplicationRoot {
         }
     }
 
+    /// Triggers the one-time background build of the node store's membership
+    /// (Bloom) filter. Called only once the node is settled (has reached Full
+    /// and is stable), so the build's store scan runs when disk demand is low
+    /// and never competes with startup load / replay / catch-up I/O. Idempotent
+    /// and safe when no node store or no filter is configured; the backend
+    /// no-ops if a filter is already ready or bloom is disabled.
+    pub fn trigger_node_store_membership_build(&self) {
+        if let Some(node_store) = self.node_store().as_ref() {
+            node_store.trigger_membership_filter_build();
+        }
+    }
+
     /// Returns the active NodeStore write backlog. Before the store is
     /// attached there is no pending persistence work, so return zero.
     /// Matches rippled's `app_.getNodeStore().getWriteLoad()`.

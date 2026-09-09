@@ -109,30 +109,35 @@ fn hashes_within_block_bounds() {
 }
 
 #[test]
-fn serialize_round_trip_preserves_membership() {
+fn serialize_round_trip_preserves_membership_and_binding() {
     let count = 20_000usize;
     let filter = BloomFilter::with_capacity(count, 10);
     for i in 0..count as u64 {
         filter.insert(&key_from_seed(i));
     }
-    let bytes = filter.to_bytes();
+    let store_uid = 0xABCD_1234_5678_9F01u64;
+    let watermark = 987_654_321u64;
+    let bytes = filter.to_bytes(store_uid, watermark);
     let restored = BloomFilter::from_bytes(&bytes).expect("round-trip must decode");
-    // Every inserted key must still be possibly-present after reload.
+    // Binding metadata survives.
+    assert_eq!(restored.store_uid, store_uid);
+    assert_eq!(restored.durable_watermark, watermark);
+    // Every inserted key is still possibly-present after reload.
     for i in 0..count as u64 {
         assert_eq!(
-            restored.probe(&key_from_seed(i)),
+            restored.filter.probe(&key_from_seed(i)),
             Membership::PossiblyPresent,
             "reloaded filter lost inserted key seed {i}"
         );
     }
-    assert_eq!(restored.hashes(), filter.hashes());
-    assert_eq!(restored.memory_bytes(), filter.memory_bytes());
+    assert_eq!(restored.filter.hashes(), filter.hashes());
+    assert_eq!(restored.filter.memory_bytes(), filter.memory_bytes());
 }
 
 #[test]
 fn from_bytes_rejects_corrupt_or_mismatched_images() {
     let filter = BloomFilter::with_capacity(1_000, 10);
-    let good = filter.to_bytes();
+    let good = filter.to_bytes(1, 1);
     // Too short.
     assert!(BloomFilter::from_bytes(&good[..16]).is_none());
     // Bad magic.

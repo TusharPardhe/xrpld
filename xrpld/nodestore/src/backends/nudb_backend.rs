@@ -1144,60 +1144,115 @@ impl NuDbBackend {
         self.config.layout.base_path.join("nudb.bloom")
     }
 
+    /// The owning store's stable identity, used to bind a persisted filter to
+    /// this exact store (edge cases E1/E2). Read from the NuDB key-file header,
+    /// which is stable across restarts for the same store and differs for a
+    /// freshly-created or foreign store. Returns 0 if the header is unavailable
+    /// (treated as "no identity" -> a persisted image cannot match -> rebuild).
+    fn store_uid(&self) -> u64 {
+        self.current_key_header().map(|h| h.uid).unwrap_or(0)
+    }
+
+    /// A monotonic marker of how much durable store state exists, used to detect
+    /// a persisted filter that is BEHIND the store (edge case E9: an unclean
+    /// crash could persist a stale image missing recently durable-written
+    /// keys). We use the data-file size: it only grows as records are appended,
+    /// so `store_watermark >= filter_watermark` proves the filter cannot be
+    /// missing any durable key that existed at persist time.
+    fn durable_watermark(&self) -> u64 {
+        self.data_file_size.load(Ordering::Acquire)
+    }
+
     /// Prepares the Bloom filter at open time.
     ///
-    /// Fast path: if a valid persisted filter image exists on disk, load it and
-    /// mark the filter READY immediately — no store scan, so the fetch
-    /// skip-gate is usable right away and startup is not blocked. The loaded
-    /// image reflects the key set as of the last clean persist; any keys
-    /// written after that are added to the (mutable) loaded filter via the
-    /// normal `store` hooks, so coverage stays complete.
+    /// Fast path: if a persisted image exists AND is bound to THIS store (its
+    /// `store_uid` matches and its `durable_watermark` is not ahead of the
+    /// store), load it and mark READY immediately — no scan, startup not
+    /// blocked, skip-gate usable at once. Store writes after the snapshot are
+    /// added to the loaded filter via the `store` hooks, keeping coverage
+    /// complete.
     ///
-    /// Slow path (no valid image): publish an empty, right-sized filter marked
-    /// NOT ready. `store` writes populate it immediately (so nothing written
-    /// after open is missed), and `populate_bloom` — run on a background thread
-    /// once the node is settled — scans the existing key set, persists the
-    /// result, and flips ready. Reads ignore the filter until ready.
+    /// Rebuild path (no image, or a stale/foreign/behind/corrupt image, or a
+    /// freshly-created store): publish an empty filter marked NOT ready, and
+    /// invalidate any unusable on-disk image. The one-time scan is deferred to
+    /// `populate_bloom`, triggered only once the node is settled (never during
+    /// fast_load/replay/catch-up), so it cannot starve sync I/O. Reads ignore
+    /// the filter until ready; writes populate it meanwhile.
     ///
-    /// Capacity is taken from `bloom_expected_keys` when configured, else a
-    /// generous default; never sized by a counting scan.
+    /// `store_uid == 0` (header unavailable) or any mismatch/behind/corrupt
+    /// image results in a rebuild. A freshly-created store is handled naturally:
+    /// it has a new `uid` that cannot match any pre-existing image, so a stale
+    /// image is rejected (edge case E1) without needing a separate flag.
     fn init_bloom_if_enabled(&self) {
         if !self.config.bloom_enabled {
             return;
         }
-        // Try the persisted image first.
         let path = self.bloom_file_path();
+
         match fs::read(&path) {
-            Ok(bytes) => {
-                if let Some(filter) = BloomFilter::from_bytes(&bytes) {
-                    let memory_bytes = filter.memory_bytes();
-                    self.bloom.store(Some(Arc::new(filter)));
-                    self.bloom_ready.store(true, Ordering::Release);
-                    tracing::info!(
+            Ok(bytes) => match BloomFilter::from_bytes(&bytes) {
+                Some(persisted) => {
+                    let store_uid = self.store_uid();
+                    let watermark = self.durable_watermark();
+                    // Accept only if bound to THIS store (uid) and not behind
+                    // the store's durable state (watermark). Otherwise the
+                    // image could report real on-disk keys as absent.
+                    if persisted.store_uid == store_uid
+                        && store_uid != 0
+                        && persisted.durable_watermark <= watermark
+                    {
+                        let memory_bytes = persisted.filter.memory_bytes();
+                        self.bloom.store(Some(Arc::new(persisted.filter)));
+                        self.bloom_ready.store(true, Ordering::Release);
+                        tracing::info!(
+                            target: "nodestore",
+                            path = %self.config.path,
+                            memory_bytes,
+                            store_uid,
+                            image_watermark = persisted.durable_watermark,
+                            store_watermark = watermark,
+                            "NuDB bloom filter loaded from disk (ready); no scan needed"
+                        );
+                        return;
+                    }
+                    tracing::warn!(
                         target: "nodestore",
                         path = %self.config.path,
-                        memory_bytes,
-                        "NuDB bloom filter loaded from disk (ready); no scan needed"
+                        image_uid = persisted.store_uid,
+                        store_uid,
+                        image_watermark = persisted.durable_watermark,
+                        store_watermark = watermark,
+                        "persisted NuDB bloom image does not match this store (uid/watermark); rebuilding"
                     );
-                    return;
+                    let _ = fs::remove_file(&path);
                 }
-                tracing::warn!(
-                    target: "nodestore",
-                    path = %self.config.path,
-                    file = %path.display(),
-                    "persisted NuDB bloom image invalid; will rebuild"
-                );
-            }
+                None => {
+                    tracing::warn!(
+                        target: "nodestore",
+                        path = %self.config.path,
+                        file = %path.display(),
+                        "persisted NuDB bloom image corrupt/old-format; rebuilding"
+                    );
+                    let _ = fs::remove_file(&path);
+                }
+            },
             Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
                 tracing::warn!(
                     target: "nodestore",
                     path = %self.config.path,
                     %error,
-                    "could not read persisted NuDB bloom image; will rebuild"
+                    "could not read persisted NuDB bloom image; rebuilding"
                 );
             }
             Err(_) => { /* NotFound: first build, fall through */ }
         }
+        self.publish_empty_bloom();
+    }
+
+    /// Publishes an empty, right-sized, not-ready filter. Writes populate it
+    /// immediately; the one-time scan (`populate_bloom`) fills the pre-existing
+    /// keys later, once the node is settled.
+    fn publish_empty_bloom(&self) {
         let expected = if self.config.bloom_expected_keys > 0 {
             self.config.bloom_expected_keys
         } else {
@@ -1211,20 +1266,20 @@ impl NuDbBackend {
             path = %self.config.path,
             expected_keys = expected,
             bits_per_key = self.config.bloom_bits_per_key,
-            "NuDB bloom filter initialized (empty); background population pending"
+            "NuDB bloom filter initialized (empty); deferred population pending until node settled"
         );
     }
 
     /// Populates the Bloom filter from the existing on-disk key set in a single,
-    /// I/O-throttled pass, persists the result, then marks it ready. Intended
-    /// to run on a background thread (see `start_membership_filter_build`),
-    /// only when no valid persisted image was loaded at open. Inserts into the
-    /// already-published filter `Arc`, so it races safely with concurrent
-    /// `store` writes (both use atomic bit sets).
+    /// I/O-throttled pass, persists the result (bound to this store), then marks
+    /// it ready. Intended to run on a background thread once the node is settled
+    /// (see `start_membership_filter_build`), only when no valid persisted image
+    /// was loaded at open. Inserts into the already-published filter `Arc`, so
+    /// it races safely with concurrent `store` writes (both use atomic bits).
     ///
     /// The scan yields the CPU periodically (a short sleep every
-    /// `BLOOM_BUILD_THROTTLE_BATCH` keys) so it does not starve the node's live
-    /// ledger-acquisition and consensus reads/writes on the shared store.
+    /// `BLOOM_BUILD_THROTTLE_BATCH` keys) as defense-in-depth so it does not
+    /// starve live I/O even if triggered while the node is still busy.
     fn populate_bloom(&self) {
         if !self.config.bloom_enabled || self.bloom_ready.load(Ordering::Acquire) {
             return;
@@ -1233,24 +1288,28 @@ impl NuDbBackend {
             return;
         };
         let started = Instant::now();
+        // Capture the watermark BEFORE the scan: the persisted image will be
+        // tagged as covering at least this much durable state. Using the
+        // pre-scan value is conservative (the scan may also pick up newer keys),
+        // guaranteeing the tagged watermark never overstates coverage.
+        let watermark = self.durable_watermark();
+        let store_uid = self.store_uid();
         let mut inserted = 0usize;
         self.for_each(&mut |object| {
             filter.insert(object.get_hash());
             inserted += 1;
-            // Throttle: yield the disk/CPU periodically so the background build
-            // never starves live consensus/acquisition I/O on the shared store.
             if inserted % BLOOM_BUILD_THROTTLE_BATCH == 0 {
                 std::thread::sleep(BLOOM_BUILD_THROTTLE_SLEEP);
             }
         });
         // Only persist/flip-ready if this filter is still the active one (it
-        // could have been evicted mid-build); Arc identity guards that.
+        // could have been evicted mid-build); Arc identity guards that (E7).
         let still_active = self
             .bloom
             .load_full()
             .is_some_and(|active| Arc::ptr_eq(&active, &filter));
         if still_active {
-            self.persist_bloom_filter(&filter);
+            self.persist_bloom_filter(&filter, store_uid, watermark);
             self.bloom_ready.store(true, Ordering::Release);
         }
         tracing::info!(
@@ -1265,19 +1324,21 @@ impl NuDbBackend {
     }
 
     /// Writes the filter image to disk atomically (temp file + rename) so a
-    /// crash mid-write cannot leave a torn image that would be silently trusted
-    /// on the next open. Best-effort: a failure is logged, not fatal (the node
-    /// simply rebuilds next start).
-    fn persist_bloom_filter(&self, filter: &BloomFilter) {
+    /// crash mid-write cannot leave a torn image trusted on the next open (E3).
+    /// The image is bound to `store_uid` + `watermark` so a stale/foreign image
+    /// is rejected on load. Best-effort: a failure is logged, not fatal.
+    fn persist_bloom_filter(&self, filter: &BloomFilter, store_uid: u64, watermark: u64) {
         let path = self.bloom_file_path();
         let tmp = path.with_extension("bloom.tmp");
-        let bytes = filter.to_bytes();
+        let bytes = filter.to_bytes(store_uid, watermark);
         let result = fs::write(&tmp, &bytes).and_then(|()| fs::rename(&tmp, &path));
         match result {
             Ok(()) => tracing::info!(
                 target: "nodestore",
                 path = %self.config.path,
                 bytes = bytes.len(),
+                store_uid,
+                watermark,
                 "persisted NuDB bloom filter to disk"
             ),
             Err(error) => {
@@ -1292,15 +1353,16 @@ impl NuDbBackend {
         }
     }
 
-    /// Persists the currently-active, fully-built filter to disk if present.
-    /// Called on clean shutdown so the next start can load instead of rescan.
-    /// No-op when disabled, not built, or evicted.
+    /// Persists the currently-active, fully-built filter to disk if present,
+    /// bound to the store's current uid + watermark. Called on clean shutdown
+    /// so the next start can load instead of rescan. No-op when disabled, not
+    /// built, or evicted.
     fn persist_bloom_on_shutdown(&self) {
         if !self.config.bloom_enabled || !self.bloom_ready.load(Ordering::Acquire) {
             return;
         }
         if let Some(filter) = self.bloom.load_full() {
-            self.persist_bloom_filter(&filter);
+            self.persist_bloom_filter(&filter, self.store_uid(), self.durable_watermark());
         }
     }
 
@@ -1314,18 +1376,27 @@ impl NuDbBackend {
         }
     }
 
-    /// Evicts the Bloom filter, freeing its RAM. Used when a transient filter
-    /// (for example one built to accelerate history backfill) is no longer
-    /// needed. Safe to call at any time: subsequent `may_contain` calls simply
-    /// return `true` (must-check) until a filter is rebuilt.
+    /// Evicts the Bloom filter FROM RAM, freeing its ~memory, but KEEPS the
+    /// persisted on-disk image. Used once the node has been caught up for a
+    /// while and the filter's acquisition benefit is exhausted (the steady-
+    /// state miss rate is ~0.07%, so the in-RAM filter is dead weight). Keeping
+    /// the disk image means a later behind-restart can reload it instantly
+    /// instead of rescanning. Before eviction, the current filter is persisted
+    /// so the on-disk image reflects the latest coverage.
+    ///
+    /// After eviction, `may_contain`/`fetch` revert to "must check" (the ready
+    /// gate is cleared), which is always safe.
     pub fn evict_bloom(&self) {
         if self.bloom.load().is_some() {
+            // Flush current coverage to disk first so the kept image is current.
+            if self.bloom_ready.load(Ordering::Acquire) {
+                if let Some(filter) = self.bloom.load_full() {
+                    self.persist_bloom_filter(&filter, self.store_uid(), self.durable_watermark());
+                }
+            }
             self.bloom_ready.store(false, Ordering::Release);
             self.bloom.store(None);
-            // Remove the persisted image too: an evicted filter must not be
-            // reloaded as authoritative on the next start.
-            let _ = fs::remove_file(self.bloom_file_path());
-            tracing::info!(target: "nodestore", path = %self.config.path, "NuDB bloom filter evicted");
+            tracing::info!(target: "nodestore", path = %self.config.path, "NuDB bloom filter evicted from RAM (persisted image kept)");
         }
     }
 

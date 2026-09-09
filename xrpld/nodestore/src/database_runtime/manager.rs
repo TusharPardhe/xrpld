@@ -300,9 +300,6 @@ impl Manager for ManagerImp {
         )?;
         backend.open(true)?;
         let backend: Arc<dyn Backend> = backend.into();
-        // Kick off the membership (Bloom) filter background build, if enabled.
-        // Non-blocking: startup proceeds while the filter populates.
-        Arc::clone(&backend).start_membership_filter_build();
         DatabaseNodeImp::new(scheduler, read_threads, backend, config, journal)
     }
 
@@ -326,7 +323,6 @@ impl Manager for ManagerImp {
         )?;
         backend.open_deterministic(true, app_type, uid, salt)?;
         let backend: Arc<dyn Backend> = backend.into();
-        Arc::clone(&backend).start_membership_filter_build();
         DatabaseNodeImp::new(scheduler, read_threads, backend, config, journal)
     }
 
@@ -349,7 +345,6 @@ impl Manager for ManagerImp {
         )?;
         backend.open(true)?;
         let backend: Arc<dyn Backend> = backend.into();
-        Arc::clone(&backend).start_membership_filter_build();
         DatabaseNodeImp::new(scheduler, read_threads, backend, config, journal)
     }
 
@@ -372,7 +367,6 @@ impl Manager for ManagerImp {
         )?;
         backend.open(true)?;
         let backend: Arc<dyn Backend> = backend.into();
-        Arc::clone(&backend).start_membership_filter_build();
         DatabaseNodeImp::new(scheduler, read_threads, backend, config, journal)
     }
 
@@ -406,11 +400,6 @@ impl Manager for ManagerImp {
 
         let writable_backend: Arc<dyn Backend> = writable_backend.into();
         let archive_backend: Arc<dyn Backend> = archive_backend.into();
-        // Background-build the membership filter for both generations, if
-        // enabled. Non-blocking; rotation keeps these filters for steady-state
-        // cross-store probe skipping.
-        Arc::clone(&writable_backend).start_membership_filter_build();
-        Arc::clone(&archive_backend).start_membership_filter_build();
 
         DatabaseRotatingImp::new(
             scheduler,

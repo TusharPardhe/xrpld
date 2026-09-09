@@ -63,6 +63,17 @@ impl SHAMapStoreNodeStore {
             Self::Rotating(database) => database.evict_membership_filter(),
         }
     }
+
+    /// Triggers the one-time background build of the membership (Bloom) filter.
+    /// Called by the node only once it is settled (Full and stable), so the
+    /// build's store scan never competes with startup load / replay / catch-up
+    /// I/O. Idempotent; a no-op if already built/loaded or disabled.
+    pub fn trigger_membership_filter_build(&self) {
+        match self {
+            Self::Single(database) => database.trigger_membership_filter_build(),
+            Self::Rotating(database) => database.trigger_membership_filter_build(),
+        }
+    }
 }
 
 pub struct SHAMapStoreBackendBundle {

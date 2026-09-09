@@ -239,6 +239,20 @@ pub trait Database: DatabaseSource + DatabaseImporter + Send + Sync + 'static {
             backend.evict_membership_filter();
         }
     }
+
+    /// Triggers the one-time background build of the membership (Bloom) filter
+    /// on the primary backend, if enabled and not already built/loaded.
+    ///
+    /// This is called by the node ONLY once it is settled (reached Full and
+    /// stable), never during startup load / replay / catch-up, so the build's
+    /// store scan cannot starve the node's heavy sync I/O. The default forwards
+    /// to the primary [`export_backend`]. Idempotent and safe to call repeatedly
+    /// (the backend no-ops if a filter is already ready).
+    fn trigger_membership_filter_build(&self) {
+        if let Some(backend) = self.export_backend() {
+            backend.start_membership_filter_build();
+        }
+    }
 }
 
 /// reference-style rotating owner extension.

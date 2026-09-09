@@ -79,6 +79,19 @@ pub struct BloomFilter {
     hashes: u32,
 }
 
+/// A filter decoded from a persisted image, together with the store-binding
+/// metadata it was written with. The caller MUST validate `store_uid` and
+/// `durable_watermark` against the live store before trusting `filter` for
+/// reads; see the NuDB loader and edge cases E1/E2/E9 in the lifecycle plan.
+pub struct PersistedBloom {
+    /// The reconstructed filter.
+    pub filter: BloomFilter,
+    /// The owning store's identity at persist time (NuDB key-file `uid`).
+    pub store_uid: u64,
+    /// How much durable store state the filter covered at persist time.
+    pub durable_watermark: u64,
+}
+
 impl BloomFilter {
     /// Builds a filter sized for `expected_keys` at approximately
     /// `bits_per_key` bits each.
@@ -125,27 +138,42 @@ impl BloomFilter {
         self.hashes
     }
 
-    /// Serializes the filter to a self-describing byte buffer for persistence.
+    /// Serializes the filter to a self-describing byte buffer for persistence,
+    /// bound to the store it covers.
+    ///
+    /// `store_uid` and `durable_watermark` bind the image to a specific store
+    /// state so a stale, foreign, or behind image is rejected on load rather
+    /// than trusted (see [`PersistedBloom`] and the NuDB loader):
+    /// - `store_uid`: the owning store's stable identity (NuDB key-file `uid`).
+    ///   A different or freshly-created store has a different uid, so its old
+    ///   image is rejected (edge cases E1/E2).
+    /// - `durable_watermark`: a monotonic marker of how much durable store
+    ///   state the filter covers (e.g. the data-file size at persist time). On
+    ///   load, the store's current watermark must be >= this, proving the
+    ///   filter is not missing durable keys written after the snapshot (E9).
     ///
     /// Layout (all little-endian):
-    /// - magic: 8 bytes `BLOOMFL1`
+    /// - magic: 8 bytes `BLOOMFL2`
     /// - version: u32
     /// - hashes (`k`): u32
+    /// - store_uid: u64
+    /// - durable_watermark: u64
     /// - block_count: u64
     /// - word_count: u64 (== block_count * BLOCK_WORDS, stored for validation)
     /// - words: `word_count` * u64 (the bit array, snapshot via atomic loads)
     ///
-    /// The snapshot is taken with relaxed atomic loads; callers should persist
-    /// when the filter is quiescent (e.g. on clean shutdown) so the on-disk
-    /// image is coherent. A slightly stale snapshot is still safe on reload
-    /// because [`Self::load`] validation plus the ready-gate ensure the filter
-    /// is only trusted when it fully covers the store.
-    pub fn to_bytes(&self) -> Vec<u8> {
+    /// The snapshot uses relaxed atomic loads; callers should persist when the
+    /// filter is quiescent (clean shutdown / after build) so the image is
+    /// coherent. Coherence plus the load-time watermark check keep the filter
+    /// trustworthy only when it fully covers the current store.
+    pub fn to_bytes(&self, store_uid: u64, durable_watermark: u64) -> Vec<u8> {
         let word_count = self.words.len();
-        let mut out = Vec::with_capacity(32 + word_count * 8);
+        let mut out = Vec::with_capacity(Self::HEADER_LEN + word_count * 8);
         out.extend_from_slice(Self::MAGIC);
         out.extend_from_slice(&Self::FORMAT_VERSION.to_le_bytes());
         out.extend_from_slice(&self.hashes.to_le_bytes());
+        out.extend_from_slice(&store_uid.to_le_bytes());
+        out.extend_from_slice(&durable_watermark.to_le_bytes());
         out.extend_from_slice(&(self.block_count as u64).to_le_bytes());
         out.extend_from_slice(&(word_count as u64).to_le_bytes());
         for word in self.words.iter() {
@@ -154,14 +182,16 @@ impl BloomFilter {
         out
     }
 
-    /// Reconstructs a filter from bytes produced by [`Self::to_bytes`].
+    /// Reconstructs a filter and its binding metadata from bytes produced by
+    /// [`Self::to_bytes`].
     ///
     /// Returns `None` (rather than a partial/garbage filter) if the magic,
-    /// version, or size fields are invalid or inconsistent, so a corrupt or
-    /// mismatched on-disk image is safely ignored and the caller can rebuild.
-    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        // Header: 8 (magic) + 4 (version) + 4 (hashes) + 8 (block_count) + 8 (word_count) = 32
-        if bytes.len() < 32 || &bytes[0..8] != Self::MAGIC {
+    /// version, or size fields are invalid or inconsistent, so a corrupt image
+    /// (E3) or an old-format image (E4) is safely ignored. The caller is
+    /// responsible for validating the returned `store_uid` / `durable_watermark`
+    /// against the live store before TRUSTING the filter for reads (E1/E2/E9).
+    pub fn from_bytes(bytes: &[u8]) -> Option<PersistedBloom> {
+        if bytes.len() < Self::HEADER_LEN || &bytes[0..8] != Self::MAGIC {
             return None;
         }
         let read_u32 = |o: usize| -> u32 {
@@ -179,13 +209,13 @@ impl BloomFilter {
             return None;
         }
         let hashes = read_u32(12);
-        let block_count = read_u64(16) as usize;
-        let word_count = read_u64(24) as usize;
-        // Consistency: word_count must equal block_count * BLOCK_WORDS and the
-        // buffer must contain exactly that many words after the header.
+        let store_uid = read_u64(16);
+        let durable_watermark = read_u64(24);
+        let block_count = read_u64(32) as usize;
+        let word_count = read_u64(40) as usize;
         if block_count == 0
             || word_count != block_count * BLOCK_WORDS
-            || bytes.len() != 32 + word_count * 8
+            || bytes.len() != Self::HEADER_LEN + word_count * 8
             || hashes == 0
             || hashes > 16
         {
@@ -193,23 +223,31 @@ impl BloomFilter {
         }
         let mut words = Vec::with_capacity(word_count);
         for i in 0..word_count {
-            let off = 32 + i * 8;
+            let off = Self::HEADER_LEN + i * 8;
             let mut b = [0u8; 8];
             b.copy_from_slice(&bytes[off..off + 8]);
             words.push(AtomicU64::new(u64::from_le_bytes(b)));
         }
-        Some(Self {
-            words: words.into_boxed_slice(),
-            block_count,
-            hashes,
+        Some(PersistedBloom {
+            filter: Self {
+                words: words.into_boxed_slice(),
+                block_count,
+                hashes,
+            },
+            store_uid,
+            durable_watermark,
         })
     }
 
-    /// Magic marker identifying a persisted filter image.
-    const MAGIC: &'static [u8; 8] = b"BLOOMFL1";
+    /// Magic marker identifying a persisted, store-bound filter image.
+    const MAGIC: &'static [u8; 8] = b"BLOOMFL2";
     /// On-disk format version. Bump when the layout or hashing changes so old
     /// images are rejected and rebuilt rather than misinterpreted.
-    const FORMAT_VERSION: u32 = 1;
+    const FORMAT_VERSION: u32 = 2;
+    /// Fixed header size before the bit words:
+    /// 8 magic + 4 version + 4 hashes + 8 uid + 8 watermark + 8 block_count
+    /// + 8 word_count = 48 bytes.
+    const HEADER_LEN: usize = 48;
 
     /// Derives the base hash pair for a key.
     ///
