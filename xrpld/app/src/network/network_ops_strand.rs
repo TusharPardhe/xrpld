@@ -2155,6 +2155,15 @@ fn check_accept_and_advance(
         return;
     };
     let lm = lm_rt.ledger_master();
+    // Once the node is Full it is settled (startup load, replay, and catch-up
+    // are done and disk demand is low). Trigger the one-time node-store
+    // membership (Bloom) filter build here so it fires regardless of which
+    // operating-mode promotion path reached Full. Idempotent: the backend
+    // no-ops once the filter is built, loaded, or bloom is disabled, so calling
+    // it on each advance is safe.
+    if root.network_ops_operating_mode() == NetworkOpsOperatingMode::Full {
+        root.trigger_node_store_membership_build();
+    }
     // Preferred-LCL selection and installation were completed by the
     // strand-owned reconciliation before this maintenance pass. Keep the
     // existing transition gate for validation/publication consistency only.
