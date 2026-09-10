@@ -191,7 +191,6 @@ impl SHAMapSyncFilter for ConsensusTransSetSF {
 mod tests {
     use super::*;
     use basics::hardened_hash::HardenedHashBuilder;
-    use basics::intrusive_pointer::make_shared_intrusive;
     use protocol::{STAmount, TxType, get_field_by_symbol, serialize_blob};
     use time::Duration;
 
@@ -331,7 +330,7 @@ mod tests {
     #[test]
     fn temp_node_cache_satisfies_non_transaction_nodes_before_master_lookup() {
         let (factory, _) = factory();
-        let inner = make_shared_intrusive(shamap::tree_node::SHAMapTreeNode::new_inner(1));
+        let inner = shamap::tree_node::SHAMapTreeNode::new_inner(1);
         inner.set_child_hash(
             0,
             SHAMapHash::new(basics::base_uint::Uint256::from_array([0xAB; 32])),

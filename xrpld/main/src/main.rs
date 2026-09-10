@@ -1,24 +1,5 @@
 // Legacy catchup loop removed; NetworkOpsStrand handles all consensus duties.
 
-#[cfg(not(target_env = "msvc"))]
-#[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-
-// Configure jemalloc to immediately return freed pages to the OS.
-// Without this, jemalloc retains freed pages as "dirty" for potential reuse,
-// so RSS never decreases even after freeing 7.5M tree nodes (33GB+).
-// dirty_decay_ms:0 = purge dirty pages immediately
-// muzzy_decay_ms:0 = purge muzzy pages immediately
-#[cfg(not(target_env = "msvc"))]
-#[used]
-#[allow(non_upper_case_globals)]
-#[unsafe(no_mangle)]
-pub static _rjem_malloc_conf: Option<&'static libc::c_char> = Some(unsafe {
-    &*c"dirty_decay_ms:0,muzzy_decay_ms:0"
-        .as_ptr()
-        .cast::<libc::c_char>()
-});
-
 use app::{
     AppBootstrapOptions, AppBootstrapRuntime, MainRuntime, ManagedComponent, build_bootstrap_root,
     load_basic_config_file, parse_bootstrap_args, run_bootstrap_runtime,

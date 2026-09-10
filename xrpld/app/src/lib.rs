@@ -12,6 +12,35 @@
     clippy::type_complexity
 )]
 
+// Every executable hosting the application runtime must use the same allocator
+// that the periodic sweep purges. Keeping this in the library also covers the
+// standalone `quaxar-app` binary and prevents false allocator telemetry.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// Bound fragmentation from transient, cross-thread SHAMap acquisition graphs
+// while retaining parallel allocation and immediate release of unused pages.
+#[cfg(not(target_env = "msvc"))]
+const JEMALLOC_CONF: &std::ffi::CStr = c"narenas:4,dirty_decay_ms:0,muzzy_decay_ms:0";
+
+#[cfg(not(target_env = "msvc"))]
+#[used]
+#[allow(non_upper_case_globals)]
+#[unsafe(no_mangle)]
+pub static _rjem_malloc_conf: Option<&'static libc::c_char> =
+    Some(unsafe { &*JEMALLOC_CONF.as_ptr().cast::<libc::c_char>() });
+
+#[cfg(all(test, not(target_env = "msvc")))]
+mod allocator_configuration_tests {
+    #[test]
+    fn jemalloc_configuration_bounds_arenas_and_zeroes_decay() {
+        assert_eq!(
+            super::JEMALLOC_CONF.to_bytes(),
+            b"narenas:4,dirty_decay_ms:0,muzzy_decay_ms:0"
+        );
+    }
+}
 // Organized module groups
 pub mod amendments;
 pub mod bootstrap;

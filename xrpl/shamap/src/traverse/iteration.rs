@@ -742,7 +742,7 @@ mod tests {
     use crate::search::NodePathEntry;
     use crate::tree_node::{SHAMapNodeType, SHAMapTreeNode};
     use basics::base_uint::Uint256;
-    use basics::intrusive_pointer::{SharedIntrusive, make_shared_intrusive};
+    use basics::intrusive_pointer::SharedIntrusive;
     use basics::sha_map_hash::SHAMapHash;
 
     fn key(hex: &str) -> Uint256 {
@@ -775,22 +775,22 @@ mod tests {
         let mid_key = key("4000000000000000000000000000000000000000000000000000000000000000");
         let high_key = key("9000000000000000000000000000000000000000000000000000000000000000");
 
-        let low_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let low_leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(low_key, vec![1; 12]),
             0,
-        ));
-        let mid_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        );
+        let mid_leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(mid_key, vec![2; 12]),
             0,
-        ));
-        let high_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        );
+        let high_leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(high_key, vec![3; 12]),
             0,
-        ));
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        );
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(1, low_leaf.get_hash());
         root.share_child(1, &low_leaf);
         root.set_child_hash(4, mid_leaf.get_hash());
@@ -871,13 +871,13 @@ mod tests {
     #[test]
     fn peek_first_item_fetches_missing_children_when_backed() {
         let key = key("2000000000000000000000000000000000000000000000000000000000000000");
-        let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf_with_hash(
+        let leaf = SHAMapTreeNode::new_leaf_with_hash(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(key, vec![9; 12]),
             0,
             sample_hash(0xAB),
-        ));
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        );
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(2, sample_hash(0xAB));
 
         let mut stack = Vec::new();

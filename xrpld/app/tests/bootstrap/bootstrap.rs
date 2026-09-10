@@ -148,19 +148,19 @@ fn persisted_bootstrap_account_root(fill: u8) -> SHAMapItem {
 }
 
 fn persisted_bootstrap_ledger(seq: u32) -> Arc<Ledger> {
-    let state_root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let state_root = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         persisted_bootstrap_account_root(0x10 + seq as u8),
         0,
-    ));
-    let tx_root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    );
+    let tx_root = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::TransactionNm,
         SHAMapItem::new(
             Uint256::from_array([0x40 + seq as u8; 32]),
             vec![seq as u8; 16],
         ),
         0,
-    ));
+    );
 
     let mut header = LedgerHeader {
         seq,
@@ -255,11 +255,11 @@ fn persisted_bootstrap_replay_ledger(
             .expect("transaction-with-metadata item should insert");
     }
 
-    let state_root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let state_root = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         persisted_bootstrap_account_root(0x20 + seq as u8),
         0,
-    ));
+    );
     let tx_root = tx_tree.root();
     let mut header = LedgerHeader {
         seq,
@@ -324,12 +324,12 @@ fn persist_tree_subtree(
 }
 
 fn persisted_bootstrap_incomplete_state_only_ledger(seq: u32) -> Arc<Ledger> {
-    let state_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let state_leaf = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         persisted_bootstrap_account_root(0x10 + seq as u8),
         0,
-    ));
-    let state_root = make_shared_intrusive(SHAMapTreeNode::new_inner(0));
+    );
+    let state_root = SHAMapTreeNode::new_inner(0);
     state_root.set_child_hash(3, state_leaf.get_hash());
     state_root.update_hash();
 

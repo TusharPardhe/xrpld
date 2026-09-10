@@ -2158,9 +2158,20 @@ impl<V: AppServerInfoView> crate::handlers::get_counts::GetCountsSource
         let Some(app) = self.view.app() else {
             return;
         };
-        let Some(node_store) = app.node_store().as_ref() else {
-            return;
-        };
+        let memory = shamap::tree_node::shamap_memory_stats();
+        for (name, value) in [
+            ("shamap_allocated_inner_nodes", memory.allocated_inner_nodes),
+            ("shamap_allocated_leaf_nodes", memory.allocated_leaf_nodes),
+            ("shamap_active_inner_nodes", memory.active_inner_nodes),
+            ("shamap_active_leaf_nodes", memory.active_leaf_nodes),
+            ("shamap_allocated_child_slots", memory.allocated_child_slots),
+            ("shamap_loaded_child_links", memory.loaded_child_links),
+            ("shamap_allocated_items", memory.allocated_items),
+            ("shamap_allocated_item_bytes", memory.allocated_item_bytes),
+            ("shamap_structural_bytes", memory.structural_bytes),
+        ] {
+            json.insert(name.to_owned(), JsonValue::Unsigned(value));
+        }
 
         let profile =
             app::NodeSizeResourceProfile::for_node_size(app.status_rpc_node_size().as_deref());
@@ -2172,6 +2183,22 @@ impl<V: AppServerInfoView> crate::handlers::get_counts::GetCountsSource
             "treenode_cache_target_age_seconds".to_owned(),
             JsonValue::Signed(profile.tree_cache_age_seconds),
         );
+        json.insert(
+            "ledger_cache_target_size".to_owned(),
+            JsonValue::Unsigned(profile.ledger_history_cache_size as u64),
+        );
+        json.insert(
+            "ledger_cache_target_age_seconds".to_owned(),
+            JsonValue::Signed(profile.ledger_history_cache_age_seconds),
+        );
+        json.insert(
+            "acquisition_max_sessions".to_owned(),
+            JsonValue::Unsigned(profile.acquisition_max_sessions as u64),
+        );
+
+        let Some(node_store) = app.node_store().as_ref() else {
+            return;
+        };
 
         json.insert(
             "node_store".to_owned(),

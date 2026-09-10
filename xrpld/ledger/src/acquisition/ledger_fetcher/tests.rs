@@ -6,10 +6,7 @@ use std::{
     },
 };
 
-use basics::{
-    base_uint::Uint256, intrusive_pointer::make_shared_intrusive, sha_map_hash::SHAMapHash,
-    tagged_cache::ManualClock,
-};
+use basics::{base_uint::Uint256, sha_map_hash::SHAMapHash, tagged_cache::ManualClock};
 use shamap::{
     family::{
         FullBelowCache, NullFullBelowCache, NullMissingNodeReporter, NullNodeFetcher, SHAMapFamily,
@@ -143,7 +140,7 @@ fn sample_peer_ids_with_draws_unique_subset() {
 
 #[test]
 fn packet_shape_skips_raw_base_header_and_classifies_bundled_roots() {
-    let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    let root = SHAMapTreeNode::new_inner(1);
     root.set_child_hash(3, sample_hash(0x73));
     root.update_hash();
     let root_wire = root
@@ -177,7 +174,7 @@ fn packet_shape_skips_raw_base_header_and_classifies_bundled_roots() {
 
 #[test]
 fn packet_shape_classifies_inner_empty_and_malformed_nodes() {
-    let inner = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    let inner = SHAMapTreeNode::new_inner(1);
     inner.set_child_hash(3, sample_hash(0x33));
     inner.update_hash();
     let inner_wire = inner
@@ -204,9 +201,9 @@ fn packet_shape_classifies_inner_empty_and_malformed_nodes() {
 
 #[test]
 fn complete_tree_plan_clears_only_the_completed_map_synching_state() {
-    let state_root = make_shared_intrusive(SHAMapTreeNode::new_inner(0));
+    let state_root = SHAMapTreeNode::new_inner(0);
     state_root.update_hash();
-    let tx_root = make_shared_intrusive(SHAMapTreeNode::new_inner(0));
+    let tx_root = SHAMapTreeNode::new_inner(0);
     tx_root.update_hash();
     let mut inbound = InboundLedgerLocal::new(sample_hash(0x43), 77);
     inbound.ledger = Some(Ledger::from_maps(
@@ -246,11 +243,11 @@ fn complete_tree_plan_clears_only_the_completed_map_synching_state() {
 #[test]
 fn completion_reopen_requests_missing_state_hashes_by_hash() {
     let missing_state_hash = sample_hash(0x71);
-    let state_root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    let state_root = SHAMapTreeNode::new_inner(1);
     state_root.set_child_hash(5, missing_state_hash);
     state_root.update_hash();
 
-    let tx_root = make_shared_intrusive(SHAMapTreeNode::new_inner(0));
+    let tx_root = SHAMapTreeNode::new_inner(0);
     tx_root.update_hash();
 
     let mut inbound = InboundLedgerLocal::new(sample_hash(0x99), 94);
@@ -328,9 +325,9 @@ fn completion_fee_settings_failure_preserves_shared_full_below_cache() {
         NullNodeFetcher,
         NullMissingNodeReporter,
     );
-    let state_root = make_shared_intrusive(SHAMapTreeNode::new_inner(0));
+    let state_root = SHAMapTreeNode::new_inner(0);
     state_root.update_hash();
-    let tx_root = make_shared_intrusive(SHAMapTreeNode::new_inner(0));
+    let tx_root = SHAMapTreeNode::new_inner(0);
     tx_root.update_hash();
 
     let mut inbound = InboundLedgerLocal::new(sample_hash(0x44), XRP_LEDGER_EARLIEST_FEES);

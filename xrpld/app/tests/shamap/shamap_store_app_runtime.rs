@@ -515,7 +515,7 @@ fn shamap_store_app_runtime_stops_copy_at_health_checkpoint() {
 
 #[test]
 fn shamap_store_app_runtime_surfaces_missing_state_node_without_rotating() {
-    let root = make_shared_intrusive(SHAMapTreeNode::new_inner(0));
+    let root = SHAMapTreeNode::new_inner(0);
     root.set_child_hash(0, sample_hash(0xAB));
     let ledger = Arc::new(Ledger::from_maps(
         LedgerHeader {

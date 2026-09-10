@@ -16,6 +16,7 @@ use crate::{
 use basics::base_uint::Uint256;
 use basics::basic_config::{BasicConfig, IniFileSections};
 use basics::chrono::NetClockTimePoint;
+use basics::memory::malloc_trim::{MallocTrimLogger, MallocTrimReport, malloc_trim};
 use basics::string_utilities::str_unhex;
 use basics::tagged_cache::MonotonicClock;
 use ledger::{
@@ -52,6 +53,24 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use xrpl_core::{HashRouter, ServiceRegistry, StartUpType};
+
+/// Match rippled `ApplicationImp::doSweep`: trim only after periodic cache cleanup.
+const APPLICATION_SWEEP_MALLOC_TRIM_TAG: &str = "Application::doSweep";
+#[derive(Debug, Clone, Copy)]
+struct SweepMallocTrimLogger;
+impl MallocTrimLogger for SweepMallocTrimLogger {
+    fn debug(&self, message: &str) {
+        tracing::debug!(target: "app", "{message}");
+    }
+}
+fn trim_after_application_sweep_with(
+    trim: impl FnOnce(&str) -> MallocTrimReport,
+) -> MallocTrimReport {
+    trim(APPLICATION_SWEEP_MALLOC_TRIM_TAG)
+}
+fn trim_after_application_sweep() -> MallocTrimReport {
+    trim_after_application_sweep_with(|tag| malloc_trim(tag, &SweepMallocTrimLogger))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppBootstrapOptions {
@@ -744,6 +763,9 @@ pub fn build_bootstrap_root(
     options: &AppBootstrapOptions,
 ) -> Result<AppBootstrapRoot, String> {
     let manifest_limits = ManifestLimits::from_config(config)?;
+    let configured_node_size = configured_node_size_from_config(config);
+    let node_size_profile =
+        crate::NodeSizeResourceProfile::for_node_size(configured_node_size.as_deref());
     let mut effective_options = options.clone();
     let fast_load = node_db_fast_load(config);
     if fast_load
@@ -828,7 +850,12 @@ pub fn build_bootstrap_root(
         root.tx_q().reconfigure_setup(txq_setup);
     }
     let _ = root.attach_default_resolver_runtime();
-    let _ = root.attach_default_ledger_master_runtime();
+    // Construct LedgerMaster from the already-resolved node-size policy rather
+    // than retaining its generic defaults (medium: 64 ledgers / 180 seconds).
+    let ledger_master_runtime = Arc::new(crate::AppLedgerMasterRuntime::new(
+        node_size_profile.ledger_master_config(),
+    ));
+    let _ = root.attach_ledger_master_runtime(ledger_master_runtime);
     let _ = root.attach_default_network_ops_validation_runtime();
     let _ = root.attach_default_network_ops_runtime();
     attach_relational_database_if_configured(&mut root, config, options, ledger_history)?;
@@ -895,12 +922,8 @@ pub fn build_bootstrap_root(
     let node_store_kind = pending_shamap_store
         .as_ref()
         .map(|pending| pending.bootstrap.node_store_kind().to_owned());
-    let configured_node_size = configured_node_size_from_config(config);
-    let sweep_interval_seconds = configured_sweep_interval(
-        config,
-        crate::NodeSizeResourceProfile::for_node_size(configured_node_size.as_deref())
-            .sweep_interval_seconds,
-    )?;
+    let sweep_interval_seconds =
+        configured_sweep_interval(config, node_size_profile.sweep_interval_seconds)?;
     root.set_status_rpc_node_size(configured_node_size.clone());
     attach_bootstrap_node_family(&mut root, configured_node_size.as_deref());
     attach_production_shamap_store_runtime(&mut root, pending_shamap_store)?;
@@ -1474,22 +1497,28 @@ fn run_start_mode_consensus_loop(
             }
             inbound
         }
-        None => Arc::new(crate::ledger::inbound_ledgers::InboundLedgers::new(
-            Arc::clone(&app_tree_cache),
-            Arc::clone(&node_family_full_below_cache),
-            lm_rt_for_shared_inbound
-                .as_ref()
-                .map(|runtime| runtime.ledger_master().fetch_pack_cache_arc())
-                .unwrap_or_else(|| {
-                    Arc::new(ledger::FetchPackCache::new(
-                        65_536,
-                        time::Duration::seconds(45),
-                        basics::tagged_cache::MonotonicClock::default(),
-                    ))
-                }),
-            shared_completed_tx.clone(),
-            runtime.root().network_ops_state().need_network_ledger_arc(),
-        )),
+        None => Arc::new(
+            crate::ledger::inbound_ledgers::InboundLedgers::new_with_budget(
+                Arc::clone(&app_tree_cache),
+                Arc::clone(&node_family_full_below_cache),
+                lm_rt_for_shared_inbound
+                    .as_ref()
+                    .map(|runtime| runtime.ledger_master().fetch_pack_cache_arc())
+                    .unwrap_or_else(|| {
+                        Arc::new(ledger::FetchPackCache::new(
+                            65_536,
+                            time::Duration::seconds(45),
+                            basics::tagged_cache::MonotonicClock::default(),
+                        ))
+                    }),
+                shared_completed_tx.clone(),
+                runtime.root().network_ops_state().need_network_ledger_arc(),
+                crate::NodeSizeResourceProfile::for_node_size(
+                    runtime.root().status_rpc_node_size().as_deref(),
+                )
+                .acquisition_budget(),
+            ),
+        ),
     };
 
     // Tree and FullBelow cache ownership was established by NodeFamily before
@@ -2752,6 +2781,14 @@ fn run_start_mode_consensus_loop(
                         // same configured SweepInterval; without it, historical
                         // validation sets never age out in a running node.
                         root.expire_validations();
+                        // Purge the allocator actually used by the application after the
+                        // complete doSweep cache pass, never on the one-second tick.
+                        let trim = trim_after_application_sweep();
+                        tracing::debug!(target: "app", event = "application_sweep_allocator_trim",
+                            supported = trim.supported, trim_result = trim.trim_result,
+                            rss_delta_kb = trim.delta_kb(), duration_us = trim.duration_us,
+                            minflt_delta = trim.minflt_delta, majflt_delta = trim.majflt_delta,
+                            "allocator trim completed after periodic cache sweep");
 
                         last_cache_sweep = std::time::Instant::now();
                     }
@@ -5780,20 +5817,21 @@ const fn should_schedule_coordinator_fetch_pack_wake(
 #[cfg(test)]
 mod tests {
     use super::{
-        BootstrapLedgerDataRouting, ENDPOINT_HANDOUT_LIMIT, FetchPackAdmission,
-        GenericGetObjectAdmission, LedgerDataIngressDisposition, MainRuntime, StartUpType,
-        amendments_from_config, build_endpoint_handout, build_validator_list_collection_messages,
-        candidate_ledger_data_charge, classify_fetch_pack_request,
-        classify_generic_get_object_request, configured_feature_ids, configured_sweep_interval,
-        fetch_pack_failure_charge, get_ledger_send_queue_is_admissible,
+        APPLICATION_SWEEP_MALLOC_TRIM_TAG, BootstrapLedgerDataRouting, ENDPOINT_HANDOUT_LIMIT,
+        FetchPackAdmission, GenericGetObjectAdmission, LedgerDataIngressDisposition, MainRuntime,
+        StartUpType, amendments_from_config, build_endpoint_handout,
+        build_validator_list_collection_messages, candidate_ledger_data_charge,
+        classify_fetch_pack_request, classify_generic_get_object_request, configured_feature_ids,
+        configured_sweep_interval, fetch_pack_failure_charge, get_ledger_send_queue_is_admissible,
         get_object_query_send_queue_is_admissible, ledger_data_nodes_are_admissible,
         ledger_data_sequence_is_admissible, load_bootstrap_ledger_from_file,
         manifest_rate_limit_policy, parse_basic_config_text, relay_accepted_manifest,
         requested_transaction_envelope, route_bootstrap_ledger_data,
         sequence_is_fetchable_at_floor, should_schedule_coordinator_fetch_pack_wake,
         should_schedule_relayed_transaction, spawn_shutdown_watcher,
-        transaction_object_request_is_admissible, trusted_first_manifest_payloads,
-        validator_list_collection_blobs, validator_list_threshold_from_config,
+        transaction_object_request_is_admissible, trim_after_application_sweep_with,
+        trusted_first_manifest_payloads, validator_list_collection_blobs,
+        validator_list_threshold_from_config,
     };
     use crate::state::manifest::{
         MAX_UNTRUSTED_MANIFESTS, ManifestDisposition, ManifestLimits, ManifestRateLimitCapPolicy,
@@ -5802,6 +5840,7 @@ mod tests {
     use basics::base_uint::Uint256;
     use basics::basic_config::BasicConfig;
     use basics::hardened_hash::HardenedHashBuilder;
+    use basics::memory::malloc_trim::MallocTrimReport;
     use basics::tagged_cache::MonotonicClock;
     use ledger::FetchPackCache;
     use nodestore::{DummyScheduler, ManagerImp, NullJournal, Scheduler};
@@ -5814,6 +5853,26 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
     use xrpl_core::HashRouter;
+
+    #[test]
+    fn allocator_trim_runs_at_the_application_sweep_boundary() {
+        let mut tags = Vec::new();
+        let report = trim_after_application_sweep_with(|tag| {
+            tags.push(tag.to_owned());
+            MallocTrimReport {
+                supported: true,
+                trim_result: 1,
+                rss_before_kb: 100,
+                rss_after_kb: 90,
+                duration_us: 7,
+                minflt_delta: 2,
+                majflt_delta: 0,
+            }
+        });
+        assert_eq!(tags, vec![APPLICATION_SWEEP_MALLOC_TRIM_TAG]);
+        assert!(report.supported);
+        assert_eq!(report.delta_kb(), -10);
+    }
 
     #[test]
     fn bootstrap_ledger_file_rejects_unknown_sle_type_without_unwinding() {

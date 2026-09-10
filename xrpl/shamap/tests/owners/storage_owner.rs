@@ -1,6 +1,6 @@
 use crate::support::sample_hash;
 use basics::base_uint::Uint256;
-use basics::intrusive_pointer::{SharedIntrusive, make_shared_intrusive};
+use basics::intrusive_pointer::SharedIntrusive;
 use basics::sha_map_hash::SHAMapHash;
 use basics::tagged_cache::ManualClock;
 use parking_lot::Mutex;
@@ -72,18 +72,18 @@ fn shamap_storage_tree_direct_reads_use_owner_backed_policy() {
 
     let key = Uint256::from_hex("2000000000000000000000000000000000000000000000000000000000000000")
         .expect("hex should parse");
-    let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let leaf = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         SHAMapItem::new(key, vec![42; 12]),
         0,
-    ));
+    );
     let cache = Arc::new(TreeNodeCache::new(
         "storage-tree-read",
         8,
         Duration::seconds(1),
         ManualClock::new(0),
     ));
-    let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    let root = SHAMapTreeNode::new_inner(1);
     root.set_child_hash(2, leaf.get_hash());
     root.update_hash();
 
@@ -142,21 +142,21 @@ fn shamap_storage_tree_family_backed_flush_stays_backend_agnostic() {
         Duration::seconds(1),
         ManualClock::new(0),
     ));
-    let canonical = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let canonical = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         SHAMapItem::new(key, vec![0x23; 12]),
         0,
-    ));
+    );
     let mut cached = canonical.clone();
     assert!(!cache.canonicalize_replace_client(canonical.get_hash().as_uint256(), &mut cached));
-    let duplicate = make_shared_intrusive(SHAMapTreeNode::new_leaf_with_hash(
+    let duplicate = SHAMapTreeNode::new_leaf_with_hash(
         SHAMapNodeType::AccountState,
         canonical
             .peek_item()
             .expect("canonical leaf should carry an item"),
         1,
         canonical.get_hash(),
-    ));
+    );
     let family = SHAMapFamily::new_with_node_store(
         cache,
         NullFullBelowCache::new(27),
@@ -199,12 +199,12 @@ fn shamap_storage_tree_direct_reads_can_decode_node_objects_with_owner_ledger_se
 
     let key = Uint256::from_hex("2200000000000000000000000000000000000000000000000000000000000000")
         .expect("hex should parse");
-    let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let leaf = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         SHAMapItem::new(key, vec![0x24; 12]),
         0,
-    ));
-    let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    );
+    let root = SHAMapTreeNode::new_inner(1);
     root.set_child_hash(2, leaf.get_hash());
     root.update_hash();
 
@@ -256,11 +256,11 @@ fn shamap_storage_tree_walk_map_with_family_uses_owner_fetch_policy() {
     }
 
     let missing_hash = sample_hash(0x95);
-    let fetched_inner = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    let fetched_inner = SHAMapTreeNode::new_inner(1);
     fetched_inner.set_child_hash(7, missing_hash);
     fetched_inner.update_hash();
 
-    let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    let root = SHAMapTreeNode::new_inner(1);
     root.set_child_hash(2, fetched_inner.get_hash());
     root.update_hash();
 
@@ -348,15 +348,15 @@ fn shamap_storage_tree_walk_map_parallel_with_family_respects_shared_missing_lim
         }
     }
 
-    let left_inner = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    let left_inner = SHAMapTreeNode::new_inner(1);
     left_inner.set_child_hash(1, sample_hash(0x97));
     left_inner.update_hash();
 
-    let right_inner = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    let right_inner = SHAMapTreeNode::new_inner(1);
     right_inner.set_child_hash(2, sample_hash(0x98));
     right_inner.update_hash();
 
-    let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    let root = SHAMapTreeNode::new_inner(1);
     root.set_child_hash(3, left_inner.get_hash());
     root.share_child(3, &left_inner);
     root.set_child_hash(6, right_inner.get_hash());
@@ -409,11 +409,11 @@ fn shamap_storage_tree_walk_map_parallel_with_family_logs_worker_panics() {
     }
 
     let panic_hash = sample_hash(0x96);
-    let fetched_inner = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    let fetched_inner = SHAMapTreeNode::new_inner(1);
     fetched_inner.set_child_hash(7, panic_hash);
     fetched_inner.update_hash();
 
-    let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    let root = SHAMapTreeNode::new_inner(1);
     root.set_child_hash(2, fetched_inner.get_hash());
     root.update_hash();
 
@@ -474,7 +474,7 @@ fn shamap_storage_tree_reports_missing_backed_node_only_once_while_full() {
         Duration::seconds(1),
         ManualClock::new(0),
     ));
-    let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    let root = SHAMapTreeNode::new_inner(1);
     root.set_child_hash(2, missing_hash);
     root.update_hash();
 
@@ -519,7 +519,7 @@ fn shamap_storage_tree_owner_config_updates_fetch_policy() {
     let key = Uint256::from_hex("2100000000000000000000000000000000000000000000000000000000000000")
         .expect("hex should parse");
     let missing_hash = sample_hash(0x92);
-    let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    let root = SHAMapTreeNode::new_inner(1);
     root.set_child_hash(2, missing_hash);
     root.update_hash();
 
@@ -589,12 +589,12 @@ fn shamap_storage_tree_lookup_wrappers_use_owner_backed_policy() {
 
     let key = Uint256::from_hex("1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF")
         .expect("hex should parse");
-    let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let leaf = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         SHAMapItem::new(key, vec![43; 12]),
         0,
-    ));
-    let inner = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    );
+    let inner = SHAMapTreeNode::new_inner(1);
     inner.set_child_hash(2, leaf.get_hash());
     inner.share_child(2, &leaf);
     inner.update_hash_deep();
@@ -605,7 +605,7 @@ fn shamap_storage_tree_lookup_wrappers_use_owner_backed_policy() {
         Duration::seconds(1),
         ManualClock::new(0),
     ));
-    let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    let root = SHAMapTreeNode::new_inner(1);
     root.set_child_hash(1, inner.get_hash());
     root.update_hash();
 
@@ -673,16 +673,16 @@ fn shamap_storage_tree_search_and_iteration_wrappers_use_owner_backed_policy() {
     let high_key =
         Uint256::from_hex("9000000000000000000000000000000000000000000000000000000000000000")
             .expect("hex should parse");
-    let low_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let low_leaf = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         SHAMapItem::new(low_key, vec![11; 12]),
         0,
-    ));
-    let high_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    );
+    let high_leaf = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         SHAMapItem::new(high_key, vec![12; 12]),
         0,
-    ));
+    );
 
     let cache = Arc::new(TreeNodeCache::new(
         "storage-tree-search",
@@ -690,7 +690,7 @@ fn shamap_storage_tree_search_and_iteration_wrappers_use_owner_backed_policy() {
         Duration::seconds(1),
         ManualClock::new(0),
     ));
-    let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    let root = SHAMapTreeNode::new_inner(1);
     root.set_child_hash(1, low_leaf.get_hash());
     root.set_child_hash(9, high_leaf.get_hash());
     root.update_hash();
@@ -749,12 +749,12 @@ fn shamap_storage_tree_search_and_iteration_wrappers_use_owner_backed_policy() {
 fn shamap_storage_tree_visit_wrappers_use_owner_backed_policy() {
     let key = Uint256::from_hex("3100000000000000000000000000000000000000000000000000000000000000")
         .expect("hex should parse");
-    let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let leaf = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         SHAMapItem::new(key, vec![3; 12]),
         0,
-    ));
-    let inner = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    );
+    let inner = SHAMapTreeNode::new_inner(1);
     inner.set_child_hash(1, leaf.get_hash());
     inner.update_hash();
 
@@ -764,7 +764,7 @@ fn shamap_storage_tree_visit_wrappers_use_owner_backed_policy() {
         Duration::seconds(1),
         ManualClock::new(0),
     ));
-    let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    let root = SHAMapTreeNode::new_inner(1);
     root.set_child_hash(3, inner.get_hash());
     root.update_hash();
     let tree = StorageTree::from_loaded_root(root.clone(), 2, true, 106, cache);
@@ -823,24 +823,24 @@ fn shamap_storage_tree_visit_wrappers_use_owner_backed_policy() {
 fn shamap_storage_tree_compare_and_deep_compare_wrappers_use_owner_backed_policy() {
     let key = Uint256::from_hex("6200000000000000000000000000000000000000000000000000000000000000")
         .expect("hex should parse");
-    let left_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf_with_hash(
+    let left_leaf = SHAMapTreeNode::new_leaf_with_hash(
         SHAMapNodeType::AccountState,
         SHAMapItem::new(key, vec![1; 12]),
         0,
         sample_hash(0xD1),
-    ));
-    let right_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf_with_hash(
+    );
+    let right_leaf = SHAMapTreeNode::new_leaf_with_hash(
         SHAMapNodeType::AccountState,
         SHAMapItem::new(key, vec![2; 12]),
         0,
         sample_hash(0xE2),
-    ));
+    );
 
-    let left_root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    let left_root = SHAMapTreeNode::new_inner(1);
     left_root.set_child_hash(6, left_leaf.get_hash());
     left_root.update_hash();
 
-    let right_root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    let right_root = SHAMapTreeNode::new_inner(1);
     right_root.set_child_hash(6, right_leaf.get_hash());
     right_root.share_child(6, &right_leaf);
     right_root.update_hash();
@@ -893,7 +893,7 @@ fn shamap_storage_tree_compare_and_deep_compare_wrappers_use_owner_backed_policy
         ))
     );
 
-    let equal_right_root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    let equal_right_root = SHAMapTreeNode::new_inner(1);
     equal_right_root.set_child_hash(6, left_leaf.get_hash());
     equal_right_root.share_child(6, &left_leaf);
     equal_right_root.update_hash();
@@ -915,7 +915,7 @@ fn shamap_storage_tree_compare_and_deep_compare_wrappers_use_owner_backed_policy
         &mut |_| panic!("loaded right branch should not fetch"),
     ));
 
-    let loaded_left_root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    let loaded_left_root = SHAMapTreeNode::new_inner(1);
     loaded_left_root.set_child_hash(6, left_leaf.get_hash());
     loaded_left_root.share_child(6, &left_leaf);
     loaded_left_root.update_hash();
@@ -932,7 +932,7 @@ fn shamap_storage_tree_compare_and_deep_compare_wrappers_use_owner_backed_policy
         )),
     );
 
-    let missing_right_root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    let missing_right_root = SHAMapTreeNode::new_inner(1);
     missing_right_root.set_child_hash(6, right_leaf.get_hash());
     missing_right_root.update_hash();
     let missing_right_tree = StorageTree::from_loaded_root(
@@ -968,7 +968,7 @@ fn shamap_storage_tree_compare_and_deep_compare_wrappers_use_owner_backed_policy
 
 #[test]
 fn shamap_storage_tree_deep_compare_with_families_logs_hash_mismatch() {
-    let left_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf_with_hash(
+    let left_leaf = SHAMapTreeNode::new_leaf_with_hash(
         SHAMapNodeType::AccountState,
         SHAMapItem::new(
             Uint256::from_hex("6300000000000000000000000000000000000000000000000000000000000000")
@@ -977,8 +977,8 @@ fn shamap_storage_tree_deep_compare_with_families_logs_hash_mismatch() {
         ),
         0,
         sample_hash(0x63),
-    ));
-    let right_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf_with_hash(
+    );
+    let right_leaf = SHAMapTreeNode::new_leaf_with_hash(
         SHAMapNodeType::AccountState,
         SHAMapItem::new(
             Uint256::from_hex("6400000000000000000000000000000000000000000000000000000000000000")
@@ -987,7 +987,7 @@ fn shamap_storage_tree_deep_compare_with_families_logs_hash_mismatch() {
         ),
         0,
         sample_hash(0x64),
-    ));
+    );
 
     let journal = Arc::new(RecordingJournal::default());
     let left_family = SHAMapFamily::new_with_journal(
@@ -1038,28 +1038,28 @@ fn shamap_storage_tree_difference_wrappers_use_owner_backed_policy() {
         Uint256::from_hex("9000000000000000000000000000000000000000000000000000000000000000")
             .expect("hex should parse");
 
-    let shared_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let shared_leaf = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         SHAMapItem::new(shared_key, vec![1; 12]),
         0,
-    ));
-    let deep_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    );
+    let deep_leaf = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         SHAMapItem::new(deep_key, vec![2; 12]),
         0,
-    ));
-    let top_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    );
+    let top_leaf = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         SHAMapItem::new(top_leaf_key, vec![3; 12]),
         0,
-    ));
+    );
 
-    let differing_inner = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    let differing_inner = SHAMapTreeNode::new_inner(1);
     differing_inner.set_child_hash(1, deep_leaf.get_hash());
     differing_inner.share_child(1, &deep_leaf);
     differing_inner.update_hash_deep();
 
-    let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    let root = SHAMapTreeNode::new_inner(1);
     root.set_child_hash(1, shared_leaf.get_hash());
     root.share_child(1, &shared_leaf);
     root.set_child_hash(4, differing_inner.get_hash());
@@ -1067,7 +1067,7 @@ fn shamap_storage_tree_difference_wrappers_use_owner_backed_policy() {
     root.share_child(9, &top_leaf);
     root.update_hash();
 
-    let have = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    let have = SHAMapTreeNode::new_inner(1);
     have.set_child_hash(1, shared_leaf.get_hash());
     have.update_hash();
 
@@ -1205,11 +1205,11 @@ fn shamap_storage_tree_hash_unshares_zero_root_owner() {
     let mut tree = StorageTree::new(1, true, 111, cache);
     tree.root().set_child(
         3,
-        Some(make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        Some(SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(key, vec![10; 12]),
             1,
-        ))),
+        )),
     );
 
     assert!(tree.root().get_hash().is_zero());

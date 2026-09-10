@@ -24,10 +24,9 @@ fn prefetch_next_child(node: &SHAMapTreeNode, node_id: SHAMapNodeId, key: Uint25
     if node.is_empty_branch(branch) {
         return;
     }
-    // SAFETY: get_child_ptr returns a raw pointer to the child node if loaded.
-    // We only use it for a non-temporal prefetch hint — no dereference occurs.
-    unsafe {
-        if let Some(ptr) = node.get_child_ptr(branch) {
+    if let Some(child) = node.get_child(branch) {
+        let ptr = &*child as *const SHAMapTreeNode;
+        unsafe {
             #[cfg(target_arch = "x86_64")]
             std::arch::x86_64::_mm_prefetch(ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
             #[cfg(target_arch = "x86")]
@@ -253,7 +252,7 @@ mod tests {
     use crate::tree_node::{SHAMapNodeType, SHAMapTreeNode};
     use crate::tree_node_cache::TreeNodeCache;
     use basics::base_uint::Uint256;
-    use basics::intrusive_pointer::{SharedIntrusive, make_shared_intrusive};
+    use basics::intrusive_pointer::SharedIntrusive;
     use basics::sha_map_hash::SHAMapHash;
     use basics::tagged_cache::ManualClock;
     use std::sync::{Arc, Mutex};
@@ -295,12 +294,12 @@ mod tests {
         let key =
             Uint256::from_hex("1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF")
                 .expect("hex should parse");
-        let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(key, vec![1; 12]),
             0,
-        ));
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        );
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(1, leaf.get_hash());
         root.share_child(1, &leaf);
 
@@ -321,13 +320,13 @@ mod tests {
         let key =
             Uint256::from_hex("1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF")
                 .expect("hex should parse");
-        let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf_with_hash(
+        let leaf = SHAMapTreeNode::new_leaf_with_hash(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(key, vec![2; 12]),
             0,
             sample_hash(7),
-        ));
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        );
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(1, sample_hash(7));
 
         let mut fetch_calls = 0;
@@ -347,12 +346,12 @@ mod tests {
     fn find_key_requires_exact_leaf_key_match() {
         let stored_key = sample_uint256(0x10);
         let requested_key = sample_uint256(0x1F);
-        let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(stored_key, vec![3; 12]),
             0,
-        ));
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        );
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(1, leaf.get_hash());
         root.share_child(1, &leaf);
 
@@ -384,7 +383,7 @@ mod tests {
         let requested_key =
             Uint256::from_hex("1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF")
                 .expect("hex should parse");
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(1, sample_hash(0x91));
 
         let reporter = Arc::new(Mutex::new(RecordingMissingNodeReporter::default()));

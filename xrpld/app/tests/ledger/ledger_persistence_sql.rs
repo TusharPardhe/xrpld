@@ -24,11 +24,11 @@ fn account(fill: u8) -> AccountID {
 }
 
 fn state_leaf(fill: u8) -> SharedIntrusive<SHAMapTreeNode> {
-    make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         SHAMapItem::new(Uint256::from_array([fill; 32]), vec![fill; 12]),
         0,
-    ))
+    )
 }
 
 fn payment_tx(sequence: u32) -> Arc<STTx> {

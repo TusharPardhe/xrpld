@@ -110,6 +110,42 @@ impl Drop for PartialDeleteNode {
     }
 }
 
+#[derive(Debug, Default)]
+struct PanickingPartialTracker {
+    deleted: AtomicU8,
+}
+
+#[derive(Debug)]
+struct PanickingPartialNode {
+    ref_counts: IntrusiveRefCounts,
+    tracker: Arc<PanickingPartialTracker>,
+}
+
+impl PanickingPartialNode {
+    fn new(tracker: Arc<PanickingPartialTracker>) -> Self {
+        Self {
+            ref_counts: IntrusiveRefCounts::new(),
+            tracker,
+        }
+    }
+}
+
+impl IntrusiveObject for PanickingPartialNode {
+    fn intrusive_ref_counts(&self) -> &IntrusiveRefCounts {
+        &self.ref_counts
+    }
+
+    fn partial_destructor(&self) {
+        panic!("intentional partial-destruction panic");
+    }
+}
+
+impl Drop for PanickingPartialNode {
+    fn drop(&mut self) {
+        self.tracker.deleted.store(1, Ordering::SeqCst);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CastKind {
     Base,
@@ -207,6 +243,63 @@ impl IntrusiveDynamicCast<CastDerived> for CastBase {
             None
         }
     }
+}
+
+#[test]
+fn owner_metadata_initialization_is_atomic_and_type_bound() {
+    let tracker = Arc::new(StressOrderTracker::new());
+    let raw = Box::into_raw(Box::new(StressNode::new(Arc::clone(&tracker)))) as usize;
+    let barrier = Arc::new(Barrier::new(3));
+
+    thread::scope(|scope| {
+        for _ in 0..2 {
+            let barrier = Arc::clone(&barrier);
+            scope.spawn(move || {
+                barrier.wait();
+                let ptr = std::ptr::NonNull::new(raw as *mut StressNode).expect("raw node");
+                unsafe { ptr.as_ref() }
+                    .intrusive_ref_counts()
+                    .initialize_owner_metadata(ptr);
+            });
+        }
+        barrier.wait();
+    });
+
+    let owner = unsafe {
+        SharedIntrusive::from_raw(
+            raw as *mut StressNode,
+            basics::intrusive_pointer::SharedIntrusiveAdopt::NoIncrement,
+        )
+    };
+    drop(owner);
+    assert!(tracker.deleted_ran());
+    assert!(!tracker.violated());
+}
+
+#[test]
+fn raw_cast_view_cannot_replace_original_destroy_dispatch() {
+    let tracker = Arc::new(CastTracker::new());
+    let derived = make_shared_intrusive(CastDerived::new(Arc::clone(&tracker)));
+    let base_ptr = derived.get().expect("derived").base.tracker.as_ref() as *const CastTracker;
+    let casted = static_pointer_cast::<CastBase, _>(&derived);
+    let raw_base = casted.get().expect("base") as *const CastBase as *mut CastBase;
+
+    let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        SharedIntrusive::from_raw(
+            raw_base,
+            basics::intrusive_pointer::SharedIntrusiveAdopt::IncrementStrong,
+        )
+    }));
+    assert!(rejected.is_err());
+    assert!(!base_ptr.is_null());
+
+    drop(casted);
+    drop(derived);
+    assert_eq!(
+        CastLifecycle::load(&tracker.derived),
+        CastLifecycle::Deleted
+    );
+    assert_eq!(CastLifecycle::load(&tracker.base), CastLifecycle::Deleted);
 }
 
 const STRESS_PARTIAL: u8 = 1;
@@ -935,6 +1028,22 @@ fn partial_delete_waits_for_completion_before_final_delete() {
         tracker.delete_saw_partial_finished.load(Ordering::SeqCst),
         1
     );
+}
+
+#[test]
+fn panicking_partial_destructor_still_allows_last_weak_release() {
+    let tracker = Arc::new(PanickingPartialTracker::default());
+    let strong = make_shared_intrusive(PanickingPartialNode::new(Arc::clone(&tracker)));
+    let weak = WeakIntrusive::from_shared(&strong);
+
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(strong)));
+    assert!(panic.is_err());
+    assert!(weak.expired());
+
+    // This used to wait forever because the panic skipped
+    // partial_destructor_finished(). The completion guard allows final teardown.
+    drop(weak);
+    assert_eq!(tracker.deleted.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -1781,4 +1890,15 @@ fn shared_weak_union_replacement_from_owned_strong_move_assignment_shape() {
         CastLifecycle::load(&tracker2.derived),
         CastLifecycle::Deleted
     );
+}
+
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn intrusive_pointer_handles_are_one_word_with_an_option_niche() {
+    use std::mem::size_of;
+
+    assert_eq!(size_of::<SharedIntrusive<CastDerived>>(), 8);
+    assert_eq!(size_of::<WeakIntrusive<CastDerived>>(), 8);
+    assert_eq!(size_of::<SharedWeakUnion<CastDerived>>(), 8);
+    assert_eq!(size_of::<Option<SharedIntrusive<CastDerived>>>(), 8);
 }

@@ -144,7 +144,6 @@ mod tests {
     use crate::SHAMapStoreNodeStoreRuntime;
     use basics::base_uint::Uint256;
     use basics::blob::Blob;
-    use basics::memory::intrusive_pointer::make_shared_intrusive;
     use nodestore::Backend;
     use shamap::item::SHAMapItem;
     use shamap::tree_node::{SHAMapNodeType, SHAMapTreeNode};
@@ -183,11 +182,11 @@ mod tests {
 
     #[test]
     fn resident_validated_node_missing_from_both_backends_is_restored() {
-        let node = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let node = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(Uint256::from_array([0x51; 32]), vec![0xA5; 48]),
             0,
-        ));
+        );
         let hash = *node.get_hash().as_uint256();
         let expected = node.serialize_with_prefix().expect("serialize node");
         let mut pending = vec![node];
@@ -204,11 +203,11 @@ mod tests {
 
     #[test]
     fn dirty_resident_node_is_never_used_for_rotation_rescue() {
-        let node = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let node = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(Uint256::from_array([0x52; 32]), vec![0xA6; 48]),
             1,
-        ));
+        );
         let mut pending = vec![node];
         let error = copy_rotation_batch(&mut pending, &MissingBackends::default())
             .expect_err("dirty node must fail rescue");
@@ -217,11 +216,11 @@ mod tests {
 
     #[test]
     fn resident_rescue_write_failure_aborts_rotation_copy() {
-        let node = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let node = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(Uint256::from_array([0x53; 32]), vec![0xA7; 48]),
             0,
-        ));
+        );
         let mut pending = vec![node];
         let store = MissingBackends {
             fail_store: true,

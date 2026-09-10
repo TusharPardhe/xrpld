@@ -53,12 +53,12 @@ use overlay::{Peer, PeerId as OverlayPeerId, PeerSet, ProtocolMessage, SimplePee
 
 use acquisition::{
     AcquisitionEffect, AcquisitionEvent, AdmissionBudget, AdmissionGate, AdmittedLedgerPacket,
-    BackpressureOutcome, CancellationPort, CoordinatorPorts, CoordinatorRunner, HandoffPort,
-    LedgerDataRequest, LedgerRequestPort, PeerAvailabilitySnapshot, PeerId, PeerRequest, PhasePort,
-    ReadCompletion, ReadOutcome, ReadPort, ReadPriority, ReadRequest, ReferenceDecision,
-    RouteEntry, RoutingGeneration, RoutingSnapshot, RunEpoch, SessionPhase, SessionRef,
-    ShadowConfig, ShadowObservation, ShadowOutcome, ShadowRunner, ShadowSnapshot, TimerPort,
-    WritePort,
+    BackpressureOutcome, CancellationPort, CoordinatorPorts, CoordinatorRunner,
+    DurableHandoffAcknowledgement, DurableHandoffId, HandoffPort, LedgerDataRequest,
+    LedgerRequestPort, PeerAvailabilitySnapshot, PeerId, PeerRequest, PhasePort, ReadCompletion,
+    ReadOutcome, ReadPort, ReadPriority, ReadRequest, ReferenceDecision, RouteEntry,
+    RoutingGeneration, RoutingSnapshot, RunEpoch, SessionPhase, SessionRef, ShadowConfig,
+    ShadowObservation, ShadowOutcome, ShadowRunner, ShadowSnapshot, TimerPort, WritePort,
 };
 
 use super::read_broker::{
@@ -388,6 +388,16 @@ pub(crate) struct CoordinatorAdapter<R, RD, WR, T, H, P, C> {
     /// Cancellations remain excluded: only `SessionPhase::Failed` represents
     /// an acquisition failure eligible for history re-admission suppression.
     terminal_failures: BTreeSet<Uint256>,
+    /// Recipient acknowledgements retained outside the shared control channel.
+    /// They are consumed before any completion producer can refill a freed
+    /// control slot, preventing a permanently ready producer from starving the
+    /// `DurablePending -> Complete` transition and its graph-release receipt.
+    priority_durable_acks: VecDeque<DurableHandoffAcknowledgement>,
+    /// Exact durable acknowledgements that the runner accepted and processed.
+    /// Enqueue success is insufficient: NetworkOps may release graph ownership
+    /// only after this receipt proves `DurablePending -> Complete` occurred for
+    /// the same `(handoff, session)`.
+    processed_durable_acks: VecDeque<(DurableHandoffId, SessionRef)>,
     /// Last exact owners whose already-retained Generic reads were upgraded.
     /// These mirrors carry no lifecycle authority; the runner remains the
     /// source of truth and each transition is applied idempotently to the
@@ -458,6 +468,8 @@ where
             last_drain_has_more: false,
             fetch_pack,
             terminal_failures: BTreeSet::new(),
+            priority_durable_acks: VecDeque::new(),
+            processed_durable_acks: VecDeque::new(),
             promoted_recovery_read_owner: None,
             promoted_validation_read_owner: None,
         };
@@ -511,6 +523,50 @@ where
             .collect()
     }
 
+    /// Return and clear exact durable acknowledgements only after the runner
+    /// consumed them and completed the matching session lifecycle transition.
+    pub(crate) fn take_processed_durable_acks(&mut self) -> Vec<(DurableHandoffId, SessionRef)> {
+        self.processed_durable_acks.drain(..).collect()
+    }
+
+    /// Retain an exact recipient acknowledgement for the next owner drain.
+    /// This mutates no runner lifecycle state and deliberately bypasses the
+    /// shared completion channel, whose slots may be continuously refilled.
+    pub(crate) fn retain_durable_handoff_ack(
+        &mut self,
+        handoff: DurableHandoffId,
+        session: SessionRef,
+    ) -> bool {
+        if !self.durable_handoff_is_pending(handoff, session) {
+            return false;
+        }
+        if self
+            .priority_durable_acks
+            .iter()
+            .any(|ack| ack.handoff() == handoff && ack.session() == session)
+        {
+            return true;
+        }
+        if self.priority_durable_acks.len() >= CONTROL_EVENT_QUEUE_CAPACITY {
+            return false;
+        }
+        self.priority_durable_acks
+            .push_back(DurableHandoffAcknowledgement::new(handoff, session));
+        true
+    }
+
+    /// Whether the runner is still awaiting this exact durable handoff.
+    pub(crate) fn durable_handoff_is_pending(
+        &self,
+        handoff: DurableHandoffId,
+        session: SessionRef,
+    ) -> bool {
+        self.runner.session(session).is_some_and(|state| {
+            state.phase() == &SessionPhase::DurablePending
+                && state.pending_handoff() == Some(handoff)
+        })
+    }
+
     /// Immutable shadow state for RPC/metrics consumers. Disabled mode reports
     /// a zero-work snapshot and never records observations.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -544,9 +600,30 @@ where
         {
             self.runner.update_target_peer_capabilities(target, peers);
         }
+        let processed_ack_candidate = match &event {
+            AcquisitionEvent::DurableHandoffAcknowledged(acknowledgement)
+                if self
+                    .runner
+                    .session(acknowledgement.session())
+                    .is_some_and(|state| {
+                        state.phase() == &SessionPhase::DurablePending
+                            && state.pending_handoff() == Some(acknowledgement.handoff())
+                    }) =>
+            {
+                Some((acknowledgement.handoff(), acknowledgement.session()))
+            }
+            _ => None,
+        };
         let reference_session = event_session(&event);
         self.shadow.record(&event);
         let effects = self.runner.handle_event(event);
+        if let Some((handoff, session)) = processed_ack_candidate
+            && self.runner.session(session).is_some_and(|state| {
+                state.phase() == &SessionPhase::Complete && state.pending_handoff().is_none()
+            })
+        {
+            self.processed_durable_acks.push_back((handoff, session));
+        }
         self.reconcile_exact_read_priorities();
         self.observe_shadow_result(reference_session, &effects);
         self.note_terminal_failures(&effects);
@@ -592,6 +669,16 @@ where
         let mut packet_limited = false;
         let started = std::time::Instant::now();
         let mut control_limited = false;
+        while control_handled < CONTROL_EVENTS_PER_DRAIN {
+            let Some(acknowledgement) = self.priority_durable_acks.pop_front() else {
+                break;
+            };
+            self.handle_fact(AcquisitionEvent::DurableHandoffAcknowledged(
+                acknowledgement,
+            ));
+            handled += 1;
+            control_handled += 1;
+        }
         // Bootstrap an empty control lane from one producer. Subsequent free
         // slots rotate producers, preventing continuous read traffic from
         // indefinitely hiding write/fence and timer lifecycle facts.
@@ -672,7 +759,8 @@ where
         self.last_drain_has_more = control_limited
             || control_handled >= CONTROL_EVENTS_PER_DRAIN
             || packet_limited
-            || self.pending_control_event.is_some();
+            || self.pending_control_event.is_some()
+            || !self.priority_durable_acks.is_empty();
         handled
     }
 
@@ -1780,6 +1868,36 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct DurableCompletionSeed {
+        ledger: Arc<ledger::Ledger>,
+    }
+
+    impl PlanSeed for DurableCompletionSeed {
+        fn build(
+            &mut self,
+            _session: SessionRef,
+            _header: &ledger::InboundLedgerPacket,
+        ) -> Option<Box<dyn TreeEngine + Send + Sync>> {
+            Some(Box::new(
+                ScriptedEngine::new(TreePlanId::new(2), [ScriptedStep::Complete], Vec::new())
+                    .with_persistence_sequence(SEQ)
+                    .with_durable_ledger(Arc::clone(&self.ledger)),
+            ))
+        }
+    }
+
+    fn immutable_test_ledger(hash: u64) -> Arc<ledger::Ledger> {
+        let mut header = ledger::LedgerHeader {
+            seq: SEQ,
+            ..ledger::LedgerHeader::default()
+        };
+        header.hash = SHAMapHash::new(Uint256::from(hash));
+        let mut ledger = ledger::Ledger::new(header, false);
+        ledger.set_immutable(true);
+        Arc::new(ledger)
+    }
+
+    #[derive(Debug)]
     struct UsefulPacketSeed;
 
     impl PlanSeed for UsefulPacketSeed {
@@ -1919,6 +2037,104 @@ mod tests {
             reads.pending.lock().expect("retained reads").len(),
             CONTROL_EVENT_QUEUE_CAPACITY * 3 / 2,
             "write acknowledgement resumes the plan before the read backlog drains"
+        );
+    }
+
+    #[test]
+    fn processed_handoff_receipt_waits_for_exact_ack_after_control_backpressure() {
+        let cache = fetch_pack();
+        let runner = CoordinatorRunner::with_plan_seed(
+            RunEpoch::new(1),
+            BudgetState::default(),
+            Box::new(DurableCompletionSeed {
+                ledger: immutable_test_ledger(9),
+            }),
+        );
+        let (tx, rx) = mpsc::sync_channel(CONTROL_EVENT_QUEUE_CAPACITY);
+        let (packet_tx, packet_rx) = mpsc::sync_channel(PACKET_INGRESS_QUEUE_CAPACITY);
+        let read_completions = RetainedControlEvents::new(tx.clone());
+        let mut adapter = CoordinatorAdapter::with_event_channel(
+            runner,
+            ShadowConfig::disabled(),
+            FakeLedgerRequestPort::new(),
+            SaturatingReadPort {
+                completions: read_completions.clone(),
+            },
+            FakeWritePort::new(),
+            FakeTimerPort::new(),
+            FakeHandoffPort::new(),
+            FakePhasePort::new(),
+            FakeCancellationPort::new(),
+            Arc::clone(&cache),
+            tx,
+            rx,
+            packet_tx,
+            packet_rx,
+        );
+
+        adapter.connectivity(&[1]);
+        let session = adapter
+            .acquire_requested(target(9, SEQ), AcquireReason::Consensus)
+            .into_iter()
+            .find_map(|effect| match effect {
+                AcquisitionEffect::SessionStarted(session) => Some(session),
+                _ => None,
+            })
+            .expect("session");
+        assert_eq!(
+            adapter.route_ledger_data(
+                1,
+                &wire_ledger_data(Uint256::from(9), 0, vec![(None, base_root_wire())]),
+            ),
+            LedgerDataIngressDisposition::Delivered
+        );
+        assert!(
+            adapter.drain() >= 1,
+            "the packet and continuously ready producer both make progress"
+        );
+        let batch = adapter.writes.submitted[0].clone();
+        adapter.handle_fact(AcquisitionEvent::WriteCompleted(WriteCompletion::new(
+            batch.operation(),
+            WriteOutcome::Accepted,
+        )));
+        adapter.handle_fact(AcquisitionEvent::DurabilityFenced(
+            acquisition::DurabilityCompletion::new(
+                batch.fence().expect("final fence"),
+                acquisition::DurabilityOutcome::Passed,
+            ),
+        ));
+        let published = adapter.handoffs.published[0].clone();
+        assert_eq!(published.session(), session);
+
+        while adapter.try_push_control(AcquisitionEvent::Heartbeat) {}
+        assert!(
+            !adapter.try_push_control(AcquisitionEvent::DurableHandoffAcknowledged(
+                acquisition::DurableHandoffAcknowledgement::new(published.handoff(), session,),
+            )),
+            "the shared control lane is saturated"
+        );
+        assert!(
+            adapter.retain_durable_handoff_ack(published.handoff(), session),
+            "production acknowledgement retention bypasses shared-lane starvation"
+        );
+        assert!(
+            adapter.take_processed_durable_acks().is_empty(),
+            "retention is still not coordinator processing"
+        );
+
+        adapter.drain();
+        assert_eq!(
+            adapter.take_processed_durable_acks(),
+            vec![(published.handoff(), session)],
+            "the priority acknowledgement is processed before the ready producer refills slots"
+        );
+        assert_eq!(
+            adapter
+                .runner
+                .session(session)
+                .expect("retained session")
+                .phase(),
+            &SessionPhase::Complete
         );
     }
 
@@ -2206,9 +2422,7 @@ mod tests {
     }
 
     fn base_root_wire() -> Vec<u8> {
-        let root = basics::memory::intrusive_pointer::make_shared_intrusive(
-            shamap::tree_node::SHAMapTreeNode::new_inner(1),
-        );
+        let root = shamap::tree_node::SHAMapTreeNode::new_inner(1);
         root.set_child_hash(3, SHAMapHash::new(Uint256::from(0x73)));
         root.update_hash();
         root.serialize_for_wire().expect("root wire serializes")

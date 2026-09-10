@@ -2756,13 +2756,13 @@ mod tests {
 
     #[test]
     fn dormancy_rearms_real_tree_waiter_with_fresh_operation_identity() {
-        let child = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let child = SHAMapTreeNode::new_leaf(
             shamap::tree_node::SHAMapNodeType::AccountState,
             SHAMapItem::new(Uint256::from_array([0x91; 32]), vec![0x91; 12]),
             0,
-        ));
+        );
         let child_hash = child.get_hash();
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(0));
+        let root = SHAMapTreeNode::new_inner(0);
         root.set_child_hash(0, child_hash);
         root.update_hash();
         let tree = SyncTree::from_root_with_type(
@@ -3297,15 +3297,15 @@ mod tests {
         // The child is a real leaf node whose hash we compute first, then hang
         // under the root by its hash, so a decoded copy of the child can be
         // applied back and matches exactly.
-        let child = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let child = SHAMapTreeNode::new_leaf(
             shamap::tree_node::SHAMapNodeType::AccountState,
             SHAMapItem::new(Uint256::from(1), vec![0u8; 12]),
             0,
-        ));
+        );
         let child_hash = child.get_hash();
         assert!(!child_hash.is_zero());
 
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(0));
+        let root = SHAMapTreeNode::new_inner(0);
         root.set_child_hash(1, child_hash);
         root.update_hash();
         let tree = SyncTree::from_root_with_type(

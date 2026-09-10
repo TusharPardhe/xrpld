@@ -95,12 +95,12 @@ fn inbound_needed_state_and_tx_hashes_return_roots_when_maps_are_empty() {
 #[test]
 fn inbound_needed_hashes_return_missing_descendants_once_root_is_present() {
     let missing_state_hash = sample_hash(0x31);
-    let state_root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    let state_root = SHAMapTreeNode::new_inner(1);
     state_root.set_child_hash(6, missing_state_hash);
     state_root.update_hash();
 
     let missing_tx_hash = sample_hash(0x41);
-    let tx_root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    let tx_root = SHAMapTreeNode::new_inner(1);
     tx_root.set_child_hash(9, missing_tx_hash);
     tx_root.update_hash();
 
@@ -180,10 +180,10 @@ fn inbound_get_needed_hashes_matches_current_cpp_hash_only_planner() {
 
 #[test]
 fn inbound_get_needed_hashes_skips_completed_maps() {
-    let account_root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    let account_root = SHAMapTreeNode::new_inner(1);
     account_root.update_hash();
     let missing_tx_hash = sample_hash(0x61);
-    let tx_root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    let tx_root = SHAMapTreeNode::new_inner(1);
     tx_root.set_child_hash(3, missing_tx_hash);
     tx_root.update_hash();
 

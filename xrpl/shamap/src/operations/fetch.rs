@@ -145,64 +145,8 @@ where
     )
 }
 
-/// Raw descend result — returns raw pointer, no ref counting.
-pub enum AsyncDescendResultRaw {
-    Ready(Option<*const SHAMapTreeNode>),
-    Pending(SHAMapHash),
-}
-
-/// Zero-clone descend for getMissingNodes hot path.
-/// Returns raw pointer to child — parent keeps it alive.
-pub fn descend_async_raw_nocopy<CLOCK, S, FB, F, MR, NS, REQ>(
-    parent: &SHAMapTreeNode,
-    branch: usize,
-    backed: bool,
-    ledger_seq: u32,
-    family: &SHAMapFamily<CLOCK, S, FB, F, MR, NS>,
-    filter: &mut Option<&mut dyn SHAMapSyncFilter>,
-    request_async_fetch: &mut REQ,
-) -> AsyncDescendResultRaw
-where
-    CLOCK: CacheClock,
-    S: BuildHasher + Clone,
-    F: SHAMapNodeFetcher,
-    MR: MissingNodeReporter,
-    REQ: FnMut(SHAMapHash, u32),
-{
-    // Fast path: child already loaded — raw pointer, no clone
-    if let Some(ptr) = unsafe { parent.get_child_ptr(branch) } {
-        return AsyncDescendResultRaw::Ready(Some(ptr));
-    }
-    if parent.is_empty_branch(branch) {
-        return AsyncDescendResultRaw::Ready(None);
-    }
-
-    let hash = parent.get_child_hash(branch);
-    if let Some(found) = family.cache_lookup(hash) {
-        let canonical = parent.canonicalize_child(branch, found);
-        let ptr: *const SHAMapTreeNode = &*canonical;
-        return AsyncDescendResultRaw::Ready(Some(ptr));
-    }
-
-    if let Some(found) = check_filter_with_family(hash, backed, ledger_seq, family, filter) {
-        let canonical = parent.canonicalize_child(branch, found);
-        let ptr: *const SHAMapTreeNode = &*canonical;
-        return AsyncDescendResultRaw::Ready(Some(ptr));
-    }
-
-    if !backed {
-        return AsyncDescendResultRaw::Ready(None);
-    }
-
-    // Match rippled `descendAsync`: after cache/filter misses, defer exactly
-    // one backing-store resolution to the scan completion boundary. Doing a
-    // synchronous read here and another during completion probes NuDB twice
-    // for the same unresolved child.
-    request_async_fetch(hash, ledger_seq);
-    AsyncDescendResultRaw::Pending(hash)
-}
-
-/// Raw pointer version — avoids SharedIntrusive ref counting in hot paths.
+/// Descends with a pinned one-word intrusive handle so concurrent cache/tree
+/// release cannot invalidate the selected child during this traversal step.
 pub fn descend_async_raw<CLOCK, S, FB, F, MR, NS, REQ>(
     parent: &SHAMapTreeNode,
     branch: usize,
@@ -270,7 +214,7 @@ mod tests {
     use crate::tree_node_cache::TreeNodeCache;
     use basics::base_uint::Uint256;
     use basics::blob::Blob;
-    use basics::intrusive_pointer::{SharedIntrusive, make_shared_intrusive};
+    use basics::intrusive_pointer::SharedIntrusive;
     use basics::sha_map_hash::SHAMapHash;
     use basics::tagged_cache::ManualClock;
     use std::sync::{Arc, Mutex};
@@ -360,22 +304,22 @@ mod tests {
             Duration::seconds(1),
             ManualClock::new(0),
         ));
-        let canonical = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let canonical = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(sample_uint256(0x11), vec![1; 12]),
             0,
-        ));
+        );
         let mut cached = canonical.clone();
         assert!(!cache.canonicalize_replace_client(canonical.get_hash().as_uint256(), &mut cached));
 
-        let filter_blob = make_shared_intrusive(SHAMapTreeNode::new_leaf_with_hash(
+        let filter_blob = SHAMapTreeNode::new_leaf_with_hash(
             SHAMapNodeType::AccountState,
             canonical
                 .peek_item()
                 .expect("canonical leaf should carry an item"),
             0,
             canonical.get_hash(),
-        ))
+        )
         .serialize_with_prefix()
         .expect("prefix serialization should succeed");
 
@@ -449,11 +393,11 @@ mod tests {
             fn missing_node_acquire_by_hash(&self, _ref_hash: Uint256, _ref_num: u32) {}
         }
 
-        let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(sample_uint256(0x22), vec![2; 12]),
             0,
-        ));
+        );
         let leaf_blob = leaf
             .serialize_with_prefix()
             .expect("prefix serialization should succeed");
@@ -513,11 +457,11 @@ mod tests {
             fn missing_node_acquire_by_hash(&self, _ref_hash: Uint256, _ref_num: u32) {}
         }
 
-        let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(sample_uint256(0x33), vec![3; 12]),
             0,
-        ));
+        );
         let reporter = Arc::new(Mutex::new(RecordingMissingNodeReporter::default()));
         let family = SHAMapFamily::new(
             Arc::new(TreeNodeCache::new(
@@ -600,13 +544,13 @@ mod tests {
 
     #[test]
     fn async_descend_reuses_loaded_child_without_queueing() {
-        let child = make_shared_intrusive(SHAMapTreeNode::new_leaf_with_hash(
+        let child = SHAMapTreeNode::new_leaf_with_hash(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(sample_uint256(0x51), vec![5; 12]),
             0,
             SHAMapHash::new(sample_uint256(0x61)),
-        ));
-        let parent = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        );
+        let parent = SHAMapTreeNode::new_inner(1);
         parent.set_child_hash(3, child.get_hash());
         parent.share_child(3, &child);
         let family = SHAMapFamily::new(
@@ -642,15 +586,15 @@ mod tests {
 
     #[test]
     fn async_descend_checks_filter_before_queueing_backed_fetches() {
-        let child = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let child = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(sample_uint256(0x52), vec![6; 12]),
             0,
-        ));
+        );
         let child_blob = child
             .serialize_with_prefix()
             .expect("prefix serialization should succeed");
-        let parent = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let parent = SHAMapTreeNode::new_inner(1);
         parent.set_child_hash(4, child.get_hash());
         let family = SHAMapFamily::new(
             Arc::new(TreeNodeCache::new(
@@ -696,7 +640,7 @@ mod tests {
     #[test]
     fn async_descend_queues_backed_fetches_after_cache_and_filter_miss() {
         let missing_hash = SHAMapHash::new(sample_uint256(0x53));
-        let parent = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let parent = SHAMapTreeNode::new_inner(1);
         parent.set_child_hash(5, missing_hash);
         let family = SHAMapFamily::new(
             Arc::new(TreeNodeCache::new(
@@ -733,7 +677,7 @@ mod tests {
     #[test]
     fn async_descend_returns_missing_immediately_when_unbacked() {
         let missing_hash = SHAMapHash::new(sample_uint256(0x54));
-        let parent = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let parent = SHAMapTreeNode::new_inner(1);
         parent.set_child_hash(6, missing_hash);
         let family = SHAMapFamily::new(
             Arc::new(TreeNodeCache::new(

@@ -116,7 +116,7 @@ impl LedgerJournal for RecordingLedgerJournal {
 #[test]
 fn ledger_load_immutable_with_family_and_setup_marks_failed_setup_ctor() {
     let missing_amendments_hash = sample_hash(0x96);
-    let fee_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let fee_leaf = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         SHAMapItem::new(
             fees_key(),
@@ -130,8 +130,8 @@ fn ledger_load_immutable_with_family_and_setup_marks_failed_setup_ctor() {
             ),
         ),
         0,
-    ));
-    let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    );
+    let root = SHAMapTreeNode::new_inner(1);
     root.set_child_hash(
         usize::from(amendments_key().data()[0] >> 4),
         missing_amendments_hash,
@@ -213,20 +213,20 @@ fn ledger_load_immutable_with_family_and_setup_marks_failed_setup_ctor() {
 
 #[test]
 fn ledger_load_immutable_with_family_and_setup_decodes_typed_singleton_payloads() {
-    let amendment_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let amendment_leaf = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         SHAMapItem::new(
             amendments_key(),
             typed_amendments_entry_bytes(&[feature_xrp_fees(), Uint256::from_array([0xB3; 32])]),
         ),
         0,
-    ));
-    let fee_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    );
+    let fee_leaf = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         SHAMapItem::new(fees_key(), typed_xrp_fee_settings_entry_bytes(44, 55, 66)),
         0,
-    ));
-    let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    );
+    let root = SHAMapTreeNode::new_inner(1);
     root.set_child_hash(
         usize::from(amendments_key().data()[0] >> 4),
         amendment_leaf.get_hash(),

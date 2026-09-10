@@ -1118,6 +1118,7 @@ mod tests {
                 "node_object_cache_capacity_entries",
                 "node_object_cache_durable_loads",
                 "node_object_cache_entries",
+                "node_object_cache_eviction_policy",
                 "node_object_cache_hits",
                 "node_object_cache_idle_seconds",
                 "node_object_cache_invalidations",
@@ -1126,6 +1127,8 @@ mod tests {
                 "node_object_cache_promotions",
                 "node_object_cache_rejected",
                 "node_object_cache_ttl_seconds",
+                "node_object_cache_weighted_capacity_bytes",
+                "node_object_cache_weighted_size_bytes",
                 "node_read_bytes",
                 "node_reads_duration_us",
                 "node_reads_hit",
@@ -1140,6 +1143,10 @@ mod tests {
         );
         assert_eq!(counts.get("read_queue"), Some(&JsonValue::Unsigned(0)));
         assert_eq!(
+            counts.get("node_object_cache_eviction_policy"),
+            Some(&JsonValue::String("lru".to_owned()))
+        );
+        assert_eq!(
             counts.get("node_object_cache_capacity_entries"),
             Some(&JsonValue::String("1000000".to_owned()))
         );
@@ -1147,6 +1154,10 @@ mod tests {
             counts.get("node_object_cache_capacity_bytes_is_estimate"),
             Some(&JsonValue::Bool(true))
         );
+        assert!(matches!(
+            counts.get("node_object_cache_weighted_size_bytes"),
+            Some(JsonValue::String(value)) if value.parse::<u64>().is_ok()
+        ));
         assert!(matches!(
             counts.get("read_threads_total"),
             Some(JsonValue::Signed(value)) if *value >= 1

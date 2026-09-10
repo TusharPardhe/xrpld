@@ -34,16 +34,16 @@ fn sample_ledger_config(features: impl IntoIterator<Item = Uint256>) -> LedgerCo
 
 #[test]
 fn ledger_from_previous_matches_current_cpp_follow_ledger_header_and_snapshot_roles() {
-    let state_root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let state_root = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         SHAMapItem::new(sample_uint256(0x31), vec![0x61; 20]),
         0,
-    ));
-    let tx_root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    );
+    let tx_root = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::TransactionNm,
         SHAMapItem::new(sample_uint256(0x32), vec![0x62; 20]),
         0,
-    ));
+    );
     let previous = Ledger::from_maps(
         LedgerHeader {
             seq: 900,

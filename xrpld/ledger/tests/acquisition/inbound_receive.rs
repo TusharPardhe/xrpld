@@ -1,6 +1,6 @@
 use basics::base_uint::Uint256;
 use basics::blob::Blob;
-use basics::intrusive_pointer::{SharedIntrusive, make_shared_intrusive};
+use basics::intrusive_pointer::SharedIntrusive;
 use basics::sha_map_hash::SHAMapHash;
 use basics::tagged_cache::ManualClock;
 use ledger::ledger_fetcher::INBOUND_LEDGER_MAX_PACKET_NODES_PER_STEP;
@@ -292,11 +292,11 @@ fn inbound_take_header_hash_mismatch_is_rejected_without_failing_owner() {
 
 #[test]
 fn inbound_receive_state_root_packet_marks_completion_when_other_map_is_already_done() {
-    let state_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let state_leaf = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         SHAMapItem::new(Uint256::from_array([0x51; 32]), vec![1; 12]),
         0,
-    ));
+    );
     let header = sample_header(602, state_leaf.get_hash(), SHAMapHash::default());
     let wanted_hash = calculate_ledger_hash(&header);
     let family = family("inbound-receive-state-root");
@@ -351,15 +351,14 @@ fn inbound_receive_state_root_packet_marks_completion_when_other_map_is_already_
 
 #[test]
 fn inbound_packet_steps_preserve_full_packet_stats_and_timer_progress() {
-    let state_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let state_leaf = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         SHAMapItem::new(Uint256::from_array([0x53; 32]), vec![1; 12]),
         0,
-    ));
+    );
     let state_root = SHAMapTreeNode::new_inner(0);
     state_root.set_child_hash(3, state_leaf.get_hash());
     state_root.update_hash();
-    let state_root = make_shared_intrusive(state_root);
     let header = sample_header(603, state_root.get_hash(), SHAMapHash::default());
     let wanted_hash = calculate_ledger_hash(&header);
     let root = InboundLedgerNodeData::new(
@@ -477,11 +476,11 @@ fn inbound_packet_steps_preserve_full_packet_stats_and_timer_progress() {
 
 #[test]
 fn inbound_packet_step_validates_the_original_packet_before_mutating() {
-    let state_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let state_leaf = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         SHAMapItem::new(Uint256::from_array([0x54; 32]), vec![1; 12]),
         0,
-    ));
+    );
     let header = sample_header(604, state_leaf.get_hash(), SHAMapHash::default());
     let wanted_hash = calculate_ledger_hash(&header);
     let valid = InboundLedgerNodeData::new(
@@ -524,11 +523,11 @@ fn inbound_packet_step_validates_the_original_packet_before_mutating() {
 
 #[test]
 fn inbound_completion_without_fetch_backed_fee_settings_is_failed_not_full() {
-    let state_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let state_leaf = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         SHAMapItem::new(Uint256::from_array([0x52; 32]), vec![1; 12]),
         0,
-    ));
+    );
     let header = sample_header(
         XRP_LEDGER_EARLIEST_FEES,
         state_leaf.get_hash(),
@@ -591,11 +590,11 @@ fn inbound_completion_without_fetch_backed_fee_settings_is_failed_not_full() {
 
 #[test]
 fn inbound_receive_known_tx_node_attaches_child() {
-    let child = make_shared_intrusive(SHAMapTreeNode::new_inner(0));
+    let child = SHAMapTreeNode::new_inner(0);
     child.set_child_hash(4, sample_hash(0x77));
     child.update_hash_deep();
 
-    let root = make_shared_intrusive(SHAMapTreeNode::new_inner(0));
+    let root = SHAMapTreeNode::new_inner(0);
     root.set_child_hash(3, child.get_hash());
     root.update_hash();
 
@@ -707,15 +706,14 @@ fn inbound_receive_state_node_rejects_empty_payload() {
 
 #[test]
 fn inbound_receive_state_node_marks_completion_without_reprocessing_non_synching_map() {
-    let state_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let state_leaf = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         SHAMapItem::new(Uint256::from_array([0x30; 32]), vec![7; 12]),
         0,
-    ));
+    );
     let state_root = SHAMapTreeNode::new_inner(0);
     state_root.set_child_hash(3, state_leaf.get_hash());
     state_root.update_hash();
-    let state_root = make_shared_intrusive(state_root);
 
     let header = sample_header(605, state_root.get_hash(), SHAMapHash::default());
     let wanted_hash = calculate_ledger_hash(&header);
@@ -792,16 +790,16 @@ fn inbound_receive_state_node_marks_completion_without_reprocessing_non_synching
 
 #[test]
 fn inbound_packet_wrapper_rejects_missing_node_ids_and_processes_base_slots() {
-    let state_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let state_leaf = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         SHAMapItem::new(Uint256::from_array([0x61; 32]), vec![2; 12]),
         0,
-    ));
-    let tx_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    );
+    let tx_leaf = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::TransactionMd,
         SHAMapItem::new(Uint256::from_array([0x62; 32]), vec![3; 12]),
         0,
-    ));
+    );
     let header = sample_header(604, state_leaf.get_hash(), tx_leaf.get_hash());
     let wanted_hash = calculate_ledger_hash(&header);
     let family = family("inbound-process-base");

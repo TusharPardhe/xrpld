@@ -1,7 +1,7 @@
 use crate::{NodeObject, NodeObjectType};
 use basics::base_uint::Uint256;
 use basics::basic_config::{Section, get};
-use moka::sync::Cache;
+use moka::{policy::EvictionPolicy, sync::Cache};
 use protocol::JsonValue;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -13,15 +13,31 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// limit. This value derives the default capacity when the operator has not
 /// supplied one.
 const DEFAULT_TARGET_NODES: u64 = 1_000_000;
+const NODE_OBJECT_CACHE_EVICTION_POLICY: &str = "lru";
 const DEFAULT_EXPECTED_NODE_BYTES: u64 = 512;
 const DEFAULT_MAX_ENTRY_BYTES: usize = 1_048_576;
+/// Moka policy and concurrent map bookkeeping not represented by the key or
+/// NodeObject allocation. Keep this intentionally conservative.
 const ENTRY_METADATA_BYTES: usize = 128;
+const ENTRY_FIXED_BYTES: usize = NodeObject::KEY_BYTES
+    + std::mem::size_of::<NodeObject>()
+    + std::mem::size_of::<Arc<NodeObject>>()
+    + ENTRY_METADATA_BYTES;
 /// Default idle timeout in seconds — entries not accessed for this duration
 /// are evicted. Matches rippled's `cache_age` for medium node_size (90s).
 const DEFAULT_CACHE_IDLE_SECONDS: u64 = 90;
 /// Default hard TTL in seconds — entries are evicted after this duration
 /// regardless of access, ensuring post-rotation stale data is flushed.
 const DEFAULT_CACHE_TTL_SECONDS: u64 = 0;
+
+/// Conservative byte weight for an encoded NodeObject cache entry. It includes
+/// Moka's key, the Arc handle and NodeObject allocation, payload bytes, and a
+/// fixed metadata allowance. Moka accepts `u32` weights, so saturate rather
+/// than allowing an oversized accounting conversion to undercount an entry.
+fn node_object_cache_entry_weight(_key: &Uint256, object: &Arc<NodeObject>) -> u32 {
+    let bytes = ENTRY_FIXED_BYTES.saturating_add(object.data().len());
+    u32::try_from(bytes).unwrap_or(u32::MAX)
+}
 
 #[derive(Debug)]
 enum CacheLoadError {
@@ -36,11 +52,24 @@ enum CacheLoadError {
 
 #[cfg(test)]
 mod tests {
-    use super::NodeObjectCache;
+    use super::{ENTRY_FIXED_BYTES, NodeObjectCache, node_object_cache_entry_weight};
     use crate::{NodeObject, NodeObjectType};
     use basics::base_uint::Uint256;
     use basics::basic_config::Section;
+    use protocol::JsonValue;
+    use std::collections::BTreeMap;
     use std::sync::Arc;
+
+    #[test]
+    fn node_object_cache_reports_lru_eviction_policy() {
+        let cache = NodeObjectCache::from_config(&Section::new("node_db")).expect("cache");
+        let mut counts = BTreeMap::new();
+        cache.add_counts_json(&mut counts);
+        assert_eq!(
+            counts.get("node_object_cache_eviction_policy"),
+            Some(&JsonValue::String("lru".to_owned()))
+        );
+    }
 
     #[test]
     fn rippled_cache_size_and_age_control_entry_capacity_and_minutes() {
@@ -52,6 +81,10 @@ mod tests {
         let cache = NodeObjectCache::from_config(&config).expect("large node cache");
 
         assert_eq!(cache.capacity_entries, 4_194_304);
+        assert_eq!(
+            cache.capacity_bytes,
+            4_194_304 * (512 + ENTRY_FIXED_BYTES as u64)
+        );
         assert_eq!(cache.idle_seconds, 7_200);
         assert_eq!(cache.ttl_seconds, 0);
     }
@@ -68,6 +101,38 @@ mod tests {
 
         assert_eq!(cache.capacity_entries, 16);
         assert_eq!(cache.idle_seconds, 30);
+    }
+
+    #[test]
+    fn rejects_max_entry_size_that_cannot_fit_moka_weight() {
+        let mut config = Section::new("node_db");
+        config.set("cache_max_entry_bytes", &usize::MAX.to_string());
+        let error = match NodeObjectCache::from_config(&config) {
+            Ok(_) => panic!("oversized weight must fail"),
+            Err(error) => error,
+        };
+        assert!(error.contains("Invalid cache_max_entry_bytes"));
+    }
+
+    #[test]
+    fn moka_admission_and_metrics_use_conservative_byte_weights() {
+        let mut config = Section::new("node_db");
+        config.set("node_object_cache_capacity_bytes", "4096");
+        let cache = NodeObjectCache::from_config(&config).expect("cache");
+        let hash = Uint256::from_array([0xC1; 32]);
+        let object = Arc::new(NodeObject::new(
+            NodeObjectType::AccountNode,
+            vec![7; 96],
+            hash,
+        ));
+        let expected_weight = u64::from(node_object_cache_entry_weight(&hash, &object));
+
+        cache.promote(Arc::clone(&object));
+        cache.cache.run_pending_tasks();
+
+        assert_eq!(cache.cache.weighted_size(), expected_weight);
+        assert!(expected_weight > object.data().len() as u64);
+        assert!(cache.cache.weighted_size() <= cache.capacity_bytes);
     }
 
     #[test]
@@ -103,8 +168,8 @@ pub(crate) struct NodeObjectCache {
     capacity_entries: u64,
     idle_seconds: u64,
     ttl_seconds: u64,
-    /// A sizing estimate only. The rippled-parity admission boundary is the
-    /// entry count above, not a byte weigher.
+    /// Moka's byte-weighted admission capacity. `capacity_entries` remains a
+    /// compatibility planning counter rather than a second eviction limit.
     capacity_bytes: u64,
     hits: AtomicU64,
     misses: AtomicU64,
@@ -161,36 +226,46 @@ impl NodeObjectCache {
         };
         let ttl_seconds: u64 = get(config, "cache_ttl_seconds", DEFAULT_CACHE_TTL_SECONDS);
 
-        if max_entry_bytes == 0 {
-            return Err("Invalid cache_max_entry_bytes".to_owned());
+        let max_weighted_payload = (u32::MAX as usize).saturating_sub(ENTRY_FIXED_BYTES);
+        if max_entry_bytes == 0 || max_entry_bytes > max_weighted_payload {
+            return Err(format!(
+                "Invalid cache_max_entry_bytes: must be in 1..={max_weighted_payload}"
+            ));
         }
 
+        let expected_entry_bytes = expected_node_bytes
+            .checked_add(ENTRY_FIXED_BYTES as u64)
+            .ok_or_else(|| "NodeObject cache entry weight overflows u64".to_owned())?;
         let capacity_bytes = if configured_capacity_mb > 0 {
-            configured_capacity_mb * 1_048_576
+            configured_capacity_mb
+                .checked_mul(1_048_576)
+                .ok_or_else(|| "NodeObject cache capacity overflows u64".to_owned())?
         } else if configured_capacity > 0 {
             configured_capacity
         } else {
-            let expected_entry_bytes = expected_node_bytes
-                .checked_add(ENTRY_METADATA_BYTES as u64)
-                .ok_or_else(|| "NodeObject cache entry weight overflows u64".to_owned())?;
             target_nodes
                 .checked_mul(expected_entry_bytes)
                 .ok_or_else(|| "NodeObject cache capacity overflows u64".to_owned())?
         };
         let entry_capacity = if configured_capacity_mb > 0 || configured_capacity > 0 {
-            capacity_bytes
-                / expected_node_bytes
-                    .saturating_add(ENTRY_METADATA_BYTES as u64)
-                    .max(1)
+            capacity_bytes / expected_entry_bytes.max(1)
         } else {
             target_nodes
         };
 
-        // rippled's NodeObject TaggedCache is bounded by entry count and
-        // starts empty. Do not byte-weight or preallocate millions of slots.
+        // This immutable NodeObject workload is a streaming durable-read cache
+        // with strong recency characteristics, so retain weighted eviction but
+        // use LRU rather than TinyLFU admission. During a full-state scan,
+        // Moka's asynchronous maintenance counters can transiently overshoot
+        // while the full-state scan processes tens of millions of promotions. TinyLFU's
+        // weighted sketch formula multiplies those live counters; the result can
+        // clamp to 2^30 u64 slots and permanently allocate an 8 GiB frequency
+        // sketch even after eviction returns the cache to its byte capacity.
         let mut builder = Cache::builder()
             .name("node-object-cache")
-            .max_capacity(entry_capacity);
+            .max_capacity(capacity_bytes)
+            .weigher(node_object_cache_entry_weight)
+            .eviction_policy(EvictionPolicy::lru());
 
         if idle_seconds > 0 {
             builder = builder.time_to_idle(std::time::Duration::from_secs(idle_seconds));
@@ -301,6 +376,10 @@ impl NodeObjectCache {
 
     pub(crate) fn add_counts_json(&self, obj: &mut BTreeMap<String, JsonValue>) {
         obj.insert(
+            "node_object_cache_eviction_policy".to_owned(),
+            JsonValue::String(NODE_OBJECT_CACHE_EVICTION_POLICY.to_owned()),
+        );
+        obj.insert(
             "node_object_cache_capacity_entries".to_owned(),
             JsonValue::String(self.capacity_entries.to_string()),
         );
@@ -312,8 +391,9 @@ impl NodeObjectCache {
             "node_object_cache_ttl_seconds".to_owned(),
             JsonValue::String(self.ttl_seconds.to_string()),
         );
-        // Preserve the established key for RPC compatibility, but make its
-        // modeled nature explicit. Moka admission is entry-count bounded.
+        // Preserve established counters while exposing Moka's actual weighted
+        // accounting. These measurements are approximate during concurrent
+        // maintenance, as documented by Moka.
         obj.insert(
             "node_object_cache_capacity_bytes".to_owned(),
             JsonValue::String(self.capacity_bytes.to_string()),
@@ -321,6 +401,14 @@ impl NodeObjectCache {
         obj.insert(
             "node_object_cache_capacity_bytes_is_estimate".to_owned(),
             JsonValue::Bool(true),
+        );
+        obj.insert(
+            "node_object_cache_weighted_capacity_bytes".to_owned(),
+            JsonValue::String(self.capacity_bytes.to_string()),
+        );
+        obj.insert(
+            "node_object_cache_weighted_size_bytes".to_owned(),
+            JsonValue::String(self.cache.weighted_size().to_string()),
         );
         obj.insert(
             "node_object_cache_entries".to_owned(),

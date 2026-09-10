@@ -99,11 +99,11 @@ fn ledger_set_immutable_and_setup_from_state_map_runs_setup_after_finalization()
         false,
         803,
     );
-    let tx_root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let tx_root = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::TransactionNm,
         SHAMapItem::new(sample_uint256(0x89), vec![0x45; 20]),
         0,
-    ));
+    );
     let expected_digest = state_map
         .peek_item_with_hash(amendments_key(), &mut |_| None)
         .expect("amendments lookup should succeed")
@@ -165,11 +165,11 @@ fn ledger_set_immutable_and_setup_from_config_reseeds_presets_and_applies_defaul
         false,
         804,
     );
-    let tx_root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let tx_root = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::TransactionNm,
         SHAMapItem::new(sample_uint256(0x8D), vec![0x45; 20]),
         0,
-    ));
+    );
     let mut ledger = Ledger::from_maps(
         LedgerHeader {
             seq: 804,
@@ -208,16 +208,16 @@ fn ledger_set_immutable_and_setup_from_config_reseeds_presets_and_applies_defaul
 
 #[test]
 fn ledger_set_accepted_with_correct_close_time_updates_header_and_finalizes() {
-    let tx_root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let tx_root = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::TransactionNm,
         SHAMapItem::new(sample_uint256(0x91), vec![0x51; 20]),
         0,
-    ));
-    let state_root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    );
+    let state_root = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         SHAMapItem::new(sample_uint256(0x92), vec![0x52; 20]),
         0,
-    ));
+    );
     let tx_hash = tx_root.get_hash();
     let account_hash = state_root.get_hash();
     let mut expected_header = LedgerHeader {
@@ -320,12 +320,12 @@ fn ledger_set_accepted_and_setup_from_config_preserves_finalized_close_fields() 
 #[test]
 fn ledger_set_accepted_and_setup_from_state_map_preserves_bool_setup_outcome() {
     let missing_amendments_hash = sample_hash(0xA4);
-    let fee_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let fee_leaf = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         SHAMapItem::new(fees_key(), encode_fee_settings_entry(10, 20, 30, false)),
         0,
-    ));
-    let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    );
+    let root = SHAMapTreeNode::new_inner(1);
     root.set_child_hash(
         usize::from(amendments_key().data()[0] >> 4),
         missing_amendments_hash,

@@ -92,7 +92,7 @@ fn sandbox_apply_with_tx_thread_updates_threaded_sles() {
         },
         state_map.clone(),
         SyncTree::from_root_with_type(
-            make_shared_intrusive(SHAMapTreeNode::new_inner(0)),
+            SHAMapTreeNode::new_inner(0),
             SHAMapType::Transaction,
             true,
             ledger_seq,
@@ -538,16 +538,16 @@ fn ledger_new_matches_narrow_cpp_map_roles() {
 
 #[test]
 fn ledger_set_immutable_with_rehash_pulls_map_hashes_into_header_and_hashes_ledger() {
-    let tx_root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let tx_root = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::TransactionNm,
         SHAMapItem::new(sample_uint256(0x71), vec![0x11; 20]),
         0,
-    ));
-    let state_root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    );
+    let state_root = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         SHAMapItem::new(sample_uint256(0x72), vec![0x22; 20]),
         0,
-    ));
+    );
     let tx_hash = tx_root.get_hash();
     let account_hash = state_root.get_hash();
     let mut expected_header = LedgerHeader {
@@ -602,16 +602,16 @@ fn ledger_set_immutable_with_rehash_pulls_map_hashes_into_header_and_hashes_ledg
 
 #[test]
 fn ledger_set_immutable_without_rehash_keeps_existing_header_hashes() {
-    let tx_root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let tx_root = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::TransactionNm,
         SHAMapItem::new(sample_uint256(0x81), vec![0x33; 20]),
         0,
-    ));
-    let state_root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    );
+    let state_root = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         SHAMapItem::new(sample_uint256(0x82), vec![0x44; 20]),
         0,
-    ));
+    );
     let original = LedgerHeader {
         seq: 803,
         hash: sample_hash(0x84),

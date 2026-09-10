@@ -165,14 +165,14 @@ fn inbound_owner_check_local_returns_false_when_more_data_is_still_needed() {
 
 #[test]
 fn inbound_owner_check_local_returns_true_when_local_state_completes() {
-    let state_root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let state_root = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         shamap::item::SHAMapItem::new(
             Uint256::from_array([0x42; 32]),
             vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
         ),
         0,
-    ));
+    );
     let state_blob = state_root
         .serialize_with_prefix()
         .expect("state root prefix serialization should succeed");
@@ -230,14 +230,14 @@ fn inbound_owner_check_local_returns_true_when_local_state_completes() {
 #[test]
 fn inbound_owner_completion_reports_reason_before_owner_acceptance() {
     for reason in [InboundLedgerReason::History, InboundLedgerReason::Consensus] {
-        let state_root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let state_root = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             shamap::item::SHAMapItem::new(
                 Uint256::from_array([0x43; 32]),
                 vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
             ),
             0,
-        ));
+        );
         let state_blob = state_root
             .serialize_with_prefix()
             .expect("state root prefix serialization should succeed");

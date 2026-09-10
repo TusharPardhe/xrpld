@@ -38,6 +38,13 @@ pub struct NodeSizeResourceProfile {
     /// rippled SizedItem::LedgerFetch — maximum adjacent ledgers prefetched
     /// by one `LedgerMaster::fetchForHistory` pass.
     pub ledger_fetch_size: u32,
+    /// LedgerMaster's retained completed-ledger history. Medium is the rippled
+    /// 3.3.0 policy of 64 ledgers for 180 seconds.
+    pub ledger_history_cache_size: usize,
+    pub ledger_history_cache_age_seconds: i64,
+    /// Maximum concurrently live inbound acquisitions. This bounds coordinator
+    /// state independently of the three-worker local-scan pool.
+    pub acquisition_max_sessions: usize,
     /// rippled kFullBelowTargetSize (constant 524288 in Tuning.h).
     pub full_below_target_size: usize,
     /// rippled kFullBelowExpiration (constant 10 minutes in Tuning.h).
@@ -57,6 +64,9 @@ impl NodeSizeResourceProfile {
                 tree_cache_age_seconds: 30,
                 sweep_interval_seconds: 10,
                 ledger_fetch_size: 2,
+                ledger_history_cache_size: 16,
+                ledger_history_cache_age_seconds: 60,
+                acquisition_max_sessions: 4,
                 full_below_target_size: 524_288,
                 full_below_expiration_seconds: 600,
             },
@@ -65,6 +75,9 @@ impl NodeSizeResourceProfile {
                 tree_cache_age_seconds: 60,
                 sweep_interval_seconds: 30,
                 ledger_fetch_size: 3,
+                ledger_history_cache_size: 32,
+                ledger_history_cache_age_seconds: 120,
+                acquisition_max_sessions: 8,
                 full_below_target_size: 524_288,
                 full_below_expiration_seconds: 600,
             },
@@ -73,6 +86,9 @@ impl NodeSizeResourceProfile {
                 tree_cache_age_seconds: 120,
                 sweep_interval_seconds: 90,
                 ledger_fetch_size: 5,
+                ledger_history_cache_size: 128,
+                ledger_history_cache_age_seconds: 300,
+                acquisition_max_sessions: 32,
                 full_below_target_size: 524_288,
                 full_below_expiration_seconds: 600,
             },
@@ -81,6 +97,9 @@ impl NodeSizeResourceProfile {
                 tree_cache_age_seconds: 900,
                 sweep_interval_seconds: 120,
                 ledger_fetch_size: 8,
+                ledger_history_cache_size: 256,
+                ledger_history_cache_age_seconds: 600,
+                acquisition_max_sessions: 64,
                 full_below_target_size: 524_288,
                 full_below_expiration_seconds: 600,
             },
@@ -90,10 +109,34 @@ impl NodeSizeResourceProfile {
                 tree_cache_age_seconds: 90,
                 sweep_interval_seconds: 60,
                 ledger_fetch_size: 4,
+                ledger_history_cache_size: 64,
+                ledger_history_cache_age_seconds: 180,
+                acquisition_max_sessions: 16,
                 full_below_target_size: 524_288,
                 full_below_expiration_seconds: 600,
             },
         }
+    }
+
+    /// The LedgerMaster settings selected by this profile. Keeping this
+    /// conversion beside the other node-size policy prevents production from
+    /// silently falling back to `LedgerMasterConfig::default()`.
+    pub fn ledger_master_config(self) -> ledger::LedgerMasterConfig {
+        ledger::LedgerMasterConfig {
+            history_cache_size: self.ledger_history_cache_size,
+            history_cache_age: time::Duration::seconds(self.ledger_history_cache_age_seconds),
+            ..ledger::LedgerMasterConfig::default()
+        }
+    }
+
+    /// Coordinator budget selected by this profile. The packet and byte limits
+    /// remain the existing per-session protocol admission limits.
+    pub fn acquisition_budget(self) -> acquisition::BudgetState {
+        acquisition::BudgetState::new(
+            self.acquisition_max_sessions,
+            acquisition::AdmissionBudget::default(),
+            std::time::Duration::from_secs(3),
+        )
     }
 }
 
@@ -107,6 +150,7 @@ pub trait NodeFamilyRuntime: Send + Sync {
     fn owned_full_below_cache(&self) -> Option<NodeFamilyFullBelowCache> {
         None
     }
+
     fn fetch_cached_node(
         &self,
         hash: SHAMapHash,
@@ -421,6 +465,9 @@ mod tests {
                 tree_cache_age_seconds: 30,
                 sweep_interval_seconds: 10,
                 ledger_fetch_size: 2,
+                ledger_history_cache_size: 16,
+                ledger_history_cache_age_seconds: 60,
+                acquisition_max_sessions: 4,
                 full_below_target_size: 524_288,
                 full_below_expiration_seconds: 600,
             }
@@ -432,6 +479,9 @@ mod tests {
                 tree_cache_age_seconds: 90,
                 sweep_interval_seconds: 60,
                 ledger_fetch_size: 4,
+                ledger_history_cache_size: 64,
+                ledger_history_cache_age_seconds: 180,
+                acquisition_max_sessions: 16,
                 full_below_target_size: 524_288,
                 full_below_expiration_seconds: 600,
             }
@@ -443,10 +493,26 @@ mod tests {
                 tree_cache_age_seconds: 900,
                 sweep_interval_seconds: 120,
                 ledger_fetch_size: 8,
+                ledger_history_cache_size: 256,
+                ledger_history_cache_age_seconds: 600,
+                acquisition_max_sessions: 64,
                 full_below_target_size: 524_288,
                 full_below_expiration_seconds: 600,
             }
         );
+    }
+
+    #[test]
+    fn medium_profile_drives_ledger_master_and_acquisition_policy() {
+        let profile = NodeSizeResourceProfile::for_node_size(Some("medium"));
+        let ledger_master = profile.ledger_master_config();
+
+        assert_eq!(ledger_master.history_cache_size, 64);
+        assert_eq!(
+            ledger_master.history_cache_age,
+            time::Duration::seconds(180)
+        );
+        assert_eq!(profile.acquisition_budget().max_sessions(), 16);
     }
 
     #[test]

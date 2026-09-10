@@ -812,7 +812,7 @@ mod tests {
     use crate::tree_node_cache::TreeNodeCache;
     use basics::base_uint::Uint256;
     use basics::blob::Blob;
-    use basics::intrusive_pointer::{SharedIntrusive, make_shared_intrusive};
+    use basics::intrusive_pointer::SharedIntrusive;
     use basics::sha_map_hash::SHAMapHash;
     use basics::tagged_cache::ManualClock;
     use parking_lot::Mutex;
@@ -985,11 +985,11 @@ mod tests {
     }
 
     fn sample_leaf(fill: u8) -> SharedIntrusive<SHAMapTreeNode> {
-        make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(Uint256::from_array([fill; 32]), vec![fill; 12]),
             0,
-        ))
+        )
     }
 
     #[test]
@@ -1055,7 +1055,7 @@ mod tests {
 
     #[test]
     fn sync_tree_get_missing_nodes_with_family_uses_shared_full_below_cache_and_fetcher() {
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(0));
+        let root = SHAMapTreeNode::new_inner(0);
         let leaf = sample_leaf(0x22);
         root.set_child_hash(3, leaf.get_hash());
         root.update_hash_deep();
@@ -1091,11 +1091,11 @@ mod tests {
     #[test]
     fn sync_tree_get_missing_nodes_with_family_reuses_deferred_restart_shape_for_nested_fetches() {
         let missing_leaf_hash = SHAMapHash::new(Uint256::from_array([0x39; 32]));
-        let fetched_inner = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let fetched_inner = SHAMapTreeNode::new_inner(1);
         fetched_inner.set_child_hash(7, missing_leaf_hash);
         fetched_inner.update_hash_deep();
 
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(0));
+        let root = SHAMapTreeNode::new_inner(0);
         root.set_child_hash(4, fetched_inner.get_hash());
         root.update_hash();
 
@@ -1158,14 +1158,14 @@ mod tests {
         let mut cached = canonical.clone();
         assert!(!cache.canonicalize_replace_client(canonical.get_hash().as_uint256(), &mut cached));
 
-        let duplicate = make_shared_intrusive(SHAMapTreeNode::new_leaf_with_hash(
+        let duplicate = SHAMapTreeNode::new_leaf_with_hash(
             SHAMapNodeType::AccountState,
             canonical
                 .peek_item()
                 .expect("canonical leaf should carry an item"),
             1,
             canonical.get_hash(),
-        ));
+        );
         let mut tree = StorageTree::new_with_family(1, true, 91, &family);
         tree.root().set_child(1, Some(duplicate));
         tree.root().update_hash_deep();
@@ -1630,14 +1630,14 @@ mod tests {
         let mut cached = canonical.clone();
         assert!(!cache.canonicalize_replace_client(canonical.get_hash().as_uint256(), &mut cached));
 
-        let duplicate = make_shared_intrusive(SHAMapTreeNode::new_leaf_with_hash(
+        let duplicate = SHAMapTreeNode::new_leaf_with_hash(
             SHAMapNodeType::AccountState,
             canonical
                 .peek_item()
                 .expect("canonical leaf should carry an item"),
             0,
             canonical.get_hash(),
-        ));
+        );
         let expected_bytes = canonical
             .serialize_with_prefix()
             .expect("leaf should serialize with a prefix");

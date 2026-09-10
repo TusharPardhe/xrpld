@@ -300,7 +300,7 @@ mod tests {
     use crate::node_id::SHAMapNodeId;
     use crate::tree_node::{SHAMapNodeType, SHAMapTreeNode};
     use basics::base_uint::Uint256;
-    use basics::intrusive_pointer::{SharedIntrusive, make_shared_intrusive};
+    use basics::intrusive_pointer::SharedIntrusive;
     use basics::sha_map_hash::SHAMapHash;
     use basics::tagged_cache::ManualClock;
     use std::sync::{Arc, Mutex};
@@ -317,11 +317,11 @@ mod tests {
     #[test]
     fn single_leaf_proof_path_matches_current_cpp_role() {
         let key = sample_uint256(0x11);
-        let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(key, vec![1; 12]),
             0,
-        ));
+        );
         let leaf_wire = leaf
             .serialize_for_wire()
             .expect("leaf wire serialization should succeed");
@@ -343,13 +343,13 @@ mod tests {
         let key =
             Uint256::from_hex("1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF")
                 .expect("hex should parse");
-        let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(key, vec![7; 12]),
             0,
-        ));
+        );
 
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(0));
+        let root = SHAMapTreeNode::new_inner(0);
         root.set_child_hash(1, leaf.get_hash());
         root.update_hash();
 
@@ -380,12 +380,12 @@ mod tests {
         let key =
             Uint256::from_hex("1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF")
                 .expect("hex should parse");
-        let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(key, vec![9; 12]),
             0,
-        ));
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(0));
+        );
+        let root = SHAMapTreeNode::new_inner(0);
         root.set_child_hash(1, leaf.get_hash());
 
         assert!(has_leaf_node(&root, key, leaf.get_hash()));
@@ -397,17 +397,17 @@ mod tests {
         let key =
             Uint256::from_hex("1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF")
                 .expect("hex should parse");
-        let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(key, vec![4; 12]),
             0,
-        ));
-        let inner = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        );
+        let inner = SHAMapTreeNode::new_inner(1);
         inner.set_child_hash(2, leaf.get_hash());
         inner.share_child(2, &leaf);
         inner.update_hash_deep();
 
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(1, inner.get_hash());
         root.share_child(1, &inner);
         root.update_hash_deep();
@@ -424,17 +424,17 @@ mod tests {
 
     #[test]
     fn has_inner_node_matches_current_cpp_role() {
-        let inner = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
-        let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let inner = SHAMapTreeNode::new_inner(1);
+        let leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(sample_uint256(0x23), vec![1; 12]),
             0,
-        ));
+        );
         inner.set_child_hash(6, leaf.get_hash());
         inner.share_child(6, &leaf);
         inner.update_hash_deep();
 
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(2, inner.get_hash());
         root.share_child(2, &inner);
         root.update_hash_deep();
@@ -503,11 +503,11 @@ mod tests {
 
     #[test]
     fn has_inner_node_with_family_fetches_missing_children_when_backed() {
-        let inner = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let inner = SHAMapTreeNode::new_inner(1);
         inner.set_child_hash(3, sample_hash(0x34));
         inner.update_hash();
 
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(0));
+        let root = SHAMapTreeNode::new_inner(0);
         root.set_child_hash(4, inner.get_hash());
         root.update_hash();
 
@@ -546,17 +546,17 @@ mod tests {
         let key =
             Uint256::from_hex("1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF")
                 .expect("hex should parse");
-        let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(key, vec![6; 12]),
             0,
-        ));
-        let inner = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        );
+        let inner = SHAMapTreeNode::new_inner(1);
         inner.set_child_hash(2, leaf.get_hash());
         inner.share_child(2, &leaf);
         inner.update_hash_deep();
 
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(1, inner.get_hash());
         root.update_hash();
 
@@ -592,12 +592,12 @@ mod tests {
         let key =
             Uint256::from_hex("1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF")
                 .expect("hex should parse");
-        let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(key, vec![5; 12]),
             0,
-        ));
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        );
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(1, leaf.get_hash());
         root.share_child(1, &leaf);
         root.update_hash();
@@ -624,17 +624,17 @@ mod tests {
         let key =
             Uint256::from_hex("1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF")
                 .expect("hex should parse");
-        let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(key, vec![7; 12]),
             0,
-        ));
-        let inner = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        );
+        let inner = SHAMapTreeNode::new_inner(1);
         inner.set_child_hash(2, leaf.get_hash());
         inner.share_child(2, &leaf);
         inner.update_hash_deep();
 
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(1, inner.get_hash());
         root.update_hash();
 
@@ -668,17 +668,17 @@ mod tests {
         let key =
             Uint256::from_hex("1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF")
                 .expect("hex should parse");
-        let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(key, vec![8; 12]),
             0,
-        ));
-        let inner = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        );
+        let inner = SHAMapTreeNode::new_inner(1);
         inner.set_child_hash(2, leaf.get_hash());
         inner.share_child(2, &leaf);
         inner.update_hash_deep();
 
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(1, inner.get_hash());
         root.update_hash();
 
@@ -727,12 +727,12 @@ mod tests {
     #[test]
     fn get_proof_path_with_family_logs_when_no_path_exists() {
         let key = sample_uint256(0xA4);
-        let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(sample_uint256(0xB5), vec![8; 12]),
             0,
-        ));
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        );
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(1, leaf.get_hash());
         root.share_child(1, &leaf);
         root.update_hash();

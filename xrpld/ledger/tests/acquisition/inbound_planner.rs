@@ -114,7 +114,7 @@ fn needed_state_hashes_returns_empty_for_zero_root() {
 fn needed_state_hashes_returns_missing_child_hashes_in_scan_order() {
     let missing_a = sample_hash(0xB1);
     let missing_b = sample_hash(0xB2);
-    let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    let root = SHAMapTreeNode::new_inner(1);
     root.set_child_hash(1, missing_a);
     root.set_child_hash(10, missing_b);
     root.update_hash();
@@ -173,11 +173,11 @@ fn needed_state_hashes_returns_missing_child_hashes_in_scan_order() {
 
 #[test]
 fn needed_tx_hashes_clears_synching_when_tree_is_complete() {
-    let tx_root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let tx_root = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::TransactionNm,
         SHAMapItem::new(sample_uint256(0x44), vec![0x55; 16]),
         0,
-    ));
+    );
     let reporter = Arc::new(Mutex::new(RecordingMissingNodeReporter::default()));
     let family = SHAMapFamily::new(
         Arc::new(TreeNodeCache::new(
@@ -217,17 +217,17 @@ fn needed_tx_hashes_clears_synching_when_tree_is_complete() {
 
 #[test]
 fn needed_state_hashes_stays_empty_when_complete_subtree_is_only_in_backed_fetch_path() {
-    let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let leaf = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         SHAMapItem::new(sample_uint256(0x91), vec![0xA5; 16]),
         0,
-    ));
-    let fetched_inner = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    );
+    let fetched_inner = SHAMapTreeNode::new_inner(1);
     fetched_inner.set_child_hash(4, leaf.get_hash());
     fetched_inner.share_child(4, &leaf);
     fetched_inner.update_hash_deep();
 
-    let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    let root = SHAMapTreeNode::new_inner(1);
     root.set_child_hash(7, fetched_inner.get_hash());
     root.update_hash();
 

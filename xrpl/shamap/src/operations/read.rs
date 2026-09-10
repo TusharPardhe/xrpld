@@ -104,7 +104,6 @@ mod tests {
     use crate::item::SHAMapItem;
     use crate::tree_node::{SHAMapNodeType, SHAMapTreeNode};
     use basics::base_uint::Uint256;
-    use basics::intrusive_pointer::make_shared_intrusive;
     use basics::sha_map_hash::SHAMapHash;
 
     fn key(hex: &str) -> Uint256 {
@@ -119,12 +118,12 @@ mod tests {
     fn has_item_and_peek_item_match_exact_key_role() {
         let stored_key = key("1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF");
         let missing_key = key("1F34567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF");
-        let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(stored_key, vec![1; 12]),
             0,
-        ));
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        );
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(1, leaf.get_hash());
         root.share_child(1, &leaf);
         root.update_hash_deep();
@@ -149,13 +148,13 @@ mod tests {
     fn peek_item_with_hash_returns_leaf_hash_when_found() {
         let key = key("ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890");
         let expected_hash = sample_hash(0x77);
-        let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf_with_hash(
+        let leaf = SHAMapTreeNode::new_leaf_with_hash(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(key, vec![2; 12]),
             0,
             expected_hash,
-        ));
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        );
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(10, expected_hash);
         root.share_child(10, &leaf);
         root.update_hash_deep();
@@ -171,13 +170,13 @@ mod tests {
     fn direct_read_helpers_can_fetch_backed_missing_children() {
         let key = key("2000000000000000000000000000000000000000000000000000000000000000");
         let expected_hash = sample_hash(0x55);
-        let fetched_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf_with_hash(
+        let fetched_leaf = SHAMapTreeNode::new_leaf_with_hash(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(key, vec![3; 12]),
             0,
             expected_hash,
-        ));
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        );
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(2, expected_hash);
 
         let mut fetch_calls = 0;

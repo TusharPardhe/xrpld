@@ -24,11 +24,11 @@ fn sample_hash(fill: u8) -> SHAMapHash {
 }
 
 fn state_leaf(fill: u8) -> SharedIntrusive<SHAMapTreeNode> {
-    make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         SHAMapItem::new(Uint256::from_array([fill; 32]), vec![fill; 12]),
         0,
-    ))
+    )
 }
 
 fn immutable_ledger(seq: u32, fill: u8) -> Arc<Ledger> {
@@ -316,4 +316,95 @@ fn persistence_load_helpers_reuse_current_ledger_loading_paths() {
     assert_eq!(seq, 42);
     assert_eq!(hash, header.hash);
     assert_eq!(latest.expect("latest ledger").header().hash, header.hash);
+}
+
+fn deep_map(
+    map_type: SHAMapType,
+    node_type: SHAMapNodeType,
+    fill: u8,
+    backed: bool,
+    seq: u32,
+) -> (SyncTree, SharedIntrusive<SHAMapTreeNode>) {
+    let leaf = SHAMapTreeNode::new_leaf(
+        node_type,
+        SHAMapItem::new(Uint256::from_array([fill; 32]), vec![fill; 24]),
+        0,
+    );
+    let level_two = SHAMapTreeNode::new_inner(1);
+    level_two.set_child(3, Some(leaf));
+    level_two.update_hash_deep();
+    let level_one = SHAMapTreeNode::new_inner(1);
+    level_one.set_child(2, Some(level_two.clone()));
+    level_one.update_hash_deep();
+    let root = SHAMapTreeNode::new_inner(1);
+    root.set_child(1, Some(level_one));
+    root.update_hash_deep();
+    (
+        SyncTree::from_root_with_type(root, map_type, backed, seq, SyncState::Immutable),
+        level_two,
+    )
+}
+
+fn deep_ledger_with_map_backing(
+    seq: u32,
+    state_backed: bool,
+    tx_backed: bool,
+) -> (
+    Ledger,
+    SharedIntrusive<SHAMapTreeNode>,
+    SharedIntrusive<SHAMapTreeNode>,
+) {
+    let (state, state_level_two) = deep_map(
+        SHAMapType::State,
+        SHAMapNodeType::AccountState,
+        0x51,
+        state_backed,
+        seq,
+    );
+    let (transactions, tx_level_two) = deep_map(
+        SHAMapType::Transaction,
+        SHAMapNodeType::TransactionNm,
+        0x61,
+        tx_backed,
+        seq,
+    );
+    let header = LedgerHeader {
+        seq,
+        account_hash: state.root().get_hash(),
+        tx_hash: transactions.root().get_hash(),
+        ..LedgerHeader::default()
+    };
+    let mut ledger = Ledger::from_maps(header, state, transactions);
+    ledger.set_node_fetcher(Arc::new(|_| None));
+    ledger.set_immutable(true);
+    (ledger, state_level_two, tx_level_two)
+}
+
+#[test]
+fn durable_graph_release_checks_both_maps_before_releasing_either() {
+    let (ledger, state_level_two, tx_level_two) = deep_ledger_with_map_backing(90, true, true);
+    let original_state_hash = ledger.state_map().root().get_hash();
+    let original_tx_hash = ledger.tx_map().root().get_hash();
+
+    let released = ledger
+        .release_durable_map_graphs(None, 2)
+        .expect("immutable fetchable backed maps satisfy release guards");
+    assert_eq!(released.state_deep, 1);
+    assert_eq!(released.transaction_deep, 1);
+    assert!(state_level_two.get_child(3).is_none());
+    assert!(tx_level_two.get_child(3).is_none());
+    assert_eq!(ledger.state_map().root().get_hash(), original_state_hash);
+    assert_eq!(ledger.tx_map().root().get_hash(), original_tx_hash);
+
+    let (guarded, guarded_state_level_two, guarded_tx_level_two) =
+        deep_ledger_with_map_backing(91, true, false);
+    assert!(
+        guarded.release_durable_map_graphs(None, 2).is_none(),
+        "one unbacked map rejects the complete two-map release"
+    );
+    assert!(
+        guarded_state_level_two.get_child(3).is_some(),
+        "state graph must remain loaded when the transaction guard fails"
+    );
+    assert!(guarded_tx_level_two.get_child(3).is_some());
 }

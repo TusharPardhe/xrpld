@@ -1158,7 +1158,7 @@ mod tests {
     use super::*;
     use crate::{LedgerHeader, LedgerPersistenceRuntime, NullLedgerJournal, calculate_ledger_hash};
     use basics::base_uint::Uint256;
-    use basics::intrusive_pointer::{SharedIntrusive, make_shared_intrusive};
+    use basics::intrusive_pointer::SharedIntrusive;
     use protocol::{
         AccountID, STAmount, STArray, STObject, STTx, Serializer, TxType, get_field_by_symbol,
     };
@@ -1202,11 +1202,11 @@ mod tests {
     }
 
     fn state_leaf(fill: u8) -> SharedIntrusive<SHAMapTreeNode> {
-        make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(Uint256::from_array([fill; 32]), vec![fill; 12]),
             0,
-        ))
+        )
     }
 
     fn account(fill: u8) -> AccountID {
@@ -1336,11 +1336,11 @@ mod tests {
     ) -> Arc<Ledger> {
         let state_root = state_leaf(state_fill);
         let tx_root = tx_fill.map(|fill| {
-            make_shared_intrusive(SHAMapTreeNode::new_leaf(
+            SHAMapTreeNode::new_leaf(
                 SHAMapNodeType::TransactionNm,
                 SHAMapItem::new(Uint256::from_array([fill; 32]), vec![fill; 12]),
                 0,
-            ))
+            )
         });
         let mut header = LedgerHeader {
             seq,
