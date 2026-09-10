@@ -485,6 +485,87 @@ fn offer_replacement() {
     assert_eq!(get_owner_count(&view, alice), 2);
 }
 
+/// A failed inner payment-flow strand does not fail OfferCreate crossing.
+///
+/// rippled's `OfferCreate::flowCross` leaves the offer unchanged when `flow()`
+/// returns a non-success TER, then returns `tesSUCCESS` so a non-IOC/FOK offer
+/// can rest. Testnet transaction
+/// 5BD7047C8A4DE85068B1139532978858EFFA1E65227674F78F4F7BAB0756C4EC
+/// exercised this with an issuer-side NoRipple flag: the old OfferSequence
+/// target was deleted and the replacement was created without crossing.
+#[test]
+fn offer_sequence_replacement_rests_after_no_ripple_crossing_path() {
+    let alice = acct(0x11);
+    let gw = acct(0x33);
+    let usd = usd_currency();
+
+    let ledger = build_ledger(vec![
+        account_root(alice, 10_000_000_000, 1, 0),
+        account_root(gw, 10_000_000_000, 0, 0),
+        trust_line(alice, gw, usd, 1_000, 10_000, 0),
+    ]);
+    let mut view = new_view(ledger);
+
+    let original = offer_tx(alice, xrp(1_000_000_000), iou(gw, usd, 1_000), 1);
+    assert_eq!(
+        full_apply(&mut view, &original, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS
+    );
+
+    // Make the default IOU -> XRP crossing strand fail exactly as the live
+    // transaction did. The OfferCreate preclaim still succeeds because Alice
+    // owns funded IOU; only flow's crossing path is unavailable.
+    let line_keylet = protocol::line(alice, gw, usd);
+    let mut line = (*view
+        .read(line_keylet)
+        .expect("read trust line")
+        .expect("funding trust line must exist"))
+    .clone();
+    let issuer_no_ripple = if gw > alice {
+        protocol::lsfHighNoRipple
+    } else {
+        protocol::lsfLowNoRipple
+    };
+    let line_flags = line.get_field_u32(sf("sfFlags"));
+    line.set_field_u32(sf("sfFlags"), line_flags | issuer_no_ripple);
+    view.update(Arc::new(line))
+        .expect("set issuer-side NoRipple flag");
+
+    let replacement = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), alice);
+        tx.set_field_amount(sf("sfTakerPays"), xrp(2_000_000_000));
+        tx.set_field_amount(sf("sfTakerGets"), iou(gw, usd, 2_000));
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 2);
+        tx.set_field_u32(sf("sfOfferSequence"), 1);
+    });
+    assert_eq!(
+        full_apply(&mut view, &replacement, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS,
+        "a dry no-ripple crossing path must not escape flowCross"
+    );
+
+    assert!(
+        view.read(protocol::offer_keylet(acct_id(alice), 1))
+            .expect("read cancelled offer")
+            .is_none(),
+        "OfferSequence must delete the old offer"
+    );
+    let replacement_offer = view
+        .read(protocol::offer_keylet(acct_id(alice), 2))
+        .expect("read replacement offer")
+        .expect("the unchanged replacement must rest on the book");
+    assert_eq!(
+        replacement_offer.get_field_amount(sf("sfTakerPays")),
+        xrp(2_000_000_000)
+    );
+    assert_eq!(
+        replacement_offer.get_field_amount(sf("sfTakerGets")),
+        iou(gw, usd, 2_000)
+    );
+    assert_eq!(get_owner_count(&view, alice), 2);
+}
+
 /// Regression for mainnet ledger 106134615 transaction
 /// 010A5050D712F5816FC6E7A3E1CE6AE0098DEE19DFC5D1CB76077309A02B5191.
 ///
@@ -1169,7 +1250,7 @@ fn offer_crossing_frozen_trust_line() {
 
     // Alice tries to sell frozen USD — should be unfunded
     let tx = offer_tx(alice, xrp(1_000_000_000), iou(gw, usd, 1000), 1);
-    let result = handle_real_dispatch(&mut view, &tx, TxType::OFFER_CREATE, None);
+    let result = full_apply(&mut view, &tx, TxType::OFFER_CREATE);
     assert_eq!(result, Ter::TEC_UNFUNDED_OFFER);
 }
 
@@ -1195,7 +1276,7 @@ fn offer_globally_frozen_issuer() {
     // OfferCreate.cpp:190-212 rejects GlobalFreeze before accountFunds;
     // Freeze_test.cpp:480-489 expects tecFROZEN in both offer directions.
     let tx = offer_tx(alice, xrp(1_000_000_000), iou(gw, usd, 1000), 1);
-    let result = handle_real_dispatch(&mut view, &tx, TxType::OFFER_CREATE, None);
+    let result = full_apply(&mut view, &tx, TxType::OFFER_CREATE);
     assert_eq!(result, Ter::TEC_FROZEN);
 }
 
