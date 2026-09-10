@@ -43,6 +43,8 @@ pub trait GetCountsSource {
 
     fn treenode_cache_size(&self) -> u64;
 
+    fn treenode_cache_capacity_entries(&self) -> u64;
+
     fn treenode_track_size(&self) -> u64;
 
     fn add_node_store_counts(&self, json: &mut BTreeMap<String, JsonValue>);
@@ -174,6 +176,10 @@ pub fn get_counts_json<S: GetCountsSource>(source: &S, min_count: u32) -> JsonVa
     result.insert(
         "treenode_cache_size".to_owned(),
         JsonValue::Unsigned(source.treenode_cache_size()),
+    );
+    result.insert(
+        "treenode_cache_capacity_entries".to_owned(),
+        JsonValue::Unsigned(source.treenode_cache_capacity_entries()),
     );
     result.insert(
         "treenode_track_size".to_owned(),

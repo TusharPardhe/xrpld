@@ -9,6 +9,7 @@ use crate::state::manifest::ManifestCache;
 use crate::tx_queue::txq::TxQ;
 use crate::validator::validator_site::ValidatorSite;
 use basics::base_uint::Uint256;
+use basics::blob::Blob;
 use basics::tagged_cache::{MonotonicClock, TaggedCache};
 use ledger::{
     AcceptedLedger, CachedSles, InboundTransactions, LedgerCleaner, LedgerReplayer, OrderBookDB,
@@ -76,7 +77,6 @@ impl PerfLogReportSource for StateAccountingReportSource {
 use protocol::{AccountID, PublicKey, SeqProxy};
 use quaxar_core::{DatabaseCon, WALLET_DB_INIT, WALLET_DB_NAME};
 use resource::ResourceManager;
-use shamap::tree_node_cache::TreeNodeCache;
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -109,6 +109,14 @@ static WALLET_DB_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub type AppInboundLedgers = Arc<Mutex<InboundLedgersLocal<MonotonicClock>>>;
 pub type AppInboundTransactions = Arc<Mutex<InboundTransactions>>;
 pub type AppAcceptedLedgerCache = Arc<TaggedCache<Uint256, Arc<AcceptedLedger>>>;
+/// Consensus transaction-set nodes in their original SHAMap prefix format.
+///
+/// This is deliberately distinct from the process-wide decoded
+/// `TreeNodeCache` used by `SHAMapFamily`: `ConsensusTransSetSF` must retain
+/// and serve the exact peer bytes it received.
+pub type AppTempNodeCache = Arc<TaggedCache<Uint256, Blob>>;
+pub const APP_TEMP_NODE_CACHE_TARGET_SIZE: usize = 16_384;
+pub const APP_TEMP_NODE_CACHE_TARGET_AGE: TimeDuration = TimeDuration::seconds(90);
 pub type AppTxQAccount = AccountID;
 pub type AppTxQTransaction = Arc<protocol::STTx>;
 pub type AppTxQJournalTag = String;
@@ -1286,7 +1294,7 @@ impl AppLogs {
 
 #[derive(Clone)]
 pub struct ApplicationRegistryOwners {
-    pub temp_node_cache: Arc<TreeNodeCache>,
+    pub temp_node_cache: AppTempNodeCache,
     pub cached_sles: Arc<CachedSles>,
     pub network_id_service: FixedNetworkIdService,
     pub hash_router: Arc<HashRouter>,
@@ -1382,10 +1390,10 @@ impl ApplicationRegistryOwners {
             MonotonicClock::default(),
         ));
 
-        let temp_node_cache = Arc::new(TreeNodeCache::new(
-            "TreeNodeCache",
-            32768,
-            TimeDuration::minutes(1),
+        let temp_node_cache = Arc::new(TaggedCache::new(
+            "NodeCache",
+            APP_TEMP_NODE_CACHE_TARGET_SIZE,
+            APP_TEMP_NODE_CACHE_TARGET_AGE,
             MonotonicClock::default(),
         ));
 
@@ -1489,13 +1497,15 @@ fn unique_wallet_db_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        APP_OPEN_LEDGER_DEFAULT_BASE_FEE_DROPS, AppConfig, AppLogs, AppOpenLedgerTxRecord,
-        AppPlaceholder, RelayUntrustedPolicy, unique_wallet_db_dir,
+        APP_OPEN_LEDGER_DEFAULT_BASE_FEE_DROPS, APP_TEMP_NODE_CACHE_TARGET_AGE,
+        APP_TEMP_NODE_CACHE_TARGET_SIZE, AppConfig, AppLogs, AppOpenLedgerTxRecord, AppPlaceholder,
+        RelayUntrustedPolicy, unique_wallet_db_dir,
     };
     use crate::load::load_manager::LoadManagerJournal;
     use basics::base_uint::Uint256;
     use protocol::JsonValue;
     use std::sync::Arc;
+    use time::Duration as TimeDuration;
     use xrpl_core::{HashRouterFlags, LoadMonitorJournalFactory, NetworkIDService};
 
     #[test]
@@ -1576,6 +1586,26 @@ mod tests {
             APP_OPEN_LEDGER_DEFAULT_BASE_FEE_DROPS
         );
         assert_eq!(owners.tx_q.current_max_size(), None);
+    }
+
+    #[test]
+    fn application_registry_uses_rippled_temp_node_cache_policy() {
+        let owners = super::ApplicationRegistryOwners::new().expect("registry owners");
+
+        assert_eq!(owners.temp_node_cache.name(), "NodeCache");
+        assert_eq!(
+            owners.temp_node_cache.target_size(),
+            APP_TEMP_NODE_CACHE_TARGET_SIZE
+        );
+        assert_eq!(
+            owners.temp_node_cache.target_age(),
+            APP_TEMP_NODE_CACHE_TARGET_AGE
+        );
+        assert_eq!(owners.temp_node_cache.target_size(), 16_384);
+        assert_eq!(
+            owners.temp_node_cache.target_age(),
+            TimeDuration::seconds(90)
+        );
     }
 
     #[test]

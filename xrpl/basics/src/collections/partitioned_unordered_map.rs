@@ -9,6 +9,23 @@ use std::borrow::Borrow;
 use std::collections::HashMap as StdHashMap;
 use std::hash::{BuildHasher, Hash};
 
+const MIN_CAPACITY_TO_SHRINK: usize = 1_024;
+const MIN_TARGET_CAPACITY: usize = 64;
+const HEADROOM_MULTIPLIER: usize = 2;
+const HYSTERESIS_MULTIPLIER: usize = 2;
+
+/// Returns the post-compaction target when a partition is sparse enough to
+/// justify rehashing. Saturating arithmetic keeps the policy safe even when
+/// called with theoretical capacities near `usize::MAX`.
+fn sparse_shrink_target(capacity: usize, len: usize) -> Option<usize> {
+    let target_capacity = len
+        .saturating_mul(HEADROOM_MULTIPLIER)
+        .max(MIN_TARGET_CAPACITY);
+    let shrink_threshold = target_capacity.saturating_mul(HYSTERESIS_MULTIPLIER);
+
+    (capacity >= MIN_CAPACITY_TO_SHRINK && capacity > shrink_threshold).then_some(target_capacity)
+}
+
 /// Extract the partition key the same way the reference helper does.
 ///
 /// The default reference template uses the key value directly for integer-like keys.
@@ -116,6 +133,38 @@ where
         self.len() == 0
     }
 
+    /// Returns the sum of the entry capacities reserved by all partitions.
+    ///
+    /// This is capacity in entries rather than an exact byte count, making it
+    /// suitable for cache telemetry across hash-map implementations.
+    pub fn total_capacity(&self) -> usize {
+        self.maps.iter().fold(0usize, |total, partition| {
+            total.saturating_add(partition.capacity())
+        })
+    }
+
+    /// Compact partitions whose retained capacity is far above their live set.
+    ///
+    /// A cache sweep can remove millions of entries while `HashMap::remove`
+    /// and `HashMap::retain` intentionally preserve the high-water allocation.
+    /// Keep about twice the live-entry capacity when compacting, but use both
+    /// a minimum allocation and a second 2x hysteresis threshold to avoid
+    /// rehashing normal or tiny maps repeatedly. This performs at most one
+    /// `HashMap::shrink_to` per partition per call. Returns the aggregate entry
+    /// capacity released.
+    pub fn shrink_if_sparse(&mut self) -> usize {
+        let capacity_before = self.total_capacity();
+        for partition in &mut self.maps {
+            if let Some(target_capacity) =
+                sparse_shrink_target(partition.capacity(), partition.len())
+            {
+                partition.shrink_to(target_capacity);
+            }
+        }
+
+        capacity_before.saturating_sub(self.total_capacity())
+    }
+
     pub fn clear(&mut self) {
         for partition in &mut self.maps {
             partition.clear();
@@ -204,7 +253,7 @@ fn normalize_partitions(partitions: Option<usize>) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::PartitionedUnorderedMap;
+    use super::{PartitionedUnorderedMap, sparse_shrink_target};
     use crate::hardened_hash::HardenedHashBuilder;
 
     #[test]
@@ -258,5 +307,68 @@ mod tests {
 
         assert_eq!(values, vec![10, 11, 12]);
         assert_eq!(map.len(), 3);
+    }
+
+    #[test]
+    fn sparse_shrink_policy_respects_hysteresis_without_overflow() {
+        assert_eq!(sparse_shrink_target(1_023, 0), None);
+        assert_eq!(sparse_shrink_target(1_024, 256), None);
+        assert_eq!(sparse_shrink_target(1_025, 256), Some(512));
+        assert_eq!(sparse_shrink_target(usize::MAX, 0), Some(64));
+        assert_eq!(
+            sparse_shrink_target(usize::MAX, usize::MAX / 2 + 1),
+            None,
+            "saturating threshold arithmetic must not wrap and spuriously shrink"
+        );
+    }
+
+    #[test]
+    fn shrink_if_sparse_releases_high_water_capacity_and_preserves_entries() {
+        const TOTAL_ENTRIES: u32 = 16_384;
+        const SURVIVING_ENTRIES: u32 = 128;
+
+        // Integer keys route by modulo, so this grows and subsequently compacts
+        // every partition rather than hiding a sparse-partition regression.
+        let mut map = PartitionedUnorderedMap::<u32, u32>::new(Some(4));
+        for key in 0..TOTAL_ENTRIES {
+            map.insert(key, key * 2);
+        }
+
+        for key in SURVIVING_ENTRIES..TOTAL_ENTRIES {
+            assert_eq!(map.remove(&key), Some(key * 2));
+        }
+        let capacity_before_compaction = map.total_capacity();
+
+        let released = map.shrink_if_sparse();
+        let capacity_after = map.total_capacity();
+
+        assert_eq!(map.len(), SURVIVING_ENTRIES as usize);
+        assert_eq!(released, capacity_before_compaction - capacity_after);
+        assert!(released > 0);
+        assert!(
+            capacity_after * 4 < capacity_before_compaction,
+            "capacity should fall substantially: {capacity_before_compaction} -> {capacity_after}"
+        );
+        for key in 0..SURVIVING_ENTRIES {
+            assert_eq!(map.get(&key), Some(&(key * 2)));
+        }
+    }
+
+    #[test]
+    fn shrink_if_sparse_does_not_churn_at_normal_occupancy() {
+        let mut map = PartitionedUnorderedMap::<u32, u32>::new(Some(4));
+        for key in 0..4_096 {
+            map.insert(key, key);
+        }
+
+        for key in 0..512 {
+            assert_eq!(map.remove(&key), Some(key));
+        }
+        let capacity_before_compaction = map.total_capacity();
+
+        assert_eq!(map.shrink_if_sparse(), 0);
+        assert_eq!(map.total_capacity(), capacity_before_compaction);
+        assert_eq!(map.len(), 3_584);
+        assert_eq!(map.get(&2_048), Some(&2_048));
     }
 }

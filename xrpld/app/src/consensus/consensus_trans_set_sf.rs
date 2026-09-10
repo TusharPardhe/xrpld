@@ -11,21 +11,18 @@
 
 use std::sync::{Arc, RwLock, Weak};
 
+use basics::blob::Blob;
 use basics::sha_map_hash::SHAMapHash;
-use basics::tagged_cache::MonotonicClock;
 use protocol::{STTx, SerialIter};
 use shamap::fetch::SHAMapSyncFilter;
-use shamap::tree_node::{SHAMapNodeType, SHAMapTreeNode};
-use shamap::tree_node_cache::TreeNodeCache;
+use shamap::tree_node::SHAMapNodeType;
 
+use crate::state::app_registry::AppTempNodeCache;
 use crate::tx_queue::transaction_master::TransactionMaster;
 use ledger::transaction_acquire::TransactionAcquireFilterFactory;
 
 /// The hash prefix for TransactionNm leaves: 'T','X','N',0 = 0x54584E00
 const HASH_PREFIX_TRANSACTION_ID: u32 = 0x54584E00;
-
-/// Blob is Vec<u8> in the shamap crate.
-type Blob = Vec<u8>;
 
 type SubmitFetchedTransaction = Arc<dyn Fn(Arc<STTx>) + Send + Sync + 'static>;
 
@@ -78,14 +75,14 @@ impl ConsensusFetchedTxSubmitAdapter {
 /// Stored in InboundTransactions and cloned for each new acquisition.
 pub struct ConsensusTransSetSFFactory {
     transaction_master: Arc<TransactionMaster>,
-    node_cache: Arc<TreeNodeCache<MonotonicClock>>,
+    node_cache: AppTempNodeCache,
     submit_adapter: Weak<ConsensusFetchedTxSubmitAdapter>,
 }
 
 impl ConsensusTransSetSFFactory {
     pub fn new(
         transaction_master: Arc<TransactionMaster>,
-        node_cache: Arc<TreeNodeCache<MonotonicClock>>,
+        node_cache: AppTempNodeCache,
         submit_adapter: Weak<ConsensusFetchedTxSubmitAdapter>,
     ) -> Self {
         Self {
@@ -109,7 +106,7 @@ impl TransactionAcquireFilterFactory for ConsensusTransSetSFFactory {
 /// The actual filter used during SHAMap sync for tx-set acquisition.
 struct ConsensusTransSetSF {
     transaction_master: Arc<TransactionMaster>,
-    node_cache: Arc<TreeNodeCache<MonotonicClock>>,
+    node_cache: AppTempNodeCache,
     submit_adapter: Weak<ConsensusFetchedTxSubmitAdapter>,
 }
 
@@ -123,18 +120,16 @@ impl SHAMapSyncFilter for ConsensusTransSetSF {
         node_type: SHAMapNodeType,
     ) {
         // `ConsensusTransSetSF::gotNode` ignores a node supplied by its own
-        // filter. Network nodes are canonicalized into the process-wide
-        // TempNodeCache before any transaction decoding, exactly as in
-        // rippled. This makes subsequent competing set acquisitions reuse the
-        // same node instead of requesting it again.
+        // filter. Cache the peer's original prefix-format bytes before any
+        // transaction decoding. This matches rippled's NodeCache and lets a
+        // competing acquisition reuse the exact network blob.
         if from_filter {
             return;
         }
 
-        if let Ok(mut node) = SHAMapTreeNode::make_from_prefix(&node_data, node_hash) {
-            self.node_cache
-                .canonicalize_replace_client(node_hash.as_uint256(), &mut node);
-        }
+        let _ = self
+            .node_cache
+            .insert(*node_hash.as_uint256(), node_data.clone());
 
         if node_type != SHAMapNodeType::TransactionNm || node_data.len() <= 16 {
             return;
@@ -166,8 +161,8 @@ impl SHAMapSyncFilter for ConsensusTransSetSF {
         // rippled checks TempNodeCache before TransactionMaster. This covers
         // inner nodes and non-transaction leaves learned while acquiring a
         // competing set, not only locally submitted transaction leaves.
-        if let Some(node) = self.node_cache.fetch(node_hash.as_uint256()) {
-            return node.serialize_with_prefix().ok();
+        if let Some(node_data) = self.node_cache.retrieve(node_hash.as_uint256()) {
+            return Some(node_data);
         }
 
         // The node_hash for TransactionNm leaves equals the transaction ID.
@@ -190,8 +185,8 @@ impl SHAMapSyncFilter for ConsensusTransSetSF {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use basics::hardened_hash::HardenedHashBuilder;
     use protocol::{STAmount, TxType, get_field_by_symbol, serialize_blob};
+    use shamap::tree_node::SHAMapTreeNode;
     use time::Duration;
 
     use crate::tx_queue::transaction::Transaction;
@@ -217,11 +212,11 @@ mod tests {
         let submit_adapter = Arc::new(ConsensusFetchedTxSubmitAdapter::default());
         let factory = ConsensusTransSetSFFactory::new(
             Arc::new(TransactionMaster::new()),
-            Arc::new(TreeNodeCache::<MonotonicClock, HardenedHashBuilder>::new(
+            Arc::new(basics::tagged_cache::TaggedCache::new(
                 "consensus-trans-set-filter",
                 32,
                 Duration::minutes(1),
-                MonotonicClock::default(),
+                basics::tagged_cache::MonotonicClock::default(),
             )),
             Arc::downgrade(&submit_adapter),
         );
@@ -282,8 +277,11 @@ mod tests {
                 .fetch_from_cache(&tx_id)
                 .is_none()
         );
-        assert_eq!(filter.get_node(SHAMapHash::new(tx_id)), Some(prefixed));
-        assert!(factory.node_cache.fetch(&tx_id).is_some());
+        assert_eq!(
+            filter.get_node(SHAMapHash::new(tx_id)),
+            Some(prefixed.clone())
+        );
+        assert_eq!(factory.node_cache.retrieve(&tx_id), Some(prefixed));
         assert_eq!(
             *submitted.lock().expect("submitted transaction lock"),
             vec![tx_id]
@@ -328,22 +326,29 @@ mod tests {
     }
 
     #[test]
-    fn temp_node_cache_satisfies_non_transaction_nodes_before_master_lookup() {
+    fn temp_node_cache_returns_exact_non_transaction_bytes_and_preserves_first_duplicate() {
         let (factory, _) = factory();
-        let inner = shamap::tree_node::SHAMapTreeNode::new_inner(1);
-        inner.set_child_hash(
-            0,
-            SHAMapHash::new(basics::base_uint::Uint256::from_array([0xAB; 32])),
-        );
-        inner.update_hash();
-        let hash = inner.get_hash();
-        let prefixed = inner
-            .serialize_with_prefix()
-            .expect("non-empty inner serializes");
+        let hash = basics::base_uint::Uint256::from_array([0xAB; 32]);
+        let original = vec![0xF0, 0x0D, 0xCA, 0xFE, 0x01];
+        let duplicate = vec![0xDE, 0xAD, 0xBE, 0xEF];
         let mut filter = factory.build_filter();
 
-        filter.got_node(false, hash, 1, prefixed.clone(), SHAMapNodeType::Inner);
+        filter.got_node(
+            false,
+            SHAMapHash::new(hash),
+            1,
+            original.clone(),
+            SHAMapNodeType::Inner,
+        );
+        filter.got_node(
+            false,
+            SHAMapHash::new(hash),
+            1,
+            duplicate,
+            SHAMapNodeType::Inner,
+        );
 
-        assert_eq!(filter.get_node(hash), Some(prefixed));
+        assert_eq!(factory.node_cache.retrieve(&hash), Some(original.clone()));
+        assert_eq!(filter.get_node(SHAMapHash::new(hash)), Some(original));
     }
 }

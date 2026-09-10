@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// supplied one.
 const DEFAULT_TARGET_NODES: u64 = 1_000_000;
 const NODE_OBJECT_CACHE_EVICTION_POLICY: &str = "lru";
+const NODE_OBJECT_CACHE_DISABLED_POLICY: &str = "disabled";
 const DEFAULT_EXPECTED_NODE_BYTES: u64 = 512;
 const DEFAULT_MAX_ENTRY_BYTES: usize = 1_048_576;
 /// Moka policy and concurrent map bookkeeping not represented by the key or
@@ -50,15 +51,31 @@ enum CacheLoadError {
     Oversized(Arc<NodeObject>),
 }
 
+/// Selects whether a runtime owns the bounded Moka NodeObject cache. Disabled
+/// is a true no-cache mode, not a zero-capacity Moka cache.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NodeObjectCacheMode {
+    Enabled,
+    Disabled,
+}
+
+enum CacheStorage {
+    Enabled(Cache<Uint256, Arc<NodeObject>>),
+    Disabled,
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ENTRY_FIXED_BYTES, NodeObjectCache, node_object_cache_entry_weight};
+    use super::{
+        ENTRY_FIXED_BYTES, NodeObjectCache, NodeObjectCacheMode, node_object_cache_entry_weight,
+    };
     use crate::{NodeObject, NodeObjectType};
     use basics::base_uint::Uint256;
     use basics::basic_config::Section;
     use protocol::JsonValue;
     use std::collections::BTreeMap;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn node_object_cache_reports_lru_eviction_policy() {
@@ -128,11 +145,11 @@ mod tests {
         let expected_weight = u64::from(node_object_cache_entry_weight(&hash, &object));
 
         cache.promote(Arc::clone(&object));
-        cache.cache.run_pending_tasks();
+        cache.run_pending_tasks();
 
-        assert_eq!(cache.cache.weighted_size(), expected_weight);
+        assert_eq!(cache.weighted_size(), expected_weight);
         assert!(expected_weight > object.data().len() as u64);
-        assert!(cache.cache.weighted_size() <= cache.capacity_bytes);
+        assert!(cache.weighted_size() <= cache.capacity_bytes);
     }
 
     #[test]
@@ -152,18 +169,97 @@ mod tests {
             .expect("fresh generation must load the object");
         assert_eq!(second.hash(), object.hash());
     }
+
+    #[test]
+    fn disabled_mode_preserves_invalid_and_dummy_fetch_semantics() {
+        let cache = NodeObjectCache::new(NodeObjectCacheMode::Disabled, &Section::new("node_db"))
+            .expect("disabled cache");
+        let hash = Uint256::from_array([0xD3; 32]);
+        let invalid = Arc::new(NodeObject::new(
+            NodeObjectType::AccountNode,
+            vec![1],
+            Uint256::from_array([0xD4; 32]),
+        ));
+        let dummy = Arc::new(NodeObject::new(NodeObjectType::Dummy, vec![], hash));
+
+        assert_eq!(
+            cache
+                .get_or_load(hash, || Some(Arc::clone(&invalid)))
+                .expect("invalid object is returned to preserve cache behavior")
+                .hash(),
+            invalid.hash()
+        );
+        assert!(
+            cache
+                .get_or_load(hash, || Some(Arc::clone(&dummy)))
+                .is_none(),
+            "dummy objects must not be exposed as cache hits"
+        );
+    }
+
+    #[test]
+    fn disabled_mode_never_retains_promotions_and_invokes_each_loader() {
+        let cache = NodeObjectCache::new(NodeObjectCacheMode::Disabled, &Section::new("node_db"))
+            .expect("disabled cache");
+        let hash = Uint256::from_array([0xD2; 32]);
+        let object = Arc::new(NodeObject::new(NodeObjectType::AccountNode, vec![1], hash));
+        let loads = AtomicUsize::new(0);
+
+        cache.promote(Arc::clone(&object));
+        for _ in 0..2 {
+            assert_eq!(
+                cache
+                    .get_or_load(hash, || {
+                        loads.fetch_add(1, Ordering::Relaxed);
+                        Some(Arc::clone(&object))
+                    })
+                    .expect("loader object")
+                    .hash(),
+                &hash
+            );
+        }
+
+        let mut counts = BTreeMap::new();
+        cache.add_counts_json(&mut counts);
+        assert_eq!(loads.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            counts.get("node_object_cache_eviction_policy"),
+            Some(&JsonValue::String("disabled".to_owned()))
+        );
+        for key in [
+            "node_object_cache_capacity_entries",
+            "node_object_cache_capacity_bytes",
+            "node_object_cache_weighted_capacity_bytes",
+            "node_object_cache_weighted_size_bytes",
+            "node_object_cache_entries",
+            "node_object_cache_hits",
+            "node_object_cache_promotions",
+        ] {
+            assert_eq!(
+                counts.get(key),
+                Some(&JsonValue::String("0".to_owned())),
+                "{key}"
+            );
+        }
+        assert_eq!(
+            counts.get("node_object_cache_misses"),
+            Some(&JsonValue::String("2".to_owned()))
+        );
+        assert_eq!(
+            counts.get("node_object_cache_durable_loads"),
+            Some(&JsonValue::String("2".to_owned()))
+        );
+    }
 }
 
 /// A bounded, concurrent cache of immutable encoded NodeObjects.
 ///
-/// `max_capacity` limits weighted admission and drives eviction. As with Moka
-/// generally, maintenance is concurrent and best-effort rather than a strict
-/// instantaneous allocator/RSS ceiling.
-///
-/// The cache is deliberately separate from SHAMap's decoded TreeNodeCache:
-/// it retains only durable-store shaped bytes and never owns decoded trees.
+/// The enabled variant owns Moka and applies weighted LRU admission. The
+/// disabled variant deliberately owns no Moka allocation or retained object.
+/// Both variants retain counters and a generation fence so database rotation
+/// has one uniform synchronization contract.
 pub(crate) struct NodeObjectCache {
-    cache: Cache<Uint256, Arc<NodeObject>>,
+    storage: CacheStorage,
     max_entry_bytes: usize,
     capacity_entries: u64,
     idle_seconds: u64,
@@ -185,6 +281,13 @@ pub(crate) struct NodeObjectCache {
 }
 
 impl NodeObjectCache {
+    pub(crate) fn new(mode: NodeObjectCacheMode, config: &Section) -> Result<Self, String> {
+        match mode {
+            NodeObjectCacheMode::Enabled => Self::from_config(config),
+            NodeObjectCacheMode::Disabled => Ok(Self::disabled()),
+        }
+    }
+
     pub(crate) fn from_config(config: &Section) -> Result<Self, String> {
         let cache_size = config
             .get::<i64>("cache_size")
@@ -274,10 +377,8 @@ impl NodeObjectCache {
             builder = builder.time_to_live(std::time::Duration::from_secs(ttl_seconds));
         }
 
-        let cache = builder.build();
-
         Ok(Self {
-            cache,
+            storage: CacheStorage::Enabled(builder.build()),
             max_entry_bytes,
             capacity_entries: entry_capacity,
             idle_seconds,
@@ -294,53 +395,91 @@ impl NodeObjectCache {
         })
     }
 
+    fn disabled() -> Self {
+        Self {
+            storage: CacheStorage::Disabled,
+            max_entry_bytes: 0,
+            capacity_entries: 0,
+            idle_seconds: 0,
+            ttl_seconds: 0,
+            capacity_bytes: 0,
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            durable_loads: AtomicU64::new(0),
+            promotions: AtomicU64::new(0),
+            rejected: AtomicU64::new(0),
+            oversized: AtomicU64::new(0),
+            invalidations: AtomicU64::new(0),
+            generation: AtomicU64::new(0),
+        }
+    }
+
     /// Returns a validated cached value or performs one Moka-coalesced durable
     /// load. `None` is represented as an error and is therefore never cached.
+    /// Disabled mode performs the durable load on every call and does not
+    /// retain either the result or a negative entry.
     pub(crate) fn get_or_load<F>(&self, hash: Uint256, load: F) -> Option<Arc<NodeObject>>
     where
         F: FnOnce() -> Option<Arc<NodeObject>>,
     {
         let generation = self.generation();
-        if let Some(object) = self.cache.get(&hash) {
-            if object.hash() == &hash {
-                self.hits.fetch_add(1, Ordering::Relaxed);
-                return (object.object_type() != NodeObjectType::Dummy).then_some(object);
-            }
-            self.rejected.fetch_add(1, Ordering::Relaxed);
-            self.cache.invalidate(&hash);
-        }
-
-        self.misses.fetch_add(1, Ordering::Relaxed);
-        let result = self.cache.try_get_with(hash, || {
-            self.durable_loads.fetch_add(1, Ordering::Relaxed);
-            let object = load().ok_or(CacheLoadError::NotFound)?;
-            if object.hash() != &hash {
-                return Err(CacheLoadError::Invalid(object));
-            }
-            if object.data().len() > self.max_entry_bytes {
-                return Err(CacheLoadError::Oversized(object));
-            }
-            if self.generation() != generation {
-                return Err(CacheLoadError::Stale);
-            }
-            self.promotions.fetch_add(1, Ordering::Relaxed);
-            Ok(object)
-        });
-
-        match result {
-            Ok(object) => (object.object_type() != NodeObjectType::Dummy).then_some(object),
-            Err(error) => match error.as_ref() {
-                CacheLoadError::NotFound => None,
-                CacheLoadError::Stale => None,
-                CacheLoadError::Invalid(object) => {
+        match &self.storage {
+            CacheStorage::Enabled(cache) => {
+                if let Some(object) = cache.get(&hash) {
+                    if object.hash() == &hash {
+                        self.hits.fetch_add(1, Ordering::Relaxed);
+                        return (object.object_type() != NodeObjectType::Dummy).then_some(object);
+                    }
                     self.rejected.fetch_add(1, Ordering::Relaxed);
-                    Some(Arc::clone(object))
+                    cache.invalidate(&hash);
                 }
-                CacheLoadError::Oversized(object) => {
-                    self.oversized.fetch_add(1, Ordering::Relaxed);
-                    Some(Arc::clone(object))
+
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                let result = cache.try_get_with(hash, || {
+                    self.durable_loads.fetch_add(1, Ordering::Relaxed);
+                    let object = load().ok_or(CacheLoadError::NotFound)?;
+                    if object.hash() != &hash {
+                        return Err(CacheLoadError::Invalid(object));
+                    }
+                    if object.data().len() > self.max_entry_bytes {
+                        return Err(CacheLoadError::Oversized(object));
+                    }
+                    if self.generation() != generation {
+                        return Err(CacheLoadError::Stale);
+                    }
+                    self.promotions.fetch_add(1, Ordering::Relaxed);
+                    Ok(object)
+                });
+
+                match result {
+                    Ok(object) => (object.object_type() != NodeObjectType::Dummy).then_some(object),
+                    Err(error) => match error.as_ref() {
+                        CacheLoadError::NotFound => None,
+                        CacheLoadError::Stale => None,
+                        CacheLoadError::Invalid(object) => {
+                            self.rejected.fetch_add(1, Ordering::Relaxed);
+                            Some(Arc::clone(object))
+                        }
+                        CacheLoadError::Oversized(object) => {
+                            self.oversized.fetch_add(1, Ordering::Relaxed);
+                            Some(Arc::clone(object))
+                        }
+                    },
                 }
-            },
+            }
+            CacheStorage::Disabled => {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                self.durable_loads.fetch_add(1, Ordering::Relaxed);
+                let object = load()?;
+                if object.hash() != &hash {
+                    self.rejected.fetch_add(1, Ordering::Relaxed);
+                    return Some(object);
+                }
+                if object.object_type() == NodeObjectType::Dummy {
+                    return None;
+                }
+                Some(object)
+            }
         }
     }
 
@@ -356,11 +495,14 @@ impl NodeObjectCache {
     /// Promote only a valid, reasonably sized positive object. Store callers
     /// invoke this after their backend write returns normally.
     pub(crate) fn promote(&self, object: Arc<NodeObject>) {
+        let CacheStorage::Enabled(cache) = &self.storage else {
+            return;
+        };
         if object.data().len() > self.max_entry_bytes {
             self.oversized.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        self.cache.insert(*object.hash(), object);
+        cache.insert(*object.hash(), object);
         self.promotions.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -370,54 +512,106 @@ impl NodeObjectCache {
 
     pub(crate) fn invalidate_all(&self) {
         self.generation.fetch_add(1, Ordering::AcqRel);
-        self.cache.invalidate_all();
+        if let CacheStorage::Enabled(cache) = &self.storage {
+            cache.invalidate_all();
+        }
         self.invalidations.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn is_disabled(&self) -> bool {
+        matches!(&self.storage, CacheStorage::Disabled)
+    }
+
+    #[cfg(test)]
+    fn run_pending_tasks(&self) {
+        if let CacheStorage::Enabled(cache) = &self.storage {
+            cache.run_pending_tasks();
+        }
+    }
+
+    #[cfg(test)]
+    fn weighted_size(&self) -> u64 {
+        match &self.storage {
+            CacheStorage::Enabled(cache) => cache.weighted_size(),
+            CacheStorage::Disabled => 0,
+        }
+    }
+
     pub(crate) fn add_counts_json(&self, obj: &mut BTreeMap<String, JsonValue>) {
-        obj.insert(
-            "node_object_cache_eviction_policy".to_owned(),
-            JsonValue::String(NODE_OBJECT_CACHE_EVICTION_POLICY.to_owned()),
-        );
-        obj.insert(
-            "node_object_cache_capacity_entries".to_owned(),
-            JsonValue::String(self.capacity_entries.to_string()),
-        );
-        obj.insert(
-            "node_object_cache_idle_seconds".to_owned(),
-            JsonValue::String(self.idle_seconds.to_string()),
-        );
-        obj.insert(
-            "node_object_cache_ttl_seconds".to_owned(),
-            JsonValue::String(self.ttl_seconds.to_string()),
-        );
-        // Preserve established counters while exposing Moka's actual weighted
-        // accounting. These measurements are approximate during concurrent
-        // maintenance, as documented by Moka.
-        obj.insert(
-            "node_object_cache_capacity_bytes".to_owned(),
-            JsonValue::String(self.capacity_bytes.to_string()),
-        );
-        obj.insert(
-            "node_object_cache_capacity_bytes_is_estimate".to_owned(),
-            JsonValue::Bool(true),
-        );
-        obj.insert(
-            "node_object_cache_weighted_capacity_bytes".to_owned(),
-            JsonValue::String(self.capacity_bytes.to_string()),
-        );
-        obj.insert(
-            "node_object_cache_weighted_size_bytes".to_owned(),
-            JsonValue::String(self.cache.weighted_size().to_string()),
-        );
-        obj.insert(
-            "node_object_cache_entries".to_owned(),
-            JsonValue::String(self.cache.entry_count().to_string()),
-        );
-        obj.insert(
-            "node_object_cache_hits".to_owned(),
-            JsonValue::String(self.hits.load(Ordering::Relaxed).to_string()),
-        );
+        if self.is_disabled() {
+            obj.insert(
+                "node_object_cache_eviction_policy".to_owned(),
+                JsonValue::String(NODE_OBJECT_CACHE_DISABLED_POLICY.to_owned()),
+            );
+            for key in [
+                "node_object_cache_capacity_entries",
+                "node_object_cache_idle_seconds",
+                "node_object_cache_ttl_seconds",
+                "node_object_cache_capacity_bytes",
+                "node_object_cache_weighted_capacity_bytes",
+                "node_object_cache_weighted_size_bytes",
+                "node_object_cache_entries",
+                "node_object_cache_hits",
+                "node_object_cache_promotions",
+            ] {
+                obj.insert(key.to_owned(), JsonValue::String("0".to_owned()));
+            }
+            obj.insert(
+                "node_object_cache_capacity_bytes_is_estimate".to_owned(),
+                JsonValue::Bool(false),
+            );
+        } else {
+            let CacheStorage::Enabled(cache) = &self.storage else {
+                unreachable!("disabled cache returned from enabled branch");
+            };
+            obj.insert(
+                "node_object_cache_eviction_policy".to_owned(),
+                JsonValue::String(NODE_OBJECT_CACHE_EVICTION_POLICY.to_owned()),
+            );
+            obj.insert(
+                "node_object_cache_capacity_entries".to_owned(),
+                JsonValue::String(self.capacity_entries.to_string()),
+            );
+            obj.insert(
+                "node_object_cache_idle_seconds".to_owned(),
+                JsonValue::String(self.idle_seconds.to_string()),
+            );
+            obj.insert(
+                "node_object_cache_ttl_seconds".to_owned(),
+                JsonValue::String(self.ttl_seconds.to_string()),
+            );
+            // Preserve established counters while exposing Moka's actual weighted
+            // accounting. These measurements are approximate during concurrent
+            // maintenance, as documented by Moka.
+            obj.insert(
+                "node_object_cache_capacity_bytes".to_owned(),
+                JsonValue::String(self.capacity_bytes.to_string()),
+            );
+            obj.insert(
+                "node_object_cache_capacity_bytes_is_estimate".to_owned(),
+                JsonValue::Bool(true),
+            );
+            obj.insert(
+                "node_object_cache_weighted_capacity_bytes".to_owned(),
+                JsonValue::String(self.capacity_bytes.to_string()),
+            );
+            obj.insert(
+                "node_object_cache_weighted_size_bytes".to_owned(),
+                JsonValue::String(cache.weighted_size().to_string()),
+            );
+            obj.insert(
+                "node_object_cache_entries".to_owned(),
+                JsonValue::String(cache.entry_count().to_string()),
+            );
+            obj.insert(
+                "node_object_cache_hits".to_owned(),
+                JsonValue::String(self.hits.load(Ordering::Relaxed).to_string()),
+            );
+            obj.insert(
+                "node_object_cache_promotions".to_owned(),
+                JsonValue::String(self.promotions.load(Ordering::Relaxed).to_string()),
+            );
+        }
         obj.insert(
             "node_object_cache_misses".to_owned(),
             JsonValue::String(self.misses.load(Ordering::Relaxed).to_string()),
@@ -425,10 +619,6 @@ impl NodeObjectCache {
         obj.insert(
             "node_object_cache_durable_loads".to_owned(),
             JsonValue::String(self.durable_loads.load(Ordering::Relaxed).to_string()),
-        );
-        obj.insert(
-            "node_object_cache_promotions".to_owned(),
-            JsonValue::String(self.promotions.load(Ordering::Relaxed).to_string()),
         );
         obj.insert(
             "node_object_cache_rejected".to_owned(),

@@ -2147,6 +2147,13 @@ impl<V: AppServerInfoView> crate::handlers::get_counts::GetCountsSource
             .map(|cache| cache.get_cache_size() as u64)
             .unwrap_or(0)
     }
+    fn treenode_cache_capacity_entries(&self) -> u64 {
+        self.view
+            .app()
+            .and_then(|app| app.shared_tree_cache())
+            .map(|cache| cache.total_capacity() as u64)
+            .unwrap_or(0)
+    }
     fn treenode_track_size(&self) -> u64 {
         self.view
             .app()

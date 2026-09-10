@@ -127,7 +127,26 @@ fn rotating_database_counts_json_reports_the_same_public_fields() {
     assert_eq!(counts.len(), 26);
     assert_eq!(
         counts.get("node_object_cache_eviction_policy"),
-        Some(&JsonValue::String("lru".to_owned()))
+        Some(&JsonValue::String("disabled".to_owned()))
+    );
+    for key in [
+        "node_object_cache_capacity_entries",
+        "node_object_cache_capacity_bytes",
+        "node_object_cache_weighted_capacity_bytes",
+        "node_object_cache_weighted_size_bytes",
+        "node_object_cache_entries",
+        "node_object_cache_hits",
+        "node_object_cache_promotions",
+    ] {
+        assert_eq!(
+            counts.get(key),
+            Some(&JsonValue::String("0".to_owned())),
+            "{key}"
+        );
+    }
+    assert_eq!(
+        counts.get("node_object_cache_capacity_bytes_is_estimate"),
+        Some(&JsonValue::Bool(false))
     );
     assert!(matches!(
         counts.get("read_request_bundle"),

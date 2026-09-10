@@ -133,6 +133,10 @@ Configures persistent ledger object storage.
 When nonzero, `online_delete` must be at least the selected numeric
 `ledger_history`. Online-delete rotation freshens cache generations and clears
 prior-ledger and FullBelow state; it is separate from normal age/size sweeps.
+Rotating NodeStores intentionally bypass the encoded `NodeObject` cache, matching
+`rippled`: reads go directly to the writable and archive backends so cached
+archive objects cannot hide copy-forward work during rotation. Cache-size and
+cache-age settings apply only to non-rotating NodeStores.
 
 ### `[database_path]`
 
