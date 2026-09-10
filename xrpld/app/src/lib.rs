@@ -19,10 +19,12 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-// Bound fragmentation from transient, cross-thread SHAMap acquisition graphs
-// while retaining parallel allocation and immediate release of unused pages.
+// Keep transient, cross-thread SHAMap acquisition graphs in one normal arena
+// so released size classes can immediately reuse the same page runs. Testnet
+// full-state measurement showed four arenas stranded active pages above the
+// xrpld RSS baseline; jemalloc still creates a separate oversize arena.
 #[cfg(not(target_env = "msvc"))]
-const JEMALLOC_CONF: &std::ffi::CStr = c"narenas:4,dirty_decay_ms:0,muzzy_decay_ms:0";
+const JEMALLOC_CONF: &std::ffi::CStr = c"narenas:1,dirty_decay_ms:0,muzzy_decay_ms:0";
 
 #[cfg(not(target_env = "msvc"))]
 #[used]
@@ -37,7 +39,7 @@ mod allocator_configuration_tests {
     fn jemalloc_configuration_bounds_arenas_and_zeroes_decay() {
         assert_eq!(
             super::JEMALLOC_CONF.to_bytes(),
-            b"narenas:4,dirty_decay_ms:0,muzzy_decay_ms:0"
+            b"narenas:1,dirty_decay_ms:0,muzzy_decay_ms:0"
         );
     }
 }
