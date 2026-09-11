@@ -92,7 +92,6 @@ pub(crate) fn decode_wire_ledger_node(
 mod tests {
     use super::decode_wire_ledger_node;
     use basics::base_uint::Uint256;
-    use basics::memory::intrusive_pointer::make_shared_intrusive;
     use ledger::InboundLedgerDataType;
     use overlay::message::wire::{TmLedgerNode, tm_ledger_node};
     use shamap::node_id::SHAMapNodeId;
@@ -106,17 +105,17 @@ mod tests {
     }
 
     fn leaf_wire(key: Uint256) -> Vec<u8> {
-        make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        SHAMapTreeNode::new_leaf(
             SHAMapNodeType::TransactionNm,
             SHAMapItem::new(key, vec![0x10; 12]),
             0,
-        ))
+        )
         .serialize_for_wire()
         .expect("leaf serializes")
     }
 
     fn base_root_wire() -> Vec<u8> {
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(
             3,
             basics::sha_map_hash::SHAMapHash::new(Uint256::from(0x73)),

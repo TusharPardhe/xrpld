@@ -19,8 +19,7 @@ use basics::blob::Blob;
 use basics::hardened_hash::HardenedHashBuilder;
 use basics::intrusive_pointer::SharedIntrusive;
 use basics::sha_map_hash::SHAMapHash;
-use basics::shared_weak_cache_pointer::SharedWeakCachePointer;
-use basics::tagged_cache::{CacheClock, TaggedCache};
+use basics::tagged_cache::{CacheClock, KeyCache};
 use parking_lot::Mutex;
 use std::hash::BuildHasher;
 use std::sync::Arc;
@@ -87,7 +86,7 @@ where
     S: BuildHasher + Clone,
 {
     generation: std::sync::atomic::AtomicU32,
-    cache: TaggedCache<Uint256, (), C, S, SharedWeakCachePointer<()>, Arc<()>>,
+    cache: KeyCache<Uint256, C, S>,
 }
 
 impl<C, S> std::fmt::Debug for FullBelowCacheImpl<C, S>
@@ -114,7 +113,7 @@ where
 {
     /// Returns the current number of entries held in the full-below cache.
     pub fn size(&self) -> usize {
-        self.cache.get_cache_size()
+        self.cache.size()
     }
 
     pub fn new(generation: u32, clock: C, hasher: S, target_size: usize) -> Self {
@@ -136,13 +135,7 @@ where
     ) -> Self {
         Self {
             generation: std::sync::atomic::AtomicU32::new(generation),
-            cache: TaggedCache::with_hasher(
-                "FullBelowCache",
-                target_size,
-                expiration,
-                clock,
-                hasher,
-            ),
+            cache: KeyCache::with_hasher("FullBelowCache", target_size, expiration, clock, hasher),
         }
     }
 }
@@ -157,12 +150,11 @@ where
     }
 
     fn touch_if_exists(&self, hash: Uint256) -> bool {
-        self.cache.fetch(&hash).is_some()
+        self.cache.touch_if_exists(&hash)
     }
 
     fn insert(&self, hash: Uint256) {
-        let mut value = Arc::new(());
-        self.cache.canonicalize_replace_client(&hash, &mut value);
+        self.cache.insert(hash);
     }
 
     fn sweep(&self) {
@@ -176,7 +168,7 @@ where
     }
 
     fn reset(&self) {
-        self.cache.reset();
+        self.cache.clear();
         self.generation
             .store(1, std::sync::atomic::Ordering::Relaxed);
     }
@@ -193,11 +185,27 @@ where
         self.generation.load(std::sync::atomic::Ordering::Relaxed)
     }
     fn touch_if_exists(&self, hash: Uint256) -> bool {
-        self.cache.fetch(&hash).is_some()
+        self.cache.touch_if_exists(&hash)
     }
+
     fn insert(&self, hash: Uint256) {
-        let mut value = Arc::new(());
-        self.cache.canonicalize_replace_client(&hash, &mut value);
+        self.cache.insert(hash);
+    }
+
+    fn sweep(&self) {
+        self.cache.sweep();
+    }
+
+    fn clear(&self) {
+        self.cache.clear();
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn reset(&self) {
+        self.cache.clear();
+        self.generation
+            .store(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -812,7 +820,7 @@ mod tests {
     use crate::tree_node_cache::TreeNodeCache;
     use basics::base_uint::Uint256;
     use basics::blob::Blob;
-    use basics::intrusive_pointer::{SharedIntrusive, make_shared_intrusive};
+    use basics::intrusive_pointer::SharedIntrusive;
     use basics::sha_map_hash::SHAMapHash;
     use basics::tagged_cache::ManualClock;
     use parking_lot::Mutex;
@@ -985,11 +993,11 @@ mod tests {
     }
 
     fn sample_leaf(fill: u8) -> SharedIntrusive<SHAMapTreeNode> {
-        make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(Uint256::from_array([fill; 32]), vec![fill; 12]),
             0,
-        ))
+        )
     }
 
     #[test]
@@ -1033,29 +1041,73 @@ mod tests {
     }
 
     #[test]
-    fn full_below_cache_clear_bumps_generation() {
-        let cache =
-            FullBelowCacheImpl::new(7, ManualClock::new(0), HardenedHashBuilder::default(), 8);
+    fn full_below_cache_duplicate_insert_touches_and_sweeps_expired_keys() {
+        let clock = Arc::new(ManualClock::new(0));
+        let cache = FullBelowCacheImpl::new_with_expiration(
+            7,
+            clock.clone(),
+            HardenedHashBuilder::default(),
+            8,
+            Duration::seconds(2),
+        );
         let hash = Uint256::from_array([0x33; 32]);
 
+        assert!(!cache.touch_if_exists(hash));
         cache.insert(hash);
-        assert_eq!(cache.generation(), 7);
+        cache.insert(hash);
+        assert_eq!(cache.size(), 1);
         assert!(cache.touch_if_exists(hash));
 
-        cache.clear();
+        clock.advance_seconds(1);
+        cache.insert(hash);
+        clock.advance_seconds(1);
+        cache.sweep();
+        assert_eq!(cache.size(), 1);
 
-        assert_eq!(cache.generation(), 8);
-        assert!(!cache.touch_if_exists(hash));
-
-        cache.reset();
-
-        assert_eq!(cache.generation(), 1);
+        clock.advance_seconds(2);
+        cache.sweep();
+        assert_eq!(cache.size(), 0);
         assert!(!cache.touch_if_exists(hash));
     }
 
     #[test]
+    fn full_below_cache_reference_clear_bumps_generation_and_reset_restores_one() {
+        let clock = Arc::new(ManualClock::new(0));
+        let cache = FullBelowCacheImpl::new_with_expiration(
+            7,
+            clock.clone(),
+            HardenedHashBuilder::default(),
+            8,
+            Duration::seconds(1),
+        );
+        let cache_ref = &cache;
+        let hash = Uint256::from_array([0x34; 32]);
+
+        FullBelowCache::insert(&cache_ref, hash);
+        assert_eq!(cache.size(), 1);
+        assert!(FullBelowCache::touch_if_exists(&cache_ref, hash));
+        assert_eq!(FullBelowCache::generation(&cache_ref), 7);
+
+        clock.advance_seconds(2);
+        FullBelowCache::sweep(&cache_ref);
+        assert_eq!(cache.size(), 0);
+
+        FullBelowCache::insert(&cache_ref, hash);
+        FullBelowCache::clear(&cache_ref);
+        assert_eq!(cache.size(), 0);
+        assert_eq!(FullBelowCache::generation(&cache_ref), 8);
+        assert!(!FullBelowCache::touch_if_exists(&cache_ref, hash));
+
+        FullBelowCache::insert(&cache_ref, hash);
+        FullBelowCache::reset(&cache_ref);
+        assert_eq!(cache.size(), 0);
+        assert_eq!(FullBelowCache::generation(&cache_ref), 1);
+        assert!(!FullBelowCache::touch_if_exists(&cache_ref, hash));
+    }
+
+    #[test]
     fn sync_tree_get_missing_nodes_with_family_uses_shared_full_below_cache_and_fetcher() {
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(0));
+        let root = SHAMapTreeNode::new_inner(0);
         let leaf = sample_leaf(0x22);
         root.set_child_hash(3, leaf.get_hash());
         root.update_hash_deep();
@@ -1091,11 +1143,11 @@ mod tests {
     #[test]
     fn sync_tree_get_missing_nodes_with_family_reuses_deferred_restart_shape_for_nested_fetches() {
         let missing_leaf_hash = SHAMapHash::new(Uint256::from_array([0x39; 32]));
-        let fetched_inner = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let fetched_inner = SHAMapTreeNode::new_inner(1);
         fetched_inner.set_child_hash(7, missing_leaf_hash);
         fetched_inner.update_hash_deep();
 
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(0));
+        let root = SHAMapTreeNode::new_inner(0);
         root.set_child_hash(4, fetched_inner.get_hash());
         root.update_hash();
 
@@ -1158,14 +1210,14 @@ mod tests {
         let mut cached = canonical.clone();
         assert!(!cache.canonicalize_replace_client(canonical.get_hash().as_uint256(), &mut cached));
 
-        let duplicate = make_shared_intrusive(SHAMapTreeNode::new_leaf_with_hash(
+        let duplicate = SHAMapTreeNode::new_leaf_with_hash(
             SHAMapNodeType::AccountState,
             canonical
                 .peek_item()
                 .expect("canonical leaf should carry an item"),
             1,
             canonical.get_hash(),
-        ));
+        );
         let mut tree = StorageTree::new_with_family(1, true, 91, &family);
         tree.root().set_child(1, Some(duplicate));
         tree.root().update_hash_deep();
@@ -1630,14 +1682,14 @@ mod tests {
         let mut cached = canonical.clone();
         assert!(!cache.canonicalize_replace_client(canonical.get_hash().as_uint256(), &mut cached));
 
-        let duplicate = make_shared_intrusive(SHAMapTreeNode::new_leaf_with_hash(
+        let duplicate = SHAMapTreeNode::new_leaf_with_hash(
             SHAMapNodeType::AccountState,
             canonical
                 .peek_item()
                 .expect("canonical leaf should carry an item"),
             0,
             canonical.get_hash(),
-        ));
+        );
         let expected_bytes = canonical
             .serialize_with_prefix()
             .expect("leaf should serialize with a prefix");

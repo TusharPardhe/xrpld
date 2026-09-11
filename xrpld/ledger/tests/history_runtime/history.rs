@@ -24,7 +24,7 @@ fn sample_hash(fill: u8) -> SHAMapHash {
 }
 
 fn state_leaf(fill: u8) -> SharedIntrusive<SHAMapTreeNode> {
-    make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         SHAMapItem::new(
             Uint256::from_array([fill; 32]),
@@ -33,7 +33,7 @@ fn state_leaf(fill: u8) -> SharedIntrusive<SHAMapTreeNode> {
             ],
         ),
         0,
-    ))
+    )
 }
 
 #[derive(Debug, Default)]

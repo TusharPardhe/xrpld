@@ -62,6 +62,16 @@ fn accepts_step_quality(first: &mut Option<Quality>, candidate: Quality) -> bool
     }
 }
 
+/// A ledger offer retains the immutable quality assigned when it entered the
+/// book. Its amounts may later be partially consumed and no longer reproduce
+/// that quality exactly, so all TOffer limiting must use the BookDirectory
+/// suffix rather than recomputing a ratio from the current amounts.
+fn offer_directory_quality(offer: &STLedgerEntry) -> Quality {
+    Quality::from_value(protocol::quality_from_key(
+        offer.get_field_h256(sf("sfBookDirectory")),
+    ))
+}
+
 fn amm_target_quality(
     clob: Option<Quality>,
     threshold: Option<Quality>,
@@ -576,12 +586,7 @@ pub fn execute_book_step_with_options<V: ApplyView>(
     // rippled tries AMM liquidity before the cleaned CLOB tip. The AMM offer
     // establishes the one-quality-per-step boundary just like a real offer.
     // Domain books never use AMM liquidity.
-    let clob_tip = offers.first().map(|offer| {
-        Quality::from_amounts(&Amounts::new(
-            offer.get_field_amount(sf("sfTakerPays")),
-            offer.get_field_amount(sf("sfTakerGets")),
-        ))
-    });
+    let clob_tip = offers.first().map(offer_directory_quality);
     let amm_generation_quality = amm_target_quality(
         clob_tip,
         quality_threshold,
@@ -761,14 +766,11 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                 continue;
             }
 
-            // The Book stores offer fields as TakerPays/TakerGets. In this
-            // strand direction, `Quality::from_amounts` must receive that raw
-            // pair (in=TakerPays, out=TakerGets) so its encoded comparison is
-            // on the same scale as OfferCreate's `Quality{takerAmount.out,
-            // sendMax}` threshold. Swapping them makes the reciprocal quality
-            // and admits offers that are worse than the taker's limit.
-            let offer_quality =
-                Quality::from_amounts(&Amounts::new(taker_pays.clone(), taker_gets.clone()));
+            // TOffer::quality() comes from BookTip's directory key. A partial
+            // consumption changes TakerPays/TakerGets but never relocates the
+            // offer, so recomputing their ratio can improve the quality and
+            // change both threshold selection and strict limit arithmetic.
+            let offer_quality = offer_directory_quality(&offer_sle);
 
             // `forEachOffer` stops before invoking the derived callback when
             // the stream advances to a second quality after an offer attempt.
@@ -877,6 +879,7 @@ pub fn execute_book_step_with_options<V: ApplyView>(
                 &taker_pays,
                 &taker_gets,
                 &owner_funds,
+                offer_quality,
                 tr_in,
                 tr_out,
                 fix_reduced_offers_v2,
@@ -2154,6 +2157,7 @@ fn compute_offer_consumption(
     taker_pays: &STAmount,
     taker_gets: &STAmount,
     owner_funds: &STAmount,
+    offer_quality: Quality,
     transfer_rate_in: u32,
     transfer_rate_out: u32,
     fix_reduced_offers_v2: bool,
@@ -2167,11 +2171,9 @@ fn compute_offer_consumption(
     let mut owner_gives = mul_ratio_amount(&ofr_out, transfer_rate_out, QUALITY_ONE, false);
     let mut actual_ofr_in = ofr_in;
     let mut actual_ofr_out = ofr_out;
-    // TOffer retains the quality calculated from the original ledger offer.
-    // Every subsequent limitIn/limitOut operation uses that stored quality,
-    // even after owner-funding has reduced the working offer amounts.
-    let offer_quality =
-        Quality::from_amounts(&Amounts::new(taker_pays.clone(), taker_gets.clone()));
+    // TOffer retains the BookDirectory quality supplied by BookTip. Every
+    // subsequent limitIn/limitOut operation uses it even after owner funding
+    // or an earlier crossing has reduced the working offer amounts.
 
     // reference: if (funds < ownerGives) — limit by owner funding
     if *owner_funds < owner_gives {
@@ -3055,6 +3057,14 @@ mod tests {
         // deriving stpAmt.in in revImp.
         let issuer = AccountID::from_array([0x33; 20]);
         let issue = protocol::Issue::new(protocol::currency_from_string("USD"), issuer);
+        let offer_quality = Quality::from_amounts(&Amounts::new(
+            STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(3_300_000_000)),
+            STAmount::from_iou_amount(
+                sf("sfAmount"),
+                protocol::IOUAmount::from_parts(1_000, 0).expect("canonical offer output"),
+                issue,
+            ),
+        ));
         let consumption = compute_offer_consumption(
             &STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(3_300_000_000)),
             &STAmount::from_iou_amount(
@@ -3073,6 +3083,7 @@ mod tests {
                 protocol::IOUAmount::from_parts(1_000, 0).expect("funded offer output"),
                 issue,
             ),
+            offer_quality,
             QUALITY_ONE,
             QUALITY_ONE,
             true,
@@ -3098,12 +3109,17 @@ mod tests {
                 .expect("99.50000000000001 IOU"),
             issue,
         );
+        let offer_quality = Quality::from_amounts(&Amounts::new(
+            STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(50_000_000)),
+            taker_gets.clone(),
+        ));
         let consumption = compute_offer_consumption(
             &STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(25_000_000)),
             &taker_gets,
             &STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(50_000_000)),
             &taker_gets,
             &taker_gets,
+            offer_quality,
             QUALITY_ONE,
             QUALITY_ONE,
             true,
@@ -3114,6 +3130,48 @@ mod tests {
         assert_eq!(
             (taker_gets - consumption.offer_out).iou().to_string(),
             "49.75000000000002"
+        );
+    }
+
+    #[test]
+    fn stored_book_quality_matches_testnet_20660471_partial_offer_limit() {
+        // The offer had already been partially consumed, so its current amount
+        // ratio encoded 11,489,999.99999987. It remained in the immutable
+        // 0x5C04150268D8D000 quality directory (exactly 11,490,000), which
+        // rippled's TOffer uses for strict limiting.
+        let issuer = AccountID::from_array([0x33; 20]);
+        let issue = protocol::Issue::new(protocol::currency_from_string("TST"), issuer);
+        let taker_pays =
+            STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(11_489_962_342_055_813));
+        let taker_gets = STAmount::from_iou_amount(
+            sf("sfAmount"),
+            protocol::IOUAmount::from_parts(9_999_967_225_462_095, -7)
+                .expect("999996722.5462095 TST"),
+            issue,
+        );
+        let stored_quality = Quality::from_value(0x5C04_1502_68D8_D000);
+        let recomputed_quality =
+            Quality::from_amounts(&Amounts::new(taker_pays.clone(), taker_gets.clone()));
+        assert_ne!(stored_quality, recomputed_quality);
+        assert_eq!(stored_quality.rate().text(), "11490000");
+        assert_eq!(recomputed_quality.rate().text(), "11489999.99999987");
+
+        let consumption = compute_offer_consumption(
+            &STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(600_000)),
+            &taker_gets,
+            &taker_pays,
+            &taker_gets,
+            &taker_gets,
+            stored_quality,
+            QUALITY_ONE,
+            QUALITY_ONE,
+            true,
+        );
+
+        assert_eq!(consumption.offer_in.xrp().drops(), 600_000);
+        assert_eq!(
+            consumption.offer_out.iou().to_string(),
+            "0.05221932114882506"
         );
     }
 

@@ -95,8 +95,10 @@ fn node_family_exposes_tree_node_cache_keys_without_mutating_cache_state() {
 
     let first = Uint256::from_array([0x11; 32]);
     let second = Uint256::from_array([0x22; 32]);
-    tree_cache.insert(first, SHAMapTreeNode::new_inner(1));
-    tree_cache.insert(second, SHAMapTreeNode::new_inner(1));
+    let mut first_node = SHAMapTreeNode::new_inner(1);
+    tree_cache.canonicalize_replace_client(&first, &mut first_node);
+    let mut second_node = SHAMapTreeNode::new_inner(1);
+    tree_cache.canonicalize_replace_client(&second, &mut second_node);
     node_family.with_full_below_cache(|cache| cache.insert(first));
 
     let mut keys = node_family.tree_node_cache_keys();

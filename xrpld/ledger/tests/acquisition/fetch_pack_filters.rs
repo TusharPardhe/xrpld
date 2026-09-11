@@ -68,7 +68,7 @@ fn sample_hash(fill: u8) -> SHAMapHash {
 }
 
 fn make_leaf(node_type: SHAMapNodeType, fill: u8) -> SharedIntrusive<SHAMapTreeNode> {
-    make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    SHAMapTreeNode::new_leaf(
         node_type,
         SHAMapItem::new(
             Uint256::from_array([fill; 32]),
@@ -88,7 +88,7 @@ fn make_leaf(node_type: SHAMapNodeType, fill: u8) -> SharedIntrusive<SHAMapTreeN
             ],
         ),
         0,
-    ))
+    )
 }
 
 #[test]

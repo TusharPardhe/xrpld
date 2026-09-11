@@ -4678,7 +4678,6 @@ mod actor_mailbox_tests {
 
     #[test]
     fn retained_tree_read_batches_drain_without_another_branch_scan() {
-        use basics::intrusive_pointer::make_shared_intrusive;
         use shamap::sync::{SHAMapType, SyncState, SyncTree};
         use shamap::tree_node::SHAMapTreeNode;
 
@@ -4696,9 +4695,9 @@ mod actor_mailbox_tests {
         // A two-level inner tree has far more distinct missing leaves than the
         // 16-read actor admission batch. One bounded advance retains later
         // batches internally after returning the first batch.
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         for parent_branch in 0..16 {
-            let child = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+            let child = SHAMapTreeNode::new_inner(1);
             for child_branch in 0..16 {
                 let byte = (parent_branch * 16 + child_branch + 1) as u8;
                 child.set_child_hash(
@@ -4748,7 +4747,6 @@ mod actor_mailbox_tests {
     #[test]
     fn deferred_ticket_with_runnable_frontier_parks_until_read_ready() {
         use super::super::read_broker::ReadBrokerConfig;
-        use basics::intrusive_pointer::make_shared_intrusive;
         use shamap::sync::{SHAMapType, SyncState, SyncTree};
         use shamap::tree_node::SHAMapTreeNode;
 
@@ -4766,9 +4764,9 @@ mod actor_mailbox_tests {
         // A two-level, 256-leaf tree has more missing children than one
         // bounded read batch, leaving retained CPU frontier after the first
         // `NeedsReads` result.
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         for parent_branch in 0..16 {
-            let child = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+            let child = SHAMapTreeNode::new_inner(1);
             for child_branch in 0..16 {
                 let byte = (parent_branch * 16 + child_branch + 1) as u8;
                 child.set_child_hash(
@@ -4848,7 +4846,6 @@ mod actor_mailbox_tests {
 
     #[test]
     fn read_admission_backpressure_waits_instead_of_spinning_zero_branch_needs_reads() {
-        use basics::intrusive_pointer::make_shared_intrusive;
         use shamap::sync::{SHAMapType, SyncState, SyncTree};
         use shamap::tree_node::SHAMapTreeNode;
 
@@ -4867,7 +4864,7 @@ mod actor_mailbox_tests {
         // admission rejection reannounces those same needs. Its stack is then
         // exhausted, so a retry returns `NeedsReads` with zero branch work:
         // this matches the live high-rate telemetry shape.
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         for branch in 0..16 {
             root.set_child_hash(
                 branch,
@@ -4966,7 +4963,6 @@ mod actor_mailbox_tests {
 
     #[test]
     fn ready_without_branch_progress_is_not_requeued() {
-        use basics::intrusive_pointer::make_shared_intrusive;
         use shamap::sync::{SHAMapType, SyncState, SyncTree};
         use shamap::tree_node::SHAMapTreeNode;
 
@@ -4985,10 +4981,10 @@ mod actor_mailbox_tests {
         // branch budget produces `Ready` before the continuation can select a
         // branch. This is the actor-side shape that previously self-requeued
         // solely from `has_runnable_frontier()`.
-        let child = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let child = SHAMapTreeNode::new_inner(1);
         child.set_child_hash(0, SHAMapHash::new(Uint256::from_array([0x51; 32])));
         child.update_hash();
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(0, child.get_hash());
         root.canonicalize_child(0, child);
         root.update_hash();
@@ -5029,7 +5025,6 @@ mod actor_mailbox_tests {
 
     #[test]
     fn verified_peer_node_resumes_deferred_parent_and_queues_a_bounded_turn() {
-        use basics::intrusive_pointer::make_shared_intrusive;
         use shamap::sync::{SHAMapType, SyncState, SyncTree};
         use shamap::tree_node::SHAMapTreeNode;
 
@@ -5044,11 +5039,11 @@ mod actor_mailbox_tests {
             }
         }
 
-        let child = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let child = SHAMapTreeNode::new_inner(1);
         child.set_child_hash(0, SHAMapHash::new(Uint256::from_array([0x42; 32])));
         child.update_hash();
         let missing = child.get_hash();
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(7, missing);
         root.update_hash();
         let tree = SyncTree::from_root_with_type(
@@ -5272,7 +5267,6 @@ mod actor_mailbox_tests {
         reason: InboundLedgerRequestTrigger,
         aggressive_by_hash: bool,
     ) -> ActorTreePlan {
-        use basics::intrusive_pointer::make_shared_intrusive;
         use shamap::sync::{SHAMapType, SyncState, SyncTree};
         use shamap::tree_node::SHAMapTreeNode;
 
@@ -5288,7 +5282,7 @@ mod actor_mailbox_tests {
         }
 
         let missing = SHAMapHash::new(Uint256::from_array([plan_id as u8; 32]));
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(7, missing);
         root.update_hash();
         let tree = SyncTree::from_root_with_type(
@@ -5498,7 +5492,6 @@ mod actor_mailbox_tests {
 
     #[test]
     fn network_request_overflow_is_requeued_without_marking_or_timeout() {
-        use basics::intrusive_pointer::make_shared_intrusive;
         use shamap::sync::{SHAMapType, SyncState, SyncTree};
         use shamap::tree_node::SHAMapTreeNode;
 
@@ -5513,7 +5506,7 @@ mod actor_mailbox_tests {
             }
         }
 
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         for branch in 0..16 {
             root.set_child_hash(
                 branch,
@@ -5574,7 +5567,6 @@ mod actor_mailbox_tests {
 
     #[test]
     fn timeout_retargets_the_retained_network_frontier_without_rebuilding() {
-        use basics::intrusive_pointer::make_shared_intrusive;
         use shamap::sync::{SHAMapType, SyncState, SyncTree};
         use shamap::tree_node::SHAMapTreeNode;
 
@@ -5590,7 +5582,7 @@ mod actor_mailbox_tests {
         }
 
         let missing = SHAMapHash::new(Uint256::from_array([42; 32]));
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(7, missing);
         root.update_hash();
         let tree = SyncTree::from_root_with_type(

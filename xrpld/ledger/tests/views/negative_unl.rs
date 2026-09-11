@@ -254,7 +254,7 @@ fn negative_unl_read_helpers_match_current_cpp_field_filtering_rules() {
 
 #[test]
 fn strict_negative_unl_read_preserves_missing_node_error() {
-    let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    let root = SHAMapTreeNode::new_inner(1);
     let branch = usize::from(negative_unl_keylet().key.data()[0] >> 4);
     let missing = SHAMapHash::new(Uint256::from_array([0xA5; 32]));
     root.set_child_hash(branch, missing);

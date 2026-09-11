@@ -178,7 +178,7 @@ impl BudgetState {
 impl Default for BudgetState {
     fn default() -> Self {
         Self::new(
-            usize::MAX,
+            16,
             AdmissionBudget::new(ADMISSION_PACKET_LIMIT, ADMISSION_BYTE_LIMIT),
             // rippled's InboundLedger timer runs every three seconds; the
             // seventh no-progress interval terminalizes the acquisition.
@@ -4947,6 +4947,11 @@ impl CoordinatorRunner {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn default_budget_uses_the_bounded_medium_session_cap() {
+        assert_eq!(super::BudgetState::default().max_sessions(), 16);
+    }
+
     use super::*;
     use crate::TreeEngine;
     use crate::TreePlanId;
@@ -7706,7 +7711,13 @@ mod tests {
 
     #[test]
     fn outbound_admission_bounds_global_credits_and_prioritizes_latched_anchor() {
-        let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
+        // This test isolates the 256-request outbound credit pool, so give it
+        // enough explicit session capacity rather than inheriting the bounded
+        // medium production default.
+        let mut runner = CoordinatorRunner::with_budget(
+            RunEpoch::new(1),
+            BudgetState::new(64, AdmissionBudget::default(), Duration::from_secs(120)),
+        );
         let peers = (1..=5).map(PeerId::new).collect::<Vec<_>>();
         let _ = runner.handle_event(AcquisitionEvent::Connectivity(
             PeerAvailabilitySnapshot::new(peers),

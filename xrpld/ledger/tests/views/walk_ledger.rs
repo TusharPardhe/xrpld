@@ -134,11 +134,11 @@ fn ledger_walk_ledger_serial_reports_missing_account_and_tx_roots() {
 fn ledger_walk_ledger_parallel_returns_state_walk_result_and_skips_tx_tree() {
     let state_missing_hash = sample_hash(0xC1);
     let tx_hash = sample_hash(0xD2);
-    let state_inner = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    let state_inner = SHAMapTreeNode::new_inner(1);
     state_inner.set_child_hash(7, state_missing_hash);
     state_inner.update_hash();
 
-    let state_root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    let state_root = SHAMapTreeNode::new_inner(1);
     state_root.set_child_hash(2, state_inner.get_hash());
     state_root.share_child(2, &state_inner);
     state_root.update_hash_deep();
@@ -193,11 +193,11 @@ fn ledger_walk_ledger_parallel_returns_state_walk_result_and_skips_tx_tree() {
 #[test]
 fn ledger_walk_ledger_serial_checks_tx_tree_after_missing_account_root() {
     let account_hash = sample_hash(0xE1);
-    let tx_root_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let tx_root_leaf = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::TransactionNm,
         SHAMapItem::new(sample_uint256(0x44), vec![0x55; 16]),
         0,
-    ));
+    );
     let tx_hash = tx_root_leaf.get_hash();
     let mut expected = HashMap::new();
     expected.insert(tx_hash, tx_root_leaf.clone());
@@ -243,16 +243,16 @@ fn ledger_walk_ledger_serial_checks_tx_tree_after_missing_account_root() {
 
 #[test]
 fn ledger_assert_sensible_accepts_matching_header_and_owner_hashes() {
-    let tx_root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let tx_root = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::TransactionNm,
         SHAMapItem::new(sample_uint256(0x62), vec![0x17; 20]),
         0,
-    ));
-    let state_root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    );
+    let state_root = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         SHAMapItem::new(sample_uint256(0x63), vec![0x27; 20]),
         0,
-    ));
+    );
     let mut header = LedgerHeader {
         seq: 902,
         drops: 101,
@@ -291,16 +291,16 @@ fn ledger_assert_sensible_accepts_matching_header_and_owner_hashes() {
 #[test]
 #[should_panic(expected = "ledger is not sensible")]
 fn ledger_assert_sensible_panics_for_mismatched_account_hash_unreachable_path() {
-    let tx_root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let tx_root = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::TransactionNm,
         SHAMapItem::new(sample_uint256(0x72), vec![0x18; 20]),
         0,
-    ));
-    let state_root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    );
+    let state_root = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         SHAMapItem::new(sample_uint256(0x73), vec![0x28; 20]),
         0,
-    ));
+    );
     let mut ledger = Ledger::from_maps(
         LedgerHeader {
             seq: 903,

@@ -142,16 +142,16 @@ impl LedgerInfoProvider for RecordingLedgerInfoProvider {
 
 #[test]
 fn load_immutable_with_family_fetches_roots_in_and_marks_immutable() {
-    let tx_root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let tx_root = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::TransactionNm,
         SHAMapItem::new(sample_uint256(0x61), vec![0xAA; 20]),
         0,
-    ));
-    let state_root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    );
+    let state_root = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         SHAMapItem::new(sample_uint256(0x62), vec![0xBB; 20]),
         0,
-    ));
+    );
     let mut expected = HashMap::new();
     expected.insert(tx_root.get_hash(), tx_root.clone());
     expected.insert(state_root.get_hash(), state_root.clone());
@@ -261,11 +261,11 @@ fn load_immutable_with_family_warns_and_acquires_by_hash_only_after_failed_load(
 
 #[test]
 fn load_immutable_with_family_and_setup_decodes_loaded_state_entries_ctor() {
-    let tx_root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let tx_root = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::TransactionNm,
         SHAMapItem::new(sample_uint256(0x94), vec![0xAB; 20]),
         0,
-    ));
+    );
     let state_map = build_state_map_with_items(
         &[
             (
@@ -350,11 +350,11 @@ fn load_immutable_with_family_and_setup_decodes_loaded_state_entries_ctor() {
 #[test]
 fn load_immutable_with_family_and_config_seeds_rules_and_fees_from_config() {
     let preset = sample_uint256(0x96);
-    let tx_root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let tx_root = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::TransactionNm,
         SHAMapItem::new(sample_uint256(0x97), vec![0xAB; 20]),
         0,
-    ));
+    );
     let state_map = build_state_map_with_items(
         &[
             (
@@ -433,11 +433,11 @@ fn load_immutable_with_family_and_config_seeds_rules_and_fees_from_config() {
 
 #[test]
 fn load_immutable_with_family_and_config_or_none_returns_some_for_complete_loads() {
-    let tx_root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let tx_root = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::TransactionNm,
         SHAMapItem::new(sample_uint256(0xA0), vec![0xAA; 20]),
         0,
-    ));
+    );
     let state_map = build_state_map_with_items(
         &[
             (
@@ -546,11 +546,11 @@ fn load_immutable_with_family_and_config_or_none_returns_none_for_failed_loads()
 
 #[test]
 fn load_finished_with_family_and_config_or_none_returns_full_ledger() {
-    let tx_root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let tx_root = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::TransactionNm,
         SHAMapItem::new(sample_uint256(0xA6), vec![0xFE; 20]),
         0,
-    ));
+    );
     let state_map = build_state_map_with_items(
         &[
             (
@@ -619,11 +619,11 @@ fn load_finished_with_family_and_config_or_none_returns_full_ledger() {
 
 #[test]
 fn load_finished_by_hash_with_family_and_config_or_none_matches_requested_hash() {
-    let tx_root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let tx_root = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::TransactionNm,
         SHAMapItem::new(sample_uint256(0xAA), vec![0xDD; 20]),
         0,
-    ));
+    );
     let state_map = build_state_map_with_items(
         &[
             (
@@ -692,11 +692,11 @@ fn load_finished_by_hash_with_family_and_config_or_none_matches_requested_hash()
 #[test]
 #[should_panic(expected = "xrpl::loadByHash : ledger hash match if loaded")]
 fn load_finished_by_hash_with_family_and_config_or_none_panics_on_hash_mismatch() {
-    let tx_root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let tx_root = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::TransactionNm,
         SHAMapItem::new(sample_uint256(0xAD), vec![0xCC; 20]),
         0,
-    ));
+    );
     let state_map = build_state_map_with_items(
         &[
             (
@@ -754,11 +754,11 @@ fn load_finished_by_hash_with_family_and_config_or_none_panics_on_hash_mismatch(
 
 #[test]
 fn load_by_index_with_provider_and_config_or_none_returns_finished_ledger() {
-    let tx_root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let tx_root = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::TransactionNm,
         SHAMapItem::new(sample_uint256(0xB0), vec![0x11; 20]),
         0,
-    ));
+    );
     let state_map = build_state_map_with_items(
         &[
             (
@@ -853,11 +853,11 @@ fn load_by_index_with_provider_and_config_or_none_returns_none_for_missing_heade
 
 #[test]
 fn load_by_hash_with_provider_and_config_or_none_returns_finished_ledger() {
-    let tx_root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let tx_root = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::TransactionNm,
         SHAMapItem::new(sample_uint256(0xB4), vec![0x22; 20]),
         0,
-    ));
+    );
     let state_map = build_state_map_with_items(
         &[
             (

@@ -200,11 +200,11 @@ fn shamap_leaf(
     node_type: SHAMapNodeType,
     marker: u8,
 ) -> (Arc<NodeObject>, [u8; 32]) {
-    let node = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let node = SHAMapTreeNode::new_leaf(
         node_type,
         SHAMapItem::new(Uint256::from_array([marker; 32]), vec![marker; 12]),
         0,
-    ));
+    );
     let hash = *node.get_hash().as_uint256();
     let hash_bytes = *hash.data();
     let data = node
@@ -217,7 +217,7 @@ fn shamap_leaf(
 }
 
 fn shamap_inner_with_child(child_hash: [u8; 32]) -> (Arc<NodeObject>, [u8; 32]) {
-    let node = make_shared_intrusive(SHAMapTreeNode::new_inner(0));
+    let node = SHAMapTreeNode::new_inner(0);
     node.set_child_hash(
         0,
         basics::sha_map_hash::SHAMapHash::new(Uint256::from_array(child_hash)),

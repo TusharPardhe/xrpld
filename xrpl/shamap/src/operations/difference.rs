@@ -241,7 +241,7 @@ mod tests {
     use crate::item::SHAMapItem;
     use crate::tree_node::{SHAMapNodeType, SHAMapTreeNode};
     use basics::base_uint::Uint256;
-    use basics::intrusive_pointer::{SharedIntrusive, make_shared_intrusive};
+    use basics::intrusive_pointer::SharedIntrusive;
     use basics::sha_map_hash::SHAMapHash;
     use basics::tagged_cache::ManualClock;
     use parking_lot::Mutex;
@@ -267,28 +267,28 @@ mod tests {
         let deep_key = key("4100000000000000000000000000000000000000000000000000000000000000");
         let top_leaf_key = key("9000000000000000000000000000000000000000000000000000000000000000");
 
-        let shared_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let shared_leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(shared_key, vec![1; 12]),
             0,
-        ));
-        let deep_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        );
+        let deep_leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(deep_key, vec![2; 12]),
             0,
-        ));
-        let top_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        );
+        let top_leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(top_leaf_key, vec![3; 12]),
             0,
-        ));
+        );
 
-        let differing_inner = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let differing_inner = SHAMapTreeNode::new_inner(1);
         differing_inner.set_child_hash(1, deep_leaf.get_hash());
         differing_inner.share_child(1, &deep_leaf);
         differing_inner.update_hash_deep();
 
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(1, shared_leaf.get_hash());
         root.share_child(1, &shared_leaf);
         root.set_child_hash(4, differing_inner.get_hash());
@@ -297,7 +297,7 @@ mod tests {
         root.share_child(9, &top_leaf);
         root.update_hash_deep();
 
-        let have = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let have = SHAMapTreeNode::new_inner(1);
         have.set_child_hash(1, shared_leaf.get_hash());
         have.share_child(1, &shared_leaf);
         have.update_hash_deep();
@@ -357,13 +357,13 @@ mod tests {
     fn visit_differences_fetches_and_canonicalizes_missing_self_children() {
         let leaf_key = key("2000000000000000000000000000000000000000000000000000000000000000");
         let expected_hash = sample_hash(0x44);
-        let fetched_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf_with_hash(
+        let fetched_leaf = SHAMapTreeNode::new_leaf_with_hash(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(leaf_key, vec![4; 12]),
             0,
             expected_hash,
-        ));
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        );
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(2, expected_hash);
         root.update_hash_deep();
 
@@ -396,26 +396,26 @@ mod tests {
         let key = key("3000000000000000000000000000000000000000000000000000000000000000");
         let expected_hash = sample_hash(0x66);
 
-        let self_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf_with_hash(
+        let self_leaf = SHAMapTreeNode::new_leaf_with_hash(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(key, vec![5; 12]),
             0,
             expected_hash,
-        ));
-        let self_root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        );
+        let self_root = SHAMapTreeNode::new_inner(1);
         self_root.set_child_hash(3, expected_hash);
         self_root.share_child(3, &self_leaf);
         self_root.update_hash_deep();
 
-        let have_root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let have_root = SHAMapTreeNode::new_inner(1);
         have_root.set_child_hash(3, expected_hash);
         have_root.update_hash_deep();
-        let have_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf_with_hash(
+        let have_leaf = SHAMapTreeNode::new_leaf_with_hash(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(key, vec![5; 12]),
             0,
             expected_hash,
-        ));
+        );
 
         let mut have_fetch_calls = 0;
         let mut visited = 0;
@@ -457,13 +457,13 @@ mod tests {
     fn visit_differences_with_families_fetches_and_canonicalizes_missing_self_children() {
         let leaf_key = key("5000000000000000000000000000000000000000000000000000000000000000");
         let expected_hash = sample_hash(0x77);
-        let fetched_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf_with_hash(
+        let fetched_leaf = SHAMapTreeNode::new_leaf_with_hash(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(leaf_key, vec![7; 12]),
             0,
             expected_hash,
-        ));
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        );
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(5, expected_hash);
         root.update_hash();
 
@@ -520,13 +520,13 @@ mod tests {
     #[test]
     fn visit_differences_returns_traversal_errors_for_missing_have_leaf_membership() {
         let key = key("6000000000000000000000000000000000000000000000000000000000000000");
-        let root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let root = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(key, vec![8; 12]),
             0,
-        ));
+        );
 
-        let have_root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let have_root = SHAMapTreeNode::new_inner(1);
         have_root.set_child_hash(6, sample_hash(0x88));
         have_root.update_hash_deep();
 
@@ -550,13 +550,13 @@ mod tests {
     #[test]
     fn visit_differences_with_families_returns_traversal_errors_for_missing_have_leaf_membership() {
         let key = key("7000000000000000000000000000000000000000000000000000000000000000");
-        let root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let root = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(key, vec![9; 12]),
             0,
-        ));
+        );
 
-        let have_root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let have_root = SHAMapTreeNode::new_inner(1);
         let missing_hash = sample_hash(0x99);
         have_root.set_child_hash(7, missing_hash);
         have_root.update_hash();

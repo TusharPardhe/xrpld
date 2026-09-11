@@ -15,9 +15,11 @@ use crate::{
 };
 use basics::base_uint::Uint256;
 use basics::basic_config::{BasicConfig, IniFileSections};
+use basics::blob::Blob;
 use basics::chrono::NetClockTimePoint;
+use basics::memory::malloc_trim::{MallocTrimLogger, MallocTrimReport, malloc_trim};
 use basics::string_utilities::str_unhex;
-use basics::tagged_cache::MonotonicClock;
+use basics::tagged_cache::{CacheClock, MonotonicClock, TaggedCache};
 use ledger::{
     Ledger, LedgerConfig, LedgerHeader, LedgerInfoProvider, LedgerJournal, LedgerReplay,
     NullOrderBookDBJournal, NullOrderBookDBRuntime, load_by_hash, load_by_index,
@@ -52,6 +54,131 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use xrpl_core::{HashRouter, ServiceRegistry, StartUpType};
+
+/// Match rippled `ApplicationImp::doSweep`: trim only after periodic cache cleanup.
+const APPLICATION_SWEEP_MALLOC_TRIM_TAG: &str = "Application::doSweep";
+#[derive(Debug, Clone, Copy)]
+struct SweepMallocTrimLogger;
+impl MallocTrimLogger for SweepMallocTrimLogger {
+    fn debug(&self, message: &str) {
+        tracing::debug!(target: "app", "{message}");
+    }
+}
+fn trim_after_application_sweep_with(
+    trim: impl FnOnce(&str) -> MallocTrimReport,
+) -> MallocTrimReport {
+    trim(APPLICATION_SWEEP_MALLOC_TRIM_TAG)
+}
+fn trim_after_application_sweep() -> MallocTrimReport {
+    trim_after_application_sweep_with(|tag| malloc_trim(tag, &SweepMallocTrimLogger))
+}
+
+/// Sweep rippled's application-owned NodeCache as part of `Application::doSweep`.
+fn sweep_temp_node_cache<C>(cache: &TaggedCache<Uint256, Blob, C>)
+where
+    C: CacheClock,
+{
+    cache.sweep();
+}
+
+/// The cache and lifecycle work performed by one configured `Application::doSweep`.
+/// Both the housekeeping timer and deterministic tests use this sequence so new
+/// sweep work cannot be added to one without exercising the other.
+trait ApplicationSweepActions {
+    fn sweep_inbound_ledgers(&self);
+    fn sweep_node_family(&self);
+    fn sweep_ledger_master(&self);
+    fn sweep_transaction_master(&self);
+    fn expire_validations(&self);
+    fn trim_allocator(&self);
+}
+
+fn run_application_sweep<C>(
+    temp_node_cache: &TaggedCache<Uint256, Blob, C>,
+    actions: &impl ApplicationSweepActions,
+) where
+    C: CacheClock,
+{
+    actions.sweep_inbound_ledgers();
+    sweep_temp_node_cache(temp_node_cache);
+    actions.sweep_node_family();
+    actions.sweep_ledger_master();
+    actions.sweep_transaction_master();
+    actions.expire_validations();
+    // Keep allocator purging after every cache/lifecycle sweep, as rippled's
+    // ApplicationImp::doSweep does.
+    actions.trim_allocator();
+}
+
+struct ProductionApplicationSweep<'a> {
+    root: &'a ApplicationRoot,
+    inbound: &'a crate::ledger::inbound_ledgers::InboundLedgers,
+}
+
+impl ApplicationSweepActions for ProductionApplicationSweep<'_> {
+    fn sweep_inbound_ledgers(&self) {
+        self.inbound.sweep();
+    }
+
+    fn sweep_node_family(&self) {
+        let before_size = self
+            .root
+            .shared_tree_cache()
+            .map(|cache| cache.size())
+            .unwrap_or(0);
+        if let Some(node_family) = self.root.node_family() {
+            // NodeFamily owns both caches, so its sweep is the only lifecycle
+            // path for the shared FullBelow generation and tree-node entries.
+            node_family.sweep();
+        }
+        let after_size = self
+            .root
+            .shared_tree_cache()
+            .map(|cache| cache.size())
+            .unwrap_or(0);
+        if before_size != after_size {
+            tracing::info!(target: "app",
+                before_size, after_size,
+                freed = before_size.saturating_sub(after_size),
+                "TreeNodeCache sweep (matching rippled doSweep)"
+            );
+        }
+
+        // NodeFamily::sweep() above expires the shared FullBelow cache used by
+        // every inbound acquisition.
+    }
+
+    fn sweep_ledger_master(&self) {
+        // LedgerMaster sweep — matching rippled's doSweep. This expires
+        // completed inbound-ledger history and fetch-pack cache entries once
+        // their normal cache policy permits it.
+        if let Some(ledger_master_runtime) = self.root.ledger_master_runtime() {
+            ledger_master_runtime.ledger_master().sweep();
+        }
+    }
+
+    fn sweep_transaction_master(&self) {
+        // TransactionMaster sweep — matching rippled's doSweep which sweeps
+        // the MasterTransaction TaggedCache (65,536 entries, 30min TTL).
+        // Without this, completed transactions accumulate indefinitely.
+        self.root.transaction_master().sweep();
+    }
+
+    fn expire_validations(&self) {
+        // Application::doSweep expires validation maps on the same configured
+        // SweepInterval; without it, historical validation sets never age out.
+        self.root.expire_validations();
+    }
+
+    fn trim_allocator(&self) {
+        let trim = trim_after_application_sweep();
+        tracing::debug!(target: "app", event = "application_sweep_allocator_trim",
+            supported = trim.supported, trim_result = trim.trim_result,
+            rss_delta_kb = trim.delta_kb(), duration_us = trim.duration_us,
+            minflt_delta = trim.minflt_delta, majflt_delta = trim.majflt_delta,
+            "allocator trim completed after periodic cache sweep");
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppBootstrapOptions {
@@ -744,6 +871,9 @@ pub fn build_bootstrap_root(
     options: &AppBootstrapOptions,
 ) -> Result<AppBootstrapRoot, String> {
     let manifest_limits = ManifestLimits::from_config(config)?;
+    let configured_node_size = configured_node_size_from_config(config);
+    let node_size_profile =
+        crate::NodeSizeResourceProfile::for_node_size(configured_node_size.as_deref());
     let mut effective_options = options.clone();
     let fast_load = node_db_fast_load(config);
     if fast_load
@@ -828,7 +958,12 @@ pub fn build_bootstrap_root(
         root.tx_q().reconfigure_setup(txq_setup);
     }
     let _ = root.attach_default_resolver_runtime();
-    let _ = root.attach_default_ledger_master_runtime();
+    // Construct LedgerMaster from the already-resolved node-size policy rather
+    // than retaining its generic defaults (medium: 64 ledgers / 180 seconds).
+    let ledger_master_runtime = Arc::new(crate::AppLedgerMasterRuntime::new(
+        node_size_profile.ledger_master_config(),
+    ));
+    let _ = root.attach_ledger_master_runtime(ledger_master_runtime);
     let _ = root.attach_default_network_ops_validation_runtime();
     let _ = root.attach_default_network_ops_runtime();
     attach_relational_database_if_configured(&mut root, config, options, ledger_history)?;
@@ -895,12 +1030,8 @@ pub fn build_bootstrap_root(
     let node_store_kind = pending_shamap_store
         .as_ref()
         .map(|pending| pending.bootstrap.node_store_kind().to_owned());
-    let configured_node_size = configured_node_size_from_config(config);
-    let sweep_interval_seconds = configured_sweep_interval(
-        config,
-        crate::NodeSizeResourceProfile::for_node_size(configured_node_size.as_deref())
-            .sweep_interval_seconds,
-    )?;
+    let sweep_interval_seconds =
+        configured_sweep_interval(config, node_size_profile.sweep_interval_seconds)?;
     root.set_status_rpc_node_size(configured_node_size.clone());
     attach_bootstrap_node_family(&mut root, configured_node_size.as_deref());
     attach_production_shamap_store_runtime(&mut root, pending_shamap_store)?;
@@ -1474,22 +1605,28 @@ fn run_start_mode_consensus_loop(
             }
             inbound
         }
-        None => Arc::new(crate::ledger::inbound_ledgers::InboundLedgers::new(
-            Arc::clone(&app_tree_cache),
-            Arc::clone(&node_family_full_below_cache),
-            lm_rt_for_shared_inbound
-                .as_ref()
-                .map(|runtime| runtime.ledger_master().fetch_pack_cache_arc())
-                .unwrap_or_else(|| {
-                    Arc::new(ledger::FetchPackCache::new(
-                        65_536,
-                        time::Duration::seconds(45),
-                        basics::tagged_cache::MonotonicClock::default(),
-                    ))
-                }),
-            shared_completed_tx.clone(),
-            runtime.root().network_ops_state().need_network_ledger_arc(),
-        )),
+        None => Arc::new(
+            crate::ledger::inbound_ledgers::InboundLedgers::new_with_budget(
+                Arc::clone(&app_tree_cache),
+                Arc::clone(&node_family_full_below_cache),
+                lm_rt_for_shared_inbound
+                    .as_ref()
+                    .map(|runtime| runtime.ledger_master().fetch_pack_cache_arc())
+                    .unwrap_or_else(|| {
+                        Arc::new(ledger::FetchPackCache::new(
+                            65_536,
+                            time::Duration::seconds(45),
+                            basics::tagged_cache::MonotonicClock::default(),
+                        ))
+                    }),
+                shared_completed_tx.clone(),
+                runtime.root().network_ops_state().need_network_ledger_arc(),
+                crate::NodeSizeResourceProfile::for_node_size(
+                    runtime.root().status_rpc_node_size().as_deref(),
+                )
+                .acquisition_budget(),
+            ),
+        ),
     };
 
     // Tree and FullBelow cache ownership was established by NodeFamily before
@@ -2710,48 +2847,13 @@ fn run_start_mode_consensus_loop(
                     // InboundLedgers::sweep belongs to this same doSweep cadence:
                     // rippled does not sweep inbound ledgers on every overlay tick.
                     if last_cache_sweep.elapsed() >= Duration::from_secs(hk_sweep_interval) {
-                        hk_shared_inbound.sweep();
-                        let before_size = root
-                            .shared_tree_cache()
-                            .map(|cache| cache.size())
-                            .unwrap_or(0);
-                        if let Some(node_family) = root.node_family() {
-                            // NodeFamily owns both caches, so its sweep is the
-                            // only lifecycle path for the shared FullBelow
-                            // generation and tree-node entries.
-                            node_family.sweep();
-                        }
-                        let after_size = root
-                            .shared_tree_cache()
-                            .map(|cache| cache.size())
-                            .unwrap_or(0);
-                        if before_size != after_size {
-                            tracing::info!(target: "app",
-                                before_size, after_size,
-                                freed = before_size.saturating_sub(after_size),
-                                "TreeNodeCache sweep (matching rippled doSweep)"
-                            );
-                        }
-
-                        // NodeFamily::sweep() above expires the shared
-                        // FullBelow cache used by every inbound acquisition.
-
-                        // LedgerMaster sweep — matching rippled's doSweep. This
-                        // expires completed inbound-ledger history and fetch-pack
-                        // cache entries once their normal cache policy permits it.
-                        if let Some(ledger_master_runtime) = root.ledger_master_runtime() {
-                            ledger_master_runtime.ledger_master().sweep();
-                        }
-
-                        // TransactionMaster sweep — matching rippled's doSweep which
-                        // sweeps the MasterTransaction TaggedCache (65,536 entries, 30min TTL).
-                        // Without this, completed transactions accumulate indefinitely.
-                        root.transaction_master().sweep();
-
-                        // Application::doSweep expires validation maps on this
-                        // same configured SweepInterval; without it, historical
-                        // validation sets never age out in a running node.
-                        root.expire_validations();
+                        run_application_sweep(
+                            root.temp_node_cache(),
+                            &ProductionApplicationSweep {
+                                root,
+                                inbound: hk_shared_inbound.as_ref(),
+                            },
+                        );
 
                         last_cache_sweep = std::time::Instant::now();
                     }
@@ -5780,33 +5882,38 @@ const fn should_schedule_coordinator_fetch_pack_wake(
 #[cfg(test)]
 mod tests {
     use super::{
-        BootstrapLedgerDataRouting, ENDPOINT_HANDOUT_LIMIT, FetchPackAdmission,
-        GenericGetObjectAdmission, LedgerDataIngressDisposition, MainRuntime, StartUpType,
-        amendments_from_config, build_endpoint_handout, build_validator_list_collection_messages,
-        candidate_ledger_data_charge, classify_fetch_pack_request,
-        classify_generic_get_object_request, configured_feature_ids, configured_sweep_interval,
-        fetch_pack_failure_charge, get_ledger_send_queue_is_admissible,
+        APPLICATION_SWEEP_MALLOC_TRIM_TAG, BootstrapLedgerDataRouting, ENDPOINT_HANDOUT_LIMIT,
+        FetchPackAdmission, GenericGetObjectAdmission, LedgerDataIngressDisposition, MainRuntime,
+        StartUpType, amendments_from_config, build_endpoint_handout,
+        build_validator_list_collection_messages, candidate_ledger_data_charge,
+        classify_fetch_pack_request, classify_generic_get_object_request, configured_feature_ids,
+        configured_sweep_interval, fetch_pack_failure_charge, get_ledger_send_queue_is_admissible,
         get_object_query_send_queue_is_admissible, ledger_data_nodes_are_admissible,
         ledger_data_sequence_is_admissible, load_bootstrap_ledger_from_file,
         manifest_rate_limit_policy, parse_basic_config_text, relay_accepted_manifest,
         requested_transaction_envelope, route_bootstrap_ledger_data,
         sequence_is_fetchable_at_floor, should_schedule_coordinator_fetch_pack_wake,
         should_schedule_relayed_transaction, spawn_shutdown_watcher,
-        transaction_object_request_is_admissible, trusted_first_manifest_payloads,
-        validator_list_collection_blobs, validator_list_threshold_from_config,
+        transaction_object_request_is_admissible, trim_after_application_sweep_with,
+        trusted_first_manifest_payloads, validator_list_collection_blobs,
+        validator_list_threshold_from_config,
     };
+    use super::{ApplicationSweepActions, run_application_sweep};
     use crate::state::manifest::{
         MAX_UNTRUSTED_MANIFESTS, ManifestDisposition, ManifestLimits, ManifestRateLimitCapPolicy,
     };
     use crate::{ApplicationRoot, ValidatorListBroadcastBlob, ValidatorListCollectionForBroadcast};
     use basics::base_uint::Uint256;
     use basics::basic_config::BasicConfig;
+    use basics::blob::Blob;
     use basics::hardened_hash::HardenedHashBuilder;
-    use basics::tagged_cache::MonotonicClock;
+    use basics::memory::malloc_trim::MallocTrimReport;
+    use basics::tagged_cache::{ManualClock, MonotonicClock, TaggedCache};
     use ledger::FetchPackCache;
     use nodestore::{DummyScheduler, ManagerImp, NullJournal, Scheduler};
     use shamap::family::FullBelowCacheImpl;
     use shamap::tree_node_cache::TreeNodeCache;
+    use std::cell::RefCell;
     use std::collections::BTreeSet;
     use std::fs;
     use std::sync::atomic::AtomicBool;
@@ -5814,6 +5921,92 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
     use xrpl_core::HashRouter;
+
+    #[test]
+    fn allocator_trim_runs_at_the_application_sweep_boundary() {
+        let mut tags = Vec::new();
+        let report = trim_after_application_sweep_with(|tag| {
+            tags.push(tag.to_owned());
+            MallocTrimReport {
+                supported: true,
+                trim_result: 1,
+                rss_before_kb: 100,
+                rss_after_kb: 90,
+                duration_us: 7,
+                minflt_delta: 2,
+                majflt_delta: 0,
+            }
+        });
+        assert_eq!(tags, vec![APPLICATION_SWEEP_MALLOC_TRIM_TAG]);
+        assert!(report.supported);
+        assert_eq!(report.delta_kb(), -10);
+    }
+
+    struct DeterministicApplicationSweep {
+        actions: RefCell<Vec<&'static str>>,
+    }
+
+    impl ApplicationSweepActions for DeterministicApplicationSweep {
+        fn sweep_inbound_ledgers(&self) {
+            self.actions.borrow_mut().push("inbound_ledgers");
+        }
+
+        fn sweep_node_family(&self) {
+            self.actions.borrow_mut().push("node_family");
+        }
+
+        fn sweep_ledger_master(&self) {
+            self.actions.borrow_mut().push("ledger_master");
+        }
+
+        fn sweep_transaction_master(&self) {
+            self.actions.borrow_mut().push("transaction_master");
+        }
+
+        fn expire_validations(&self) {
+            self.actions.borrow_mut().push("validations");
+        }
+
+        fn trim_allocator(&self) {
+            self.actions.borrow_mut().push("allocator_trim");
+        }
+    }
+
+    #[test]
+    fn configured_application_sweep_expires_temp_node_cache_before_allocator_trim() {
+        let clock = Arc::new(ManualClock::new(0));
+        let cache = TaggedCache::<Uint256, Blob, _>::new(
+            "NodeCache",
+            1,
+            time::Duration::seconds(1),
+            Arc::clone(&clock),
+        );
+        let hash = Uint256::from_u64(1);
+        let sweep = DeterministicApplicationSweep {
+            actions: RefCell::new(Vec::new()),
+        };
+
+        assert!(!cache.insert(hash, vec![0xCA, 0xFE]));
+        assert_eq!(cache.get_cache_size(), 1);
+
+        clock.advance_seconds(1);
+        run_application_sweep(&cache, &sweep);
+
+        assert_eq!(cache.get_cache_size(), 0);
+        assert_eq!(cache.get_track_size(), 0);
+        assert_eq!(cache.retrieve(&hash), None);
+        assert_eq!(
+            *sweep.actions.borrow(),
+            [
+                "inbound_ledgers",
+                "node_family",
+                "ledger_master",
+                "transaction_master",
+                "validations",
+                "allocator_trim",
+            ]
+        );
+    }
 
     #[test]
     fn bootstrap_ledger_file_rejects_unknown_sle_type_without_unwinding() {

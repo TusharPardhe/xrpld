@@ -6,7 +6,7 @@ use crate::search::{NodePathEntry, find_key, walk_towards_key_with_path};
 use crate::traversal::TraversalError;
 use crate::tree_node::{BRANCH_FACTOR, SHAMapNodeType, SHAMapTreeNode};
 use basics::base_uint::Uint256;
-use basics::intrusive_pointer::{SharedIntrusive, make_shared_intrusive};
+use basics::intrusive_pointer::SharedIntrusive;
 use basics::sha_map_hash::SHAMapHash;
 
 type WriteNodeCallback<'a> =
@@ -44,7 +44,7 @@ impl MutableTree {
     pub fn new(cowid: u32) -> Self {
         assert!(cowid != 0, "mutable trees require a non-zero cowid");
         Self {
-            root: make_shared_intrusive(SHAMapTreeNode::new_inner(cowid)),
+            root: SHAMapTreeNode::new_inner(cowid),
             cowid,
         }
     }
@@ -269,9 +269,7 @@ impl MutableTree {
                         .expect("collapsed sole leaf should carry an item");
                     let sole_type = sole_leaf.get_type();
                     node.set_child(sole_branch, None);
-                    prev_node = Some(make_shared_intrusive(SHAMapTreeNode::new_leaf(
-                        sole_type, sole_item, self.cowid,
-                    )));
+                    prev_node = Some(SHAMapTreeNode::new_leaf(sole_type, sole_item, self.cowid));
                 }
                 _ => {
                     prev_node = Some(node);
@@ -386,9 +384,7 @@ impl MutableTree {
                     };
                     let sole_item = sole_leaf.peek_item().expect("leaf must have item");
                     let sole_type = sole_leaf.get_type();
-                    prev_node = Some(make_shared_intrusive(SHAMapTreeNode::new_leaf(
-                        sole_type, sole_item, self.cowid,
-                    )));
+                    prev_node = Some(SHAMapTreeNode::new_leaf(sole_type, sole_item, self.cowid));
                 }
                 _ => {
                     // reference: prevNode = std::move(node) — no updateHashDeep
@@ -415,7 +411,7 @@ impl MutableTree {
         debug_assert!(parent.is_inner());
         debug_assert!(parent.is_empty_branch(branch));
 
-        let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(node_type, item, self.cowid));
+        let leaf = SHAMapTreeNode::new_leaf(node_type, item, self.cowid);
         parent.set_child(branch, Some(leaf));
         self.root = self.dirty_up(&path[..path.len() - 1], target, parent)?;
         Ok(true)
@@ -449,7 +445,7 @@ impl MutableTree {
 
         let mut graft_stack = path[..path.len() - 1].to_vec();
         let mut node_id = leaf_entry.node_id;
-        let mut split_node = make_shared_intrusive(SHAMapTreeNode::new_inner(self.cowid));
+        let mut split_node = SHAMapTreeNode::new_inner(self.cowid);
 
         loop {
             let new_branch = select_branch(node_id, target);
@@ -457,17 +453,15 @@ impl MutableTree {
             if new_branch != old_branch {
                 split_node.set_child(
                     new_branch,
-                    Some(make_shared_intrusive(SHAMapTreeNode::new_leaf(
-                        node_type, item, self.cowid,
-                    ))),
+                    Some(SHAMapTreeNode::new_leaf(node_type, item, self.cowid)),
                 );
                 split_node.set_child(
                     old_branch,
-                    Some(make_shared_intrusive(SHAMapTreeNode::new_leaf(
+                    Some(SHAMapTreeNode::new_leaf(
                         node_type,
                         existing_item,
                         self.cowid,
-                    ))),
+                    )),
                 );
                 self.root = self.dirty_up(&graft_stack, target, split_node)?;
                 return Ok(true);
@@ -480,7 +474,7 @@ impl MutableTree {
             node_id = node_id
                 .get_child_node_id(new_branch)
                 .expect("split branches must remain within SHAMap depth bounds");
-            split_node = make_shared_intrusive(SHAMapTreeNode::new_inner(self.cowid));
+            split_node = SHAMapTreeNode::new_inner(self.cowid);
         }
     }
 
@@ -636,11 +630,11 @@ pub fn delete_item(
                     .expect("collapsed sole leaf should carry an item");
                 let sole_type = sole_leaf.get_type();
                 entry.node.set_child(sole_branch, None);
-                prev_node = Some(make_shared_intrusive(SHAMapTreeNode::new_leaf(
+                prev_node = Some(SHAMapTreeNode::new_leaf(
                     sole_type,
                     sole_item,
                     entry.node.cowid(),
-                )));
+                ));
             }
             _ => {
                 prev_node = Some(entry.node.clone());
@@ -666,7 +660,7 @@ fn add_into_empty_branch(
     debug_assert!(parent_entry.node.is_inner());
     debug_assert!(parent_entry.node.is_empty_branch(branch));
 
-    let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(node_type, item, owner));
+    let leaf = SHAMapTreeNode::new_leaf(node_type, item, owner);
     parent_entry.node.set_child(branch, Some(leaf));
     parent_entry.node.update_hash_deep();
     dirty_up(&path[..path.len() - 1], target, parent_entry.node.clone());
@@ -701,7 +695,7 @@ fn add_with_leaf_split(
 
     let mut graft_stack = path[..path.len() - 1].to_vec();
     let mut node_id = leaf_entry.node_id;
-    let mut split_node = make_shared_intrusive(SHAMapTreeNode::new_inner(owner));
+    let mut split_node = SHAMapTreeNode::new_inner(owner);
 
     loop {
         let new_branch = select_branch(node_id, target);
@@ -709,17 +703,11 @@ fn add_with_leaf_split(
         if new_branch != old_branch {
             split_node.set_child(
                 new_branch,
-                Some(make_shared_intrusive(SHAMapTreeNode::new_leaf(
-                    node_type, item, owner,
-                ))),
+                Some(SHAMapTreeNode::new_leaf(node_type, item, owner)),
             );
             split_node.set_child(
                 old_branch,
-                Some(make_shared_intrusive(SHAMapTreeNode::new_leaf(
-                    node_type,
-                    existing_item,
-                    owner,
-                ))),
+                Some(SHAMapTreeNode::new_leaf(node_type, existing_item, owner)),
             );
             dirty_up(&graft_stack, target, split_node);
             return Ok(true);
@@ -732,7 +720,7 @@ fn add_with_leaf_split(
         node_id = node_id
             .get_child_node_id(new_branch)
             .expect("split branches must remain within SHAMap depth bounds");
-        split_node = make_shared_intrusive(SHAMapTreeNode::new_inner(owner));
+        split_node = SHAMapTreeNode::new_inner(owner);
     }
 }
 
@@ -899,7 +887,7 @@ fn walk_subtree_impl(
     }
 
     if root.is_inner() && root.is_empty() {
-        return (make_shared_intrusive(SHAMapTreeNode::new_inner(0)), 1);
+        return (SHAMapTreeNode::new_inner(0), 1);
     }
 
     let mut node = pre_flush_node(root, owner_cowid);
@@ -977,7 +965,7 @@ fn try_walk_subtree_impl<E>(
     }
 
     if root.is_inner() && root.is_empty() {
-        return Ok((make_shared_intrusive(SHAMapTreeNode::new_inner(0)), 1));
+        return Ok((SHAMapTreeNode::new_inner(0), 1));
     }
 
     let mut node = pre_flush_node(root, owner_cowid);
@@ -1049,7 +1037,7 @@ fn try_walk_subtree_detached_impl<E>(
         return Ok((root, 1));
     }
     if root.is_inner() && root.is_empty() {
-        return Ok((make_shared_intrusive(SHAMapTreeNode::new_inner(0)), 1));
+        return Ok((SHAMapTreeNode::new_inner(0), 1));
     }
 
     let mut flushed = 0;
@@ -1127,7 +1115,7 @@ mod tests {
     use crate::search::find_key;
     use crate::tree_node::{SHAMapNodeType, SHAMapTreeNode};
     use basics::base_uint::Uint256;
-    use basics::intrusive_pointer::{SharedIntrusive, make_shared_intrusive};
+    use basics::intrusive_pointer::SharedIntrusive;
 
     fn same_node(
         left: &SharedIntrusive<SHAMapTreeNode>,
@@ -1141,7 +1129,7 @@ mod tests {
         let key =
             Uint256::from_hex("1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF")
                 .expect("hex should parse");
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
 
         let inserted = add_item(
             &root,
@@ -1166,12 +1154,12 @@ mod tests {
         let inserted_key =
             Uint256::from_hex("1234A67890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF")
                 .expect("hex should parse");
-        let existing_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let existing_leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(existing_key, vec![2; 12]),
             1,
-        ));
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        );
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child(1, Some(existing_leaf.clone()));
         root.update_hash_deep();
 
@@ -1244,12 +1232,12 @@ mod tests {
     #[test]
     fn add_item_returns_false_for_duplicate_keys() {
         let key = Uint256::from_array([0x11; 32]);
-        let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(key, vec![4; 12]),
             1,
-        ));
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        );
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child(1, Some(leaf));
         root.update_hash_deep();
 
@@ -1267,11 +1255,11 @@ mod tests {
     fn add_item_splits_a_loaded_leaf_root_into_a_new_inner_root() {
         let existing_key = Uint256::from_array([0x10; 32]);
         let inserted_key = Uint256::from_array([0x90; 32]);
-        let existing_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let existing_leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(existing_key, vec![4; 12]),
             1,
-        ));
+        );
         let mut tree = MutableTree::from_loaded_root(existing_leaf.clone(), 1);
 
         let inserted = tree
@@ -1302,12 +1290,12 @@ mod tests {
     #[test]
     fn update_item_recomputes_leaf_and_parent_hashes() {
         let key = Uint256::from_array([0x22; 32]);
-        let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(key, vec![5; 12]),
             1,
-        ));
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(2));
+        );
+        let root = SHAMapTreeNode::new_inner(2);
         root.set_child(2, Some(leaf.clone()));
         root.update_hash_deep();
 
@@ -1328,12 +1316,12 @@ mod tests {
     #[test]
     fn update_item_rejects_cross_type_changes() {
         let key = Uint256::from_array([0x33; 32]);
-        let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(key, vec![7; 12]),
             1,
-        ));
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        );
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child(3, Some(leaf));
         root.update_hash_deep();
 
@@ -1357,12 +1345,12 @@ mod tests {
     fn delete_item_returns_false_when_the_exact_key_is_missing() {
         let stored_key = Uint256::from_array([0x41; 32]);
         let requested_key = Uint256::from_array([0x4F; 32]);
-        let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(stored_key, vec![9; 12]),
             1,
-        ));
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        );
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child(4, Some(leaf));
         root.update_hash_deep();
 
@@ -1373,12 +1361,12 @@ mod tests {
     #[test]
     fn delete_item_removes_the_last_root_child_without_collapsing_root() {
         let key = Uint256::from_array([0x51; 32]);
-        let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(key, vec![10; 12]),
             1,
-        ));
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        );
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child(5, Some(leaf));
         root.update_hash_deep();
 
@@ -1402,7 +1390,7 @@ mod tests {
         let delete_key =
             Uint256::from_hex("1234A67890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF")
                 .expect("hex should parse");
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         add_item(
             &root,
             SHAMapNodeType::AccountState,
@@ -1441,27 +1429,27 @@ mod tests {
             Uint256::from_hex("19FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF")
                 .expect("hex should parse");
 
-        let loaded_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let loaded_leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(keep_key, vec![13; 12]),
             1,
-        ));
-        let shared_prefix = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        );
+        let shared_prefix = SHAMapTreeNode::new_inner(1);
         shared_prefix.set_child_hash(3, loaded_leaf.get_hash());
         shared_prefix.update_hash();
 
-        let parent = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let parent = SHAMapTreeNode::new_inner(1);
         parent.set_child(2, Some(shared_prefix));
 
-        let deleted_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let deleted_leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(delete_key, vec![14; 12]),
             1,
-        ));
+        );
         parent.set_child(9, Some(deleted_leaf));
         parent.update_hash_deep();
 
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child(1, Some(parent));
         root.update_hash_deep();
 
@@ -1586,11 +1574,11 @@ mod tests {
     )]
     fn from_loaded_root_rejects_nodes_from_newer_owners() {
         let key = Uint256::from_array([0xD3; 32]);
-        let foreign_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let foreign_leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(key, vec![18; 12]),
             2,
-        ));
+        );
         let _ = MutableTree::from_loaded_root(foreign_leaf, 1);
     }
 
@@ -1637,12 +1625,12 @@ mod tests {
         let flushed = tree.flush_dirty(&mut |node| {
             writes.push((node.is_leaf(), node.get_hash()));
             if node.is_leaf() {
-                make_shared_intrusive(SHAMapTreeNode::new_leaf_with_hash(
+                SHAMapTreeNode::new_leaf_with_hash(
                     node.get_type(),
                     original_item.clone(),
                     0,
                     original_leaf_hash,
-                ))
+                )
             } else {
                 node
             }

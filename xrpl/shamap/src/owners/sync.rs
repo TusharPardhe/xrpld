@@ -27,7 +27,7 @@ use crate::tree_node::{BRANCH_FACTOR, SHAMapCodecError, SHAMapTreeNode};
 use crate::visitor::{visit_leaves as visit_leaves_impl, visit_nodes as visit_nodes_impl};
 use basics::base_uint::Uint256;
 use basics::blob::Blob;
-use basics::intrusive_pointer::{SharedIntrusive, make_shared_intrusive};
+use basics::intrusive_pointer::SharedIntrusive;
 use basics::sha_map_hash::SHAMapHash;
 use basics::tagged_cache::CacheClock;
 use parking_lot::Mutex;
@@ -289,7 +289,7 @@ impl SyncTree {
         state: SyncState,
     ) -> Self {
         Self {
-            root: make_shared_intrusive(SHAMapTreeNode::new_inner(0)),
+            root: SHAMapTreeNode::new_inner(0),
             map_type,
             backed,
             ledger_seq,
@@ -1034,13 +1034,13 @@ impl SyncTree {
 
         let generation = full_below_cache.generation();
         let mut curr_node_id = SHAMapNodeId::default();
-        let mut curr_node = &*self.root as *const SHAMapTreeNode;
+        let mut curr_node = self.root.clone();
 
-        while unsafe { &*curr_node }.is_inner()
-            && !unsafe { &*curr_node }.is_full_below(generation)
+        while curr_node.is_inner()
+            && !curr_node.is_full_below(generation)
             && curr_node_id.get_depth() < node_id.get_depth()
         {
-            let curr_node_ref = unsafe { &*curr_node };
+            let curr_node_ref = &*curr_node;
             let branch = crate::node_id::select_branch(curr_node_id, node_id.get_node_id());
             if curr_node_ref.is_empty_branch(branch) {
                 report_event(AddKnownNodeEvent::EmptyBranch { wanted: node_id });
@@ -1057,7 +1057,7 @@ impl SyncTree {
                 return SHAMapAddNode::duplicate();
             }
 
-            if let Some(loaded) = unsafe { curr_node_ref.get_child_ptr(branch) } {
+            if let Some(loaded) = curr_node_ref.get_child(branch) {
                 curr_node = loaded;
                 continue;
             }
@@ -1071,7 +1071,7 @@ impl SyncTree {
                 filter,
             );
             if let Some(next_node) = resolved {
-                curr_node = &*next_node as *const SHAMapTreeNode;
+                curr_node = next_node;
                 continue;
             }
 
@@ -4732,11 +4732,10 @@ mod tests {
     use crate::tree_node_cache::TreeNodeCache;
     use basics::base_uint::Uint256;
     use basics::blob::Blob;
-    use basics::intrusive_pointer::make_shared_intrusive;
     use basics::sha_map_hash::SHAMapHash;
     use basics::tagged_cache::ManualClock;
     use parking_lot::Mutex;
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use time::Duration;
@@ -4879,11 +4878,11 @@ mod tests {
 
     #[test]
     fn mutable_snapshot_resets_full_and_returns_modifying_tree() {
-        let root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let root = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(sample_uint256(0x35), vec![0x41; 20]),
             7,
-        ));
+        );
         let tree = SyncTree::from_root_with_type(
             root.clone(),
             SHAMapType::State,
@@ -4913,12 +4912,64 @@ mod tests {
     }
 
     #[test]
+    fn release_deep_children_refuses_unbacked_trees() {
+        let child = SHAMapTreeNode::new_inner(1);
+        let root = SHAMapTreeNode::new_inner(1);
+        root.set_child(1, Some(child.clone()));
+        root.update_hash_deep();
+        let tree =
+            SyncTree::from_root_with_type(root, SHAMapType::State, false, 88, SyncState::Immutable);
+
+        assert_eq!(tree.release_deep_children(1), 0);
+        assert!(child.is_inner());
+        assert!(tree.root().get_child(1).is_some());
+    }
+
+    #[test]
+    fn durable_deep_release_preserves_hash_and_reloads_from_backing_fetcher() {
+        let key = sample_uint256_with_prefix(0x12, 0x30);
+        let leaf = SHAMapTreeNode::new_leaf(
+            SHAMapNodeType::AccountState,
+            SHAMapItem::new(key, vec![0xAB; 24]),
+            0,
+        );
+        let level_two = SHAMapTreeNode::new_inner(1);
+        level_two.set_child(3, Some(leaf.clone()));
+        level_two.update_hash_deep();
+        let level_one = SHAMapTreeNode::new_inner(1);
+        level_one.set_child(2, Some(level_two.clone()));
+        level_one.update_hash_deep();
+        let root = SHAMapTreeNode::new_inner(1);
+        root.set_child(1, Some(level_one));
+        root.update_hash_deep();
+
+        let expected_root = root.get_hash();
+        let leaf_hash = leaf.get_hash();
+        let stored = HashMap::from([(leaf_hash, leaf)]);
+        let tree =
+            SyncTree::from_root_with_type(root, SHAMapType::State, true, 89, SyncState::Immutable);
+
+        assert_eq!(tree.release_deep_children(2), 1);
+        assert_eq!(tree.root().get_hash(), expected_root);
+        assert!(level_two.get_child(3).is_none());
+        assert!(!level_two.is_empty_branch(3));
+
+        let item = tree
+            .peek_item(key, &mut |hash| stored.get(&hash).cloned())
+            .expect("backed traversal should succeed")
+            .expect("released leaf should reload");
+        assert_eq!(item.data(), &[0xAB; 24]);
+        assert_eq!(tree.root().get_hash(), expected_root);
+        assert!(level_two.get_child(3).is_some());
+    }
+
+    #[test]
     fn walk_map_ignores_leaf_roots() {
-        let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(sample_uint256(1), vec![1; 12]),
             0,
-        ));
+        );
         let mut missing = Vec::new();
 
         walk_map(
@@ -4935,7 +4986,7 @@ mod tests {
 
     #[test]
     fn walk_map_reports_missing_branch_hashes_and_stops_at_max() {
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(1, sample_hash(0x11));
         root.set_child_hash(2, sample_hash(0x22));
 
@@ -4955,10 +5006,10 @@ mod tests {
 
     #[test]
     fn walk_map_fetches_inner_children_without_attaching_them() {
-        let nested_inner = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let nested_inner = SHAMapTreeNode::new_inner(1);
         nested_inner.set_child_hash(4, sample_hash(0x44));
 
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(3, sample_hash(0x33));
 
         let mut missing = Vec::new();
@@ -4992,11 +5043,11 @@ mod tests {
 
     #[test]
     fn walk_map_parallel_returns_false_for_leaf_roots() {
-        let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(sample_uint256(2), vec![2; 12]),
             0,
-        ));
+        );
         let mut missing = Vec::new();
 
         assert!(!walk_map_parallel(
@@ -5012,7 +5063,7 @@ mod tests {
 
     #[test]
     fn walk_map_parallel_skips_missing_top_level_children_like_current_cpp_role() {
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(5, sample_hash(0x55));
         root.update_hash();
 
@@ -5030,10 +5081,10 @@ mod tests {
 
     #[test]
     fn walk_map_parallel_fetches_inner_children_without_attaching_them() {
-        let nested_inner = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let nested_inner = SHAMapTreeNode::new_inner(1);
         nested_inner.set_child_hash(4, sample_hash(0x64));
 
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(3, sample_hash(0x63));
 
         let fetch_calls = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -5072,15 +5123,15 @@ mod tests {
 
     #[test]
     fn walk_map_parallel_respects_the_shared_missing_limit_across_workers() {
-        let left_inner = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let left_inner = SHAMapTreeNode::new_inner(1);
         left_inner.set_child_hash(1, sample_hash(0x71));
         left_inner.update_hash();
 
-        let right_inner = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let right_inner = SHAMapTreeNode::new_inner(1);
         right_inner.set_child_hash(2, sample_hash(0x72));
         right_inner.update_hash();
 
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(3, left_inner.get_hash());
         root.share_child(3, &left_inner);
         root.set_child_hash(4, right_inner.get_hash());
@@ -5119,7 +5170,7 @@ mod tests {
     #[test]
     fn get_missing_nodes_returns_node_ids_and_dedupes_hashes() {
         let shared_hash = sample_hash(0x55);
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(1, shared_hash);
         root.set_child_hash(2, shared_hash);
         root.update_hash();
@@ -5150,14 +5201,14 @@ mod tests {
 
     #[test]
     fn get_missing_nodes_uses_filter_blobs_and_canonicalizes_children() {
-        let child = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let child = SHAMapTreeNode::new_inner(1);
         child.set_child_hash(4, sample_hash(0x44));
         child.update_hash_deep();
         let child_blob = child
             .serialize_with_prefix()
             .expect("inner prefix serialization should succeed");
 
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(3, child.get_hash());
         root.update_hash_deep();
 
@@ -5198,14 +5249,14 @@ mod tests {
 
     #[test]
     fn get_missing_nodes_with_family_canonicalizes_filter_hits_into_shared_cache() {
-        let child = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let child = SHAMapTreeNode::new_inner(1);
         child.set_child_hash(4, sample_hash(0x46));
         child.update_hash_deep();
         let child_blob = child
             .serialize_with_prefix()
             .expect("inner prefix serialization should succeed");
 
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(3, child.get_hash());
         root.update_hash();
 
@@ -5250,16 +5301,16 @@ mod tests {
 
     #[test]
     fn get_missing_nodes_with_family_prefers_shared_cache_before_filter_descend_async() {
-        let child = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let child = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(sample_uint256(0x5A), vec![6; 12]),
             0,
-        ));
+        );
         let child_prefix = child
             .serialize_with_prefix()
             .expect("leaf prefix serialization should succeed");
 
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(3, child.get_hash());
         root.update_hash();
 
@@ -5295,7 +5346,7 @@ mod tests {
     #[test]
     fn get_missing_nodes_with_family_does_not_report_owner_missing_acquire_on_deferred_db_miss() {
         let child_hash = sample_hash(0x6B);
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(3, child_hash);
         root.update_hash();
 
@@ -5331,7 +5382,7 @@ mod tests {
     #[test]
     fn backed_deferred_scan_probes_node_store_once_per_unresolved_child() {
         let child_hash = sample_hash(0x6C);
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(3, child_hash);
         root.update_hash();
 
@@ -5366,11 +5417,11 @@ mod tests {
 
     #[test]
     fn add_known_node_prefers_backed_fetch_before_filter_descend() {
-        let child = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let child = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(sample_uint256(0x45), vec![3; 12]),
             0,
-        ));
+        );
         let child_hash = child.get_hash();
         let raw_child = child
             .serialize_for_wire()
@@ -5379,7 +5430,7 @@ mod tests {
             .serialize_with_prefix()
             .expect("leaf prefix serialization should succeed");
 
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(3, child_hash);
         root.update_hash();
 
@@ -5418,11 +5469,11 @@ mod tests {
 
     #[test]
     fn add_known_node_with_family_clears_full_on_backed_miss_before_filter_fallback() {
-        let child = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let child = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(sample_uint256(0x46), vec![4; 12]),
             0,
-        ));
+        );
         let child_hash = child.get_hash();
         let raw_child = child
             .serialize_for_wire()
@@ -5431,7 +5482,7 @@ mod tests {
             .serialize_with_prefix()
             .expect("leaf prefix serialization should succeed");
 
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(3, child_hash);
         root.update_hash();
 
@@ -5468,13 +5519,13 @@ mod tests {
 
     #[test]
     fn add_known_node_treats_full_below_hash_hits_as_duplicates() {
-        let child = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let child = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(sample_uint256(0x5B), vec![7; 12]),
             0,
-        ));
+        );
         let child_hash = child.get_hash();
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(3, child_hash);
         root.update_hash();
 
@@ -5496,11 +5547,11 @@ mod tests {
 
     #[test]
     fn add_known_node_checks_full_below_before_loaded_child_descent() {
-        let child = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let child = SHAMapTreeNode::new_inner(1);
         child.set_child_hash(4, sample_hash(0x44));
         child.update_hash();
         let child_hash = child.get_hash();
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(3, child_hash);
         root.canonicalize_child(3, child);
         root.update_hash();
@@ -5524,12 +5575,12 @@ mod tests {
 
     #[test]
     fn add_known_node_with_family_canonicalizes_filter_path_hits_into_shared_cache() {
-        let intermediate = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
-        let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let intermediate = SHAMapTreeNode::new_inner(1);
+        let leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(sample_uint256_with_prefix(0x36, 0x47), vec![5; 12]),
             0,
-        ));
+        );
         intermediate.set_child_hash(6, leaf.get_hash());
         intermediate.update_hash_deep();
         let intermediate_blob = intermediate
@@ -5539,7 +5590,7 @@ mod tests {
             .serialize_for_wire()
             .expect("leaf wire serialization should succeed");
 
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(3, intermediate.get_hash());
         root.update_hash();
 
@@ -5612,16 +5663,16 @@ mod tests {
             }
         }
 
-        let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(sample_uint256_with_prefix(0x30, 0x72), vec![8; 12]),
             0,
-        ));
+        );
         let raw_leaf = leaf
             .serialize_for_wire()
             .expect("leaf wire serialization should succeed");
 
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(3, leaf.get_hash());
         root.update_hash();
 
@@ -5656,17 +5707,17 @@ mod tests {
 
     #[test]
     fn get_missing_nodes_marks_full_subtrees_for_the_generation() {
-        let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(sample_uint256(0x11), vec![1; 12]),
             0,
-        ));
-        let inner = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        );
+        let inner = SHAMapTreeNode::new_inner(1);
         inner.set_child_hash(1, leaf.get_hash());
         inner.share_child(1, &leaf);
         inner.update_hash_deep();
 
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(2, inner.get_hash());
         root.share_child(2, &inner);
         root.update_hash_deep();
@@ -5710,7 +5761,7 @@ mod tests {
     #[test]
     fn get_missing_nodes_respects_full_below_hash_cache_without_loading_children() {
         let child_hash = sample_hash(0x66);
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(6, child_hash);
         root.update_hash();
 
@@ -5735,11 +5786,11 @@ mod tests {
     #[test]
     fn get_missing_nodes_keeps_parent_not_full_below_when_descendant_is_missing() {
         let missing_hash = sample_hash(0x77);
-        let inner = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let inner = SHAMapTreeNode::new_inner(1);
         inner.set_child_hash(7, missing_hash);
         inner.update_hash();
 
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(3, inner.get_hash());
         root.share_child(3, &inner);
         root.update_hash_deep();
@@ -5765,17 +5816,17 @@ mod tests {
 
     #[test]
     fn process_deferred_sync_reads_canonicalizes_children_and_dedupes_resume_parents() {
-        let left_child = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let left_child = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(sample_uint256(0x71), vec![1; 12]),
             0,
-        ));
-        let right_child = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        );
+        let right_child = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(sample_uint256(0x72), vec![2; 12]),
             0,
-        ));
-        let parent = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        );
+        let parent = SHAMapTreeNode::new_inner(1);
         parent.set_child_hash(1, left_child.get_hash());
         parent.set_child_hash(2, right_child.get_hash());
 
@@ -5823,7 +5874,7 @@ mod tests {
     #[test]
     fn process_deferred_sync_reads_records_missing_children_once() {
         let shared_hash = sample_hash(0x73);
-        let parent = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let parent = SHAMapTreeNode::new_inner(1);
         parent.set_child_hash(3, shared_hash);
         parent.set_child_hash(4, shared_hash);
 
@@ -5869,8 +5920,8 @@ mod tests {
 
     #[test]
     fn enqueue_deferred_resumes_skips_nodes_already_marked_full_below() {
-        let queued_parent = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
-        let skipped_parent = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let queued_parent = SHAMapTreeNode::new_inner(1);
+        let skipped_parent = SHAMapTreeNode::new_inner(1);
         skipped_parent.set_full_below_gen(12);
 
         let mut stack = Vec::new();
@@ -5908,17 +5959,17 @@ mod tests {
     #[test]
     fn deferred_missing_node_scan_keeps_nested_parent_alive_across_eviction() {
         let missing_leaf_hash = sample_hash(0x73);
-        let fetched_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf_with_hash(
+        let fetched_leaf = SHAMapTreeNode::new_leaf_with_hash(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(sample_uint256(0x73), vec![3; 12]),
             0,
             missing_leaf_hash,
-        ));
-        let nested = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        );
+        let nested = SHAMapTreeNode::new_inner(1);
         nested.set_child_hash(7, missing_leaf_hash);
         nested.update_hash();
 
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(3, nested.get_hash());
         root.share_child(3, &nested);
         root.update_hash_deep();
@@ -5970,11 +6021,11 @@ mod tests {
     #[test]
     fn deferred_missing_node_scan_resumes_after_completed_reads() {
         let missing_leaf_hash = sample_hash(0x74);
-        let fetched_inner = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let fetched_inner = SHAMapTreeNode::new_inner(1);
         fetched_inner.set_child_hash(7, missing_leaf_hash);
         fetched_inner.update_hash_deep();
 
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(3, fetched_inner.get_hash());
         root.update_hash();
 
@@ -6045,11 +6096,11 @@ mod tests {
     fn deferred_missing_node_scan_defers_resume_activation_until_stack_drains() {
         let active_hash = sample_hash(0x77);
         let resumed_hash = sample_hash(0x78);
-        let active_parent = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let active_parent = SHAMapTreeNode::new_inner(1);
         active_parent.set_child_hash(0, active_hash);
         active_parent.update_hash();
 
-        let resumed_parent = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let resumed_parent = SHAMapTreeNode::new_inner(1);
         resumed_parent.set_child_hash(1, resumed_hash);
         resumed_parent.update_hash();
 
@@ -6123,7 +6174,7 @@ mod tests {
     #[test]
     fn deferred_missing_node_scan_deferred_threshold_boundary() {
         let child_hash = sample_hash(0x7d);
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(1, child_hash);
         root.update_hash();
 
@@ -6163,7 +6214,7 @@ mod tests {
 
     #[test]
     fn advance_deferred_missing_node_scan_with_family_drains_bounded_batches_in_one_call() {
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         for branch in 0..3 {
             root.set_child_hash(branch, sample_hash(0x80 + branch as u8));
         }
@@ -6202,7 +6253,7 @@ mod tests {
 
     #[test]
     fn deferred_missing_node_scan_bounded_read_limit_is_eight_and_legacy_keeps_extra_read() {
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         for branch in 0..9 {
             root.set_child_hash(branch, sample_hash((0x80 + branch) as u8));
         }
@@ -6252,7 +6303,7 @@ mod tests {
     #[test]
     fn deferred_missing_node_scan_with_family_skips_known_full_below_hashes() {
         let child_hash = sample_hash(0x75);
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(4, child_hash);
         root.update_hash();
 
@@ -6293,12 +6344,12 @@ mod tests {
 
     #[test]
     fn deferred_missing_node_scan_with_family_inserts_completed_full_below_nodes() {
-        let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(sample_uint256(0x76), vec![9; 12]),
             0,
-        ));
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        );
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(2, leaf.get_hash());
         root.share_child(2, &leaf);
         root.update_hash_deep();
@@ -6342,17 +6393,17 @@ mod tests {
 
     #[test]
     fn get_node_fat_follows_single_child_inner_chains_without_spending_depth() {
-        let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(sample_uint256(0xAA), vec![1; 12]),
             0,
-        ));
-        let child_inner = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        );
+        let child_inner = SHAMapTreeNode::new_inner(1);
         child_inner.set_child_hash(2, leaf.get_hash());
         child_inner.share_child(2, &leaf);
         child_inner.update_hash_deep();
 
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(3, child_inner.get_hash());
         root.share_child(3, &child_inner);
         root.update_hash_deep();
@@ -6390,22 +6441,22 @@ mod tests {
 
     #[test]
     fn get_node_fat_can_include_immediate_inner_children_without_fat_leaves() {
-        let left_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let left_leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(sample_uint256(0x10), vec![1; 12]),
             0,
-        ));
-        let deep_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        );
+        let deep_leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(sample_uint256(0x40), vec![2; 12]),
             0,
-        ));
-        let inner_child = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        );
+        let inner_child = SHAMapTreeNode::new_inner(1);
         inner_child.set_child_hash(4, deep_leaf.get_hash());
         inner_child.share_child(4, &deep_leaf);
         inner_child.update_hash_deep();
 
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(1, left_leaf.get_hash());
         root.share_child(1, &left_leaf);
         root.set_child_hash(4, inner_child.get_hash());
@@ -6437,7 +6488,7 @@ mod tests {
 
     #[test]
     fn get_node_fat_returns_false_for_missing_requested_branches() {
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(1, sample_hash(0x11));
         root.update_hash();
 
@@ -6494,13 +6545,13 @@ mod native_missing_node_continuation_tests {
 
     #[test]
     fn duplicate_edges_emit_one_read_and_one_network_candidate() {
-        let child = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let child = SHAMapTreeNode::new_leaf(
             crate::tree_node::SHAMapNodeType::AccountState,
             SHAMapItem::new(Uint256::from_array([0x12; 32]), vec![0x12; 12]),
             1,
-        ));
+        );
         let child_hash = child.get_hash();
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(1, child_hash);
         root.set_child_hash(2, child_hash);
         root.update_hash();
@@ -6549,15 +6600,15 @@ mod native_missing_node_continuation_tests {
 
     #[test]
     fn fat_reply_descendant_attaches_by_node_id_before_it_is_requested() {
-        let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let leaf = SHAMapTreeNode::new_leaf(
             crate::tree_node::SHAMapNodeType::AccountState,
             SHAMapItem::new(Uint256::from_array([0x12; 32]), vec![0x44; 12]),
             1,
-        ));
-        let parent = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        );
+        let parent = SHAMapTreeNode::new_inner(1);
         parent.set_child_hash(2, leaf.get_hash());
         parent.update_hash();
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(1, parent.get_hash());
         root.update_hash();
 
@@ -6607,12 +6658,12 @@ mod native_missing_node_continuation_tests {
 
     #[test]
     fn peer_node_id_cannot_redirect_a_requested_hash() {
-        let child = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let child = SHAMapTreeNode::new_leaf(
             crate::tree_node::SHAMapNodeType::AccountState,
             SHAMapItem::new(Uint256::from_array([0x10; 32]), vec![0x55; 12]),
             1,
-        ));
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        );
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(1, child.get_hash());
         root.update_hash();
         let mut continuation = continuation(&root, 1);
@@ -6634,7 +6685,7 @@ mod native_missing_node_continuation_tests {
 
     #[test]
     fn reply_wire_batch_waits_until_deferred_reads_settle() {
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(0, hash(0x2f));
         root.update_hash();
         let mut continuation = continuation(&root, 32);
@@ -6686,7 +6737,7 @@ mod native_missing_node_continuation_tests {
 
     #[test]
     fn reply_scan_refreshes_exhausted_discovery_credit_and_root_walk() {
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(0, hash(0x3f));
         root.update_hash();
         let mut continuation = continuation(&root, 256);
@@ -6714,7 +6765,7 @@ mod native_missing_node_continuation_tests {
     #[test]
     fn rejected_and_cancelled_reads_rearm_the_unique_waiter_with_diagnostics() {
         let child_hash = hash(0x45);
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(0, child_hash);
         root.update_hash();
         let mut continuation = continuation(&root, 45);
@@ -6759,7 +6810,7 @@ mod native_missing_node_continuation_tests {
     #[test]
     fn dormant_operation_reset_rearms_retained_read_edge_idempotently() {
         let child_hash = hash(0x47);
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(0, child_hash);
         root.update_hash();
         let mut continuation = continuation(&root, 47);
@@ -6789,7 +6840,7 @@ mod native_missing_node_continuation_tests {
     #[test]
     fn reply_scan_reuses_network_waiter_without_repeating_db_read_or_edge() {
         let child_hash = hash(0x46);
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(0, child_hash);
         root.update_hash();
         let mut continuation = continuation(&root, 46);
@@ -6832,10 +6883,10 @@ mod native_missing_node_continuation_tests {
     #[test]
     fn exhausted_missing_budget_waits_for_admitted_read_without_spinning() {
         let missing_hash = hash(0x41);
-        let loaded_child = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let loaded_child = SHAMapTreeNode::new_inner(1);
         loaded_child.set_child_hash(0, hash(0x43));
         loaded_child.update_hash();
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(0, missing_hash);
         root.set_child_hash(1, loaded_child.get_hash());
         root.canonicalize_child(1, loaded_child);
@@ -6890,10 +6941,10 @@ mod native_missing_node_continuation_tests {
     #[test]
     fn runnable_ready_turn_always_consumes_a_branch_step() {
         let unloaded_grandchild = hash(0x51);
-        let loaded_child = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let loaded_child = SHAMapTreeNode::new_inner(1);
         loaded_child.set_child_hash(0, unloaded_grandchild);
         loaded_child.update_hash();
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(0, loaded_child.get_hash());
         root.canonicalize_child(0, loaded_child);
         root.update_hash();
@@ -6920,10 +6971,10 @@ mod native_missing_node_continuation_tests {
     #[test]
     fn found_result_resumes_frontier_without_waiting_for_other_results() {
         let grandchild_hash = hash(0x52);
-        let child = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let child = SHAMapTreeNode::new_inner(1);
         child.set_child_hash(4, grandchild_hash);
         child.update_hash();
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(3, child.get_hash());
         root.update_hash();
         let mut continuation = continuation(&root, 2);
@@ -6959,12 +7010,12 @@ mod native_missing_node_continuation_tests {
     #[test]
     fn local_read_batches_attach_strongly_publish_full_below_and_survive_next_scan() {
         fn complete_inner(fill: u8) -> SharedIntrusive<SHAMapTreeNode> {
-            let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+            let leaf = SHAMapTreeNode::new_leaf(
                 crate::tree_node::SHAMapNodeType::AccountState,
                 SHAMapItem::new(Uint256::from_array([fill; 32]), vec![fill; 12]),
                 1,
-            ));
-            let inner = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+            );
+            let inner = SHAMapTreeNode::new_inner(1);
             inner.set_child_hash(0, leaf.get_hash());
             inner.canonicalize_child(0, leaf);
             inner.update_hash();
@@ -6975,7 +7026,7 @@ mod native_missing_node_continuation_tests {
         let second = complete_inner(0x82);
         let first_hash = first.get_hash();
         let second_hash = second.get_hash();
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(0, first_hash);
         root.set_child_hash(1, second_hash);
         root.update_hash();
@@ -7065,24 +7116,24 @@ mod native_missing_node_continuation_tests {
     fn dense_local_tree_over_two_deferred_rounds_completes_and_publishes_full_below() {
         let mut next_item = 1u64;
         let mut local_nodes = BTreeMap::new();
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
 
         // Five complete 16x16 subtrees produce 1,365 non-root reads. This is
         // deliberately larger than two rippled-sized 512-read deferred rounds.
         for top_branch in 0..5 {
-            let top = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+            let top = SHAMapTreeNode::new_inner(1);
             for middle_branch in 0..BRANCH_FACTOR {
-                let middle = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+                let middle = SHAMapTreeNode::new_inner(1);
                 for leaf_branch in 0..BRANCH_FACTOR {
                     let tag = next_item;
                     next_item += 1;
                     let mut payload = vec![0u8; 12];
                     payload[4..].copy_from_slice(&tag.to_be_bytes());
-                    let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+                    let leaf = SHAMapTreeNode::new_leaf(
                         crate::tree_node::SHAMapNodeType::AccountState,
                         SHAMapItem::new(Uint256::from(tag), payload),
                         1,
-                    ));
+                    );
                     middle.set_child_hash(leaf_branch, leaf.get_hash());
                     local_nodes.insert(leaf.get_hash(), leaf);
                 }
@@ -7179,15 +7230,15 @@ mod native_missing_node_continuation_tests {
     fn mixed_local_hits_and_256_misses_drain_to_one_network_frontier() {
         let mut found_nodes = BTreeMap::new();
         let mut missing_hashes = BTreeSet::new();
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
 
         // Every root branch and every middle branch is a local hit, followed
         // by one distinct miss. The scan must stop at the 256-candidate source
         // boundary even though local hits continuously expose more traversal.
         for top_branch in 0..BRANCH_FACTOR {
-            let top = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+            let top = SHAMapTreeNode::new_inner(1);
             for middle_branch in 0..BRANCH_FACTOR {
-                let middle = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+                let middle = SHAMapTreeNode::new_inner(1);
                 let ordinal = top_branch * BRANCH_FACTOR + middle_branch + 1;
                 let missing = SHAMapHash::new(Uint256::from(10_000u64 + ordinal as u64));
                 middle.set_child_hash(0, missing);
@@ -7252,13 +7303,13 @@ mod native_missing_node_continuation_tests {
 
     #[test]
     fn retained_edge_bound_blocks_cpu_until_a_result_releases_capacity() {
-        let first = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let first = SHAMapTreeNode::new_leaf(
             crate::tree_node::SHAMapNodeType::AccountState,
             SHAMapItem::new(Uint256::from_array([0x71; 32]), vec![0x71; 12]),
             1,
-        ));
+        );
         let second_hash = hash(0x72);
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(0, first.get_hash());
         root.set_child_hash(1, second_hash);
         root.update_hash();
@@ -7324,7 +7375,7 @@ mod native_missing_node_continuation_tests {
     #[test]
     fn stale_and_hash_mismatched_results_cannot_mutate_a_plan() {
         let child_hash = hash(0x63);
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(1, child_hash);
         root.update_hash();
         let mut continuation = continuation(&root, 3);
@@ -7340,7 +7391,7 @@ mod native_missing_node_continuation_tests {
             MissingNodeReadApply::StalePlan
         );
         assert_eq!(continuation.pending_hashes(), 1);
-        let wrong = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let wrong = SHAMapTreeNode::new_inner(1);
         wrong.set_child_hash(2, hash(0x64));
         wrong.update_hash();
         assert_ne!(wrong.get_hash(), child_hash);

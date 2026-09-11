@@ -40,9 +40,9 @@ use crate::state::accept_ledger_pending_apply::AcceptLedgerPendingApplyRuntime;
 use crate::state::app_registry::{
     AppAcceptedLedgerCache, AppConfig, AppInboundLedgers, AppInboundTransactions, AppLogs,
     AppOpenLedgerTxRecord, AppOpenLedgerView, AppPlaceholder, AppQueueApplyTxSource,
-    AppRequiredFeeView, AppServerHandler, AppTxQAccount, AppTxQJournalTag, AppTxQLock,
-    AppTxQParentBatchId, AppTxQTransaction, ApplicationRegistryOwners, RelayUntrustedPolicy,
-    SharedAppOpenLedger, SharedAppTxQ,
+    AppRequiredFeeView, AppServerHandler, AppTempNodeCache, AppTxQAccount, AppTxQJournalTag,
+    AppTxQLock, AppTxQParentBatchId, AppTxQTransaction, ApplicationRegistryOwners,
+    RelayUntrustedPolicy, SharedAppOpenLedger, SharedAppTxQ,
 };
 use crate::state::basic_app::BasicApp;
 use crate::state::candidate_diagnostics::{
@@ -7750,6 +7750,12 @@ impl ApplicationRoot {
         Arc::clone(&self.transaction_master)
     }
 
+    /// Returns the application-owned raw consensus transaction-set NodeCache.
+    /// Bootstrap sweeps it from the configured `Application::doSweep` cadence.
+    pub fn temp_node_cache(&self) -> &AppTempNodeCache {
+        &self.registry.temp_node_cache
+    }
+
     pub fn fetch_cached_transaction(&self, txn_id: &Uint256) -> Option<SharedTransaction> {
         self.transaction_master.fetch_from_cache(txn_id)
     }
@@ -11322,7 +11328,7 @@ impl ServiceRegistry for ApplicationRoot {
     type NodeFamily = Option<Arc<dyn NodeFamilyRuntime>>;
     type TimeKeeper = Arc<TimeKeeper<SystemTimeKeeperClock>>;
     type JobQueue = JobQueue;
-    type TempNodeCache = Arc<shamap::tree_node_cache::TreeNodeCache>;
+    type TempNodeCache = AppTempNodeCache;
     type CachedSles = Arc<ledger::CachedSles>;
     type NetworkIdService = FixedNetworkIdService;
     type AmendmentTable = Arc<AmendmentStatus>;

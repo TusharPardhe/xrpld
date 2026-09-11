@@ -3656,7 +3656,7 @@ mod tests;
 #[cfg(test)]
 mod tree_plan_facade_tests {
     use super::*;
-    use basics::intrusive_pointer::{SharedIntrusive, make_shared_intrusive};
+    use basics::intrusive_pointer::SharedIntrusive;
     use shamap::sync::{MissingNodeResidentLookup, SyncState};
 
     struct NoResident;
@@ -3673,14 +3673,14 @@ mod tree_plan_facade_tests {
 
     #[test]
     fn tree_plan_facade_forwards_retained_edges_and_wait_state_without_ownership() {
-        let child = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let child = SHAMapTreeNode::new_leaf(
             shamap::nodes::tree_node::SHAMapNodeType::AccountState,
             shamap::item::SHAMapItem::new(Uint256::from_array([0x42; 32]), vec![42; 12]),
             1,
-        ));
+        );
         let child_hash = child.get_hash();
         assert!(child_hash.is_non_zero());
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(1, child_hash);
         root.set_child_hash(2, child_hash);
         root.update_hash();

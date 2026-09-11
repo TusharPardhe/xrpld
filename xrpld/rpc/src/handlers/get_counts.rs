@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use basics::counted_object::CountedObjects;
+use basics::memory::malloc_trim::jemalloc_stats;
 use basics::uptime_clock::{UptimeClock, UptimeTimePoint};
 use protocol::JsonValue;
 
@@ -41,6 +42,8 @@ pub trait GetCountsSource {
     fn fullbelow_size(&self) -> i64;
 
     fn treenode_cache_size(&self) -> u64;
+
+    fn treenode_cache_capacity_entries(&self) -> u64;
 
     fn treenode_track_size(&self) -> u64;
 
@@ -175,6 +178,10 @@ pub fn get_counts_json<S: GetCountsSource>(source: &S, min_count: u32) -> JsonVa
         JsonValue::Unsigned(source.treenode_cache_size()),
     );
     result.insert(
+        "treenode_cache_capacity_entries".to_owned(),
+        JsonValue::Unsigned(source.treenode_cache_capacity_entries()),
+    );
+    result.insert(
         "treenode_track_size".to_owned(),
         JsonValue::Unsigned(source.treenode_track_size()),
     );
@@ -182,6 +189,37 @@ pub fn get_counts_json<S: GetCountsSource>(source: &S, min_count: u32) -> JsonVa
         "uptime".to_owned(),
         JsonValue::String(format_uptime(UptimeClock::now())),
     );
+
+    if let Some(stats) = jemalloc_stats() {
+        result.insert(
+            "jemalloc_allocated_bytes".to_owned(),
+            JsonValue::Unsigned(stats.allocated_bytes as u64),
+        );
+        result.insert(
+            "jemalloc_active_bytes".to_owned(),
+            JsonValue::Unsigned(stats.active_bytes as u64),
+        );
+        result.insert(
+            "jemalloc_metadata_bytes".to_owned(),
+            JsonValue::Unsigned(stats.metadata_bytes as u64),
+        );
+        result.insert(
+            "jemalloc_mapped_bytes".to_owned(),
+            JsonValue::Unsigned(stats.mapped_bytes as u64),
+        );
+        result.insert(
+            "jemalloc_resident_bytes".to_owned(),
+            JsonValue::Unsigned(stats.resident_bytes as u64),
+        );
+        result.insert(
+            "jemalloc_retained_bytes".to_owned(),
+            JsonValue::Unsigned(stats.retained_bytes as u64),
+        );
+        result.insert(
+            "jemalloc_arenas".to_owned(),
+            JsonValue::Unsigned(u64::from(stats.arenas)),
+        );
+    }
 
     source.add_node_store_counts(&mut result);
 

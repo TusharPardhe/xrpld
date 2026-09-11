@@ -45,14 +45,21 @@ fn database_counts_json_reports_expected_node_store_fields() {
     };
     let expected_keys = [
         "node_object_cache_capacity_bytes",
+        "node_object_cache_capacity_bytes_is_estimate",
+        "node_object_cache_capacity_entries",
         "node_object_cache_durable_loads",
         "node_object_cache_entries",
+        "node_object_cache_eviction_policy",
         "node_object_cache_hits",
+        "node_object_cache_idle_seconds",
         "node_object_cache_invalidations",
         "node_object_cache_misses",
         "node_object_cache_oversized",
         "node_object_cache_promotions",
         "node_object_cache_rejected",
+        "node_object_cache_ttl_seconds",
+        "node_object_cache_weighted_capacity_bytes",
+        "node_object_cache_weighted_size_bytes",
         "node_read_bytes",
         "node_reads_duration_us",
         "node_reads_hit",
@@ -117,7 +124,30 @@ fn rotating_database_counts_json_reports_the_same_public_fields() {
     let JsonValue::Object(counts) = database.get_counts_json() else {
         panic!("counts json should be an object");
     };
-    assert_eq!(counts.len(), 19);
+    assert_eq!(counts.len(), 26);
+    assert_eq!(
+        counts.get("node_object_cache_eviction_policy"),
+        Some(&JsonValue::String("disabled".to_owned()))
+    );
+    for key in [
+        "node_object_cache_capacity_entries",
+        "node_object_cache_capacity_bytes",
+        "node_object_cache_weighted_capacity_bytes",
+        "node_object_cache_weighted_size_bytes",
+        "node_object_cache_entries",
+        "node_object_cache_hits",
+        "node_object_cache_promotions",
+    ] {
+        assert_eq!(
+            counts.get(key),
+            Some(&JsonValue::String("0".to_owned())),
+            "{key}"
+        );
+    }
+    assert_eq!(
+        counts.get("node_object_cache_capacity_bytes_is_estimate"),
+        Some(&JsonValue::Bool(false))
+    );
     assert!(matches!(
         counts.get("read_request_bundle"),
         Some(JsonValue::Signed(4))

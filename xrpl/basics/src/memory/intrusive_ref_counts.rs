@@ -6,7 +6,10 @@
 //! - one bit for "partial destroy started",
 //! - one bit for "partial destroy finished".
 
+use std::collections::HashMap;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,9 +25,53 @@ pub enum ReleaseWeakRefAction {
     Destroy,
 }
 
+#[derive(Clone, Copy)]
+enum OwnerDispatchAction {
+    FinalDestroy,
+    PartialDestroy,
+}
+
+type OwnerDispatch = unsafe fn(*mut (), OwnerDispatchAction);
+
+#[derive(Clone, Copy)]
+struct OwnerMetadata {
+    ptr: usize,
+    dispatch: usize,
+}
+
+// The intrusive control word must remain four bytes to match the reference
+// node layouts. Allocation-specific destruction metadata therefore lives in a
+// process-wide registry keyed by the address of that control word. The entry
+// exists from first adoption through the final weak release, which is exactly
+// the lifetime over which dispatch is needed.
+fn owner_registry() -> &'static Mutex<HashMap<usize, OwnerMetadata>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<usize, OwnerMetadata>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+unsafe fn dispatch_owner<T: crate::intrusive_pointer::IntrusiveObject>(
+    ptr: *mut (),
+    action: OwnerDispatchAction,
+) {
+    match action {
+        OwnerDispatchAction::FinalDestroy => unsafe { drop(Box::from_raw(ptr.cast::<T>())) },
+        OwnerDispatchAction::PartialDestroy => unsafe { (&*ptr.cast::<T>()).partial_destructor() },
+    }
+}
 #[derive(Debug)]
 pub struct IntrusiveRefCounts {
     ref_counts: AtomicU32,
+}
+
+/// Marks partial destruction complete even when the user callback unwinds.
+/// The final weak release waits for this marker before it can destroy the
+/// allocation shell, so this guard must outlive the callback invocation.
+struct PartialDestroyCompletion<'a>(&'a IntrusiveRefCounts);
+
+impl Drop for PartialDestroyCompletion<'_> {
+    fn drop(&mut self) {
+        self.0.partial_destructor_finished();
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +81,9 @@ struct RefCountPair {
     partial_destroy_started_bit: u32,
     partial_destroy_finished_bit: u32,
 }
+
+const _: () = assert!(std::mem::size_of::<IntrusiveRefCounts>() == 4);
+const _: () = assert!(std::mem::align_of::<IntrusiveRefCounts>() == 4);
 
 impl Default for IntrusiveRefCounts {
     fn default() -> Self {
@@ -63,6 +113,91 @@ impl IntrusiveRefCounts {
         Self {
             ref_counts: AtomicU32::new(Self::STRONG_DELTA),
         }
+    }
+
+    /// Registers the original concrete allocation exactly once. Views produced
+    /// by intrusive casts share this control word, so the final destroy always
+    /// uses the allocation's original type rather than a cast view.
+    pub fn initialize_owner_metadata<T: crate::intrusive_pointer::IntrusiveObject>(
+        &self,
+        ptr: NonNull<T>,
+    ) {
+        let key = self as *const Self as usize;
+        let metadata = OwnerMetadata {
+            ptr: ptr.cast::<()>().as_ptr() as usize,
+            dispatch: dispatch_owner::<T> as usize,
+        };
+        // Invalid raw-adoption tests intentionally panic. Drop the process-wide
+        // lock before validating an existing record so those expected panics
+        // cannot poison unrelated intrusive lifetimes.
+        let existing = {
+            let mut registry = owner_registry()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            match registry.entry(key) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(metadata);
+                    None
+                }
+                std::collections::hash_map::Entry::Occupied(entry) => Some(*entry.get()),
+            }
+        };
+        if let Some(existing) = existing {
+            assert_eq!(
+                existing.ptr, metadata.ptr,
+                "intrusive owner metadata was initialized for another allocation"
+            );
+            assert_eq!(
+                existing.dispatch, metadata.dispatch,
+                "intrusive owner metadata was initialized for another type"
+            );
+        }
+    }
+
+    pub fn dispatch_partial_destroy(&self) {
+        self.dispatch_partial_destroy_with(|| {
+            let metadata = self.owner_metadata();
+            let dispatch: OwnerDispatch = unsafe { std::mem::transmute(metadata.dispatch) };
+            unsafe { dispatch(metadata.ptr as *mut (), OwnerDispatchAction::PartialDestroy) };
+        });
+    }
+
+    /// Runs an object-specific partial destructor while guaranteeing that the
+    /// retained allocation shell becomes eligible for final weak release even
+    /// if the callback unwinds.
+    pub fn dispatch_partial_destroy_with(&self, callback: impl FnOnce()) {
+        let _completion = PartialDestroyCompletion(self);
+        callback();
+    }
+
+    pub fn dispatch_final_destroy(&self) {
+        let key = self as *const Self as usize;
+        let metadata = owner_registry()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(&key)
+            .expect("intrusive owner metadata was not initialized");
+        let dispatch: OwnerDispatch = unsafe { std::mem::transmute(metadata.dispatch) };
+        unsafe { dispatch(metadata.ptr as *mut (), OwnerDispatchAction::FinalDestroy) };
+    }
+
+    /// Returns whether this control word uses the generic out-of-object owner
+    /// metadata path. Compact polymorphic objects may provide their own
+    /// concrete destruction dispatch and deliberately return false.
+    pub fn has_registered_owner_metadata(&self) -> bool {
+        owner_registry()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .contains_key(&(self as *const Self as usize))
+    }
+
+    fn owner_metadata(&self) -> OwnerMetadata {
+        let key = self as *const Self as usize;
+        *owner_registry()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(&key)
+            .expect("intrusive owner metadata was not initialized")
     }
 
     pub fn add_strong_ref(&self) {
@@ -205,6 +340,10 @@ impl IntrusiveRefCounts {
 
     pub fn use_count(&self) -> usize {
         RefCountPair::from_raw(self.ref_counts.load(Ordering::Acquire)).strong as usize
+    }
+
+    pub fn partial_destroy_started(&self) -> bool {
+        (self.ref_counts.load(Ordering::Acquire) & Self::PARTIAL_DESTROY_STARTED_MASK) != 0
     }
 
     pub fn partial_destructor_finished(&self) {

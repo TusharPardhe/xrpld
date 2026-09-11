@@ -222,14 +222,14 @@ fn inbound_try_db_prefers_local_header_source() {
 
 #[test]
 fn inbound_try_db_fetch_pack_path_completes_when_header_and_state_root_are_local() {
-    let state_root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let state_root = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         shamap::item::SHAMapItem::new(
             Uint256::from_array([0x42; 32]),
             vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
         ),
         0,
-    ));
+    );
     let state_blob = state_root
         .serialize_with_prefix()
         .expect("state root prefix serialization should succeed");
@@ -375,15 +375,15 @@ fn inbound_try_db_rejects_mismatched_header_identity() {
 
 #[test]
 fn inbound_try_db_keeps_synching_when_get_missing_nodes_reports_missing_hash() {
-    let state_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let state_leaf = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         shamap::item::SHAMapItem::new(
             Uint256::from_array([0x61; 32]),
             vec![9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 9, 8, 7, 6, 5, 4],
         ),
         0,
-    ));
-    let state_root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    );
+    let state_root = SHAMapTreeNode::new_inner(1);
     state_root.set_child_hash(3, state_leaf.get_hash());
     state_root.update_hash();
     // Save the hash before state_root is moved into the fetcher.

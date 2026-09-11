@@ -12,10 +12,11 @@ path = "src/lib.rs"
 [dependencies]
 acquisition = { path = "../acquisition" }
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
+tikv-jemallocator = "=0.6.1"
 tracing = "0.1"
 quaxar-metrics = { path = "../metrics" }
 parking_lot = "0.12"
-basics = { path = "../../xrpl/basics" }
+basics = { path = "../../xrpl/basics", features = ["jemalloc"] }
 bs58 = "0.5"
 bytes = "1"
 consensus = { path = "../consensus" }

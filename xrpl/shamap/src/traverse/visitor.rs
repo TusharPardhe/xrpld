@@ -186,7 +186,7 @@ mod tests {
     use crate::tree_node::{SHAMapNodeType, SHAMapTreeNode};
     use crate::tree_node_cache::TreeNodeCache;
     use basics::base_uint::Uint256;
-    use basics::intrusive_pointer::{SharedIntrusive, make_shared_intrusive};
+    use basics::intrusive_pointer::SharedIntrusive;
     use basics::sha_map_hash::SHAMapHash;
     use basics::tagged_cache::ManualClock;
     use std::sync::{Arc, Mutex};
@@ -229,37 +229,37 @@ mod tests {
         SharedIntrusive<SHAMapTreeNode>,
         SharedIntrusive<SHAMapTreeNode>,
     ) {
-        let left_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let left_leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(
                 key("1000000000000000000000000000000000000000000000000000000000000000"),
                 vec![1; 12],
             ),
             0,
-        ));
-        let deep_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        );
+        let deep_leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(
                 key("4100000000000000000000000000000000000000000000000000000000000000"),
                 vec![2; 12],
             ),
             0,
-        ));
-        let right_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        );
+        let right_leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(
                 key("9000000000000000000000000000000000000000000000000000000000000000"),
                 vec![3; 12],
             ),
             0,
-        ));
+        );
 
-        let middle_inner = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let middle_inner = SHAMapTreeNode::new_inner(1);
         middle_inner.set_child_hash(1, deep_leaf.get_hash());
         middle_inner.share_child(1, &deep_leaf);
         middle_inner.update_hash_deep();
 
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(1, left_leaf.get_hash());
         root.share_child(1, &left_leaf);
         root.set_child_hash(4, middle_inner.get_hash());
@@ -332,7 +332,7 @@ mod tests {
 
     #[test]
     fn visit_nodes_fetches_without_attaching_children() {
-        let fetched_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf_with_hash(
+        let fetched_leaf = SHAMapTreeNode::new_leaf_with_hash(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(
                 key("2000000000000000000000000000000000000000000000000000000000000000"),
@@ -340,8 +340,8 @@ mod tests {
             ),
             0,
             sample_hash(0xCC),
-        ));
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        );
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(2, sample_hash(0xCC));
 
         let mut visited = Vec::new();
@@ -377,7 +377,7 @@ mod tests {
             fn missing_node_acquire_by_hash(&self, _ref_hash: Uint256, _ref_num: u32) {}
         }
 
-        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let root = SHAMapTreeNode::new_inner(1);
         root.set_child_hash(2, sample_hash(0xCD));
 
         let reporter = Arc::new(Mutex::new(RecordingMissingNodeReporter::default()));

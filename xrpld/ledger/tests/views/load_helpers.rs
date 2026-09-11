@@ -169,11 +169,11 @@ fn get_latest_ledger_with_provider_and_config_returns_none_and_zeroes_for_missin
 
 #[test]
 fn get_latest_ledger_with_provider_and_config_returns_loaded_ledger_and_original_header_identity() {
-    let tx_root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let tx_root = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::TransactionNm,
         SHAMapItem::new(sample_uint256(0xB7), vec![0x33; 20]),
         0,
-    ));
+    );
     let state_map = build_state_map_with_items(
         &[
             (
@@ -287,11 +287,11 @@ fn get_latest_ledger_with_provider_and_config_preserves_seq_and_hash_when_load_f
 #[test]
 fn ledger_finish_load_by_index_or_hash_rehashes_logs_and_marks_full() {
     let preset = sample_uint256(0x99);
-    let tx_root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let tx_root = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::TransactionNm,
         SHAMapItem::new(sample_uint256(0x9A), vec![0xCD; 20]),
         0,
-    ));
+    );
     let mut state_map = build_state_map_with_items(
         &[
             (
@@ -365,7 +365,7 @@ fn ledger_finish_load_by_index_or_hash_rehashes_logs_and_marks_full() {
 
 #[test]
 fn ledger_fetching_state_root_does_not_mark_map_full_before_walkledger() {
-    let root = make_shared_intrusive(SHAMapTreeNode::new_inner(0));
+    let root = SHAMapTreeNode::new_inner(0);
     root.update_hash();
 
     let mut ledger = Ledger::new(

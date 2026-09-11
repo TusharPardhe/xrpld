@@ -47,11 +47,11 @@ fn payment_tx(
 }
 
 fn state_leaf(fill: u8) -> SharedIntrusive<SHAMapTreeNode> {
-    make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         SHAMapItem::new(sample_hash(fill), vec![fill; 12]),
         0,
-    ))
+    )
 }
 
 fn immutable_ledger(seq: u32, parent_fill: u8, account_fill: u8) -> Arc<Ledger> {

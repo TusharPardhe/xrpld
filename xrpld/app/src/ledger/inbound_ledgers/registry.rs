@@ -20,8 +20,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use acquisition::{
-    AcquisitionEffect, AcquisitionEvent, BudgetState, CoordinatorRunner,
-    DurableHandoffAcknowledgement, DurableHandoffId, RunEpoch, RunnerSnapshot, SessionRef,
+    AcquisitionEffect, BudgetState, CoordinatorRunner, DurableHandoffId, RunEpoch, RunnerSnapshot,
+    SessionRef,
 };
 
 use crate::network::network_ops::AppNetworkOpsModeOwner;
@@ -784,6 +784,8 @@ pub struct InboundLedgers {
     /// resolves when a Base/header packet arrives. Registered exactly once per
     /// requested session.
     coordinator_origins: CoordinatorSessionOrigins,
+    /// Node-size-derived cap installed into the production coordinator.
+    coordinator_budget: BudgetState,
     /// Newest NodeStore generation published by the online-delete worker.
     /// Only the serialized coordinator owner consumes and applies this fact.
     pending_store_generation: AtomicU64,
@@ -802,19 +804,41 @@ impl InboundLedgers {
         completed_ledgers_tx: SyncSender<CompletedInboundLedger>,
         need_network_ledger: Arc<AtomicBool>,
     ) -> Self {
-        Self::with_worker_pool(
+        Self::new_with_budget(
+            tree_cache,
+            full_below,
+            fetch_pack,
+            completed_ledgers_tx,
+            need_network_ledger,
+            BudgetState::default(),
+        )
+    }
+
+    /// Construct the production registry with an explicit node-size-derived
+    /// coordinator budget. Existing callers retain the medium default above.
+    pub fn new_with_budget(
+        tree_cache: Arc<TreeNodeCache<MonotonicClock>>,
+        full_below: Arc<FullBelowCacheImpl<MonotonicClock, HardenedHashBuilder>>,
+        fetch_pack: Arc<FetchPackCache>,
+        completed_ledgers_tx: SyncSender<CompletedInboundLedger>,
+        need_network_ledger: Arc<AtomicBool>,
+        coordinator_budget: BudgetState,
+    ) -> Self {
+        Self::with_worker_pool_and_budget(
             tree_cache,
             full_below,
             fetch_pack,
             completed_ledgers_tx,
             need_network_ledger,
             Arc::new(WorkerPool::new(WORKER_COUNT)),
+            coordinator_budget,
         )
     }
 
     /// Construct the registry around its worker queue. Production always uses
     /// the fixed-size pool above; tests provide a zero-worker pool so they can
     /// prove real ingress scheduling and draining without timing races.
+    #[cfg(test)]
     fn with_worker_pool(
         tree_cache: Arc<TreeNodeCache<MonotonicClock>>,
         full_below: Arc<FullBelowCacheImpl<MonotonicClock, HardenedHashBuilder>>,
@@ -822,6 +846,26 @@ impl InboundLedgers {
         completed_ledgers_tx: SyncSender<CompletedInboundLedger>,
         need_network_ledger: Arc<AtomicBool>,
         worker_pool: Arc<WorkerPool>,
+    ) -> Self {
+        Self::with_worker_pool_and_budget(
+            tree_cache,
+            full_below,
+            fetch_pack,
+            completed_ledgers_tx,
+            need_network_ledger,
+            worker_pool,
+            BudgetState::default(),
+        )
+    }
+
+    fn with_worker_pool_and_budget(
+        tree_cache: Arc<TreeNodeCache<MonotonicClock>>,
+        full_below: Arc<FullBelowCacheImpl<MonotonicClock, HardenedHashBuilder>>,
+        fetch_pack: Arc<FetchPackCache>,
+        completed_ledgers_tx: SyncSender<CompletedInboundLedger>,
+        need_network_ledger: Arc<AtomicBool>,
+        worker_pool: Arc<WorkerPool>,
+        coordinator_budget: BudgetState,
     ) -> Self {
         let scheduler = AcquisitionReadyScheduler::new(Arc::clone(&worker_pool));
         Self {
@@ -856,6 +900,7 @@ impl InboundLedgers {
             coordinator: Mutex::new(None),
             coordinator_ingress: RwLock::new(None),
             coordinator_origins: CoordinatorSessionOrigins::default(),
+            coordinator_budget,
             pending_store_generation: AtomicU64::new(0),
             coordinator_phase: RwLock::new(None),
         }
@@ -983,7 +1028,7 @@ impl InboundLedgers {
         );
         let runner = CoordinatorRunner::with_plan_seed(
             RunEpoch::new(1),
-            BudgetState::default(),
+            self.coordinator_budget,
             Box::new(seed),
         );
         let adapter = build_coordinator_adapter(CoordinatorPortResources {
@@ -1397,21 +1442,49 @@ impl InboundLedgers {
 
     /// Submit a durable-handoff acknowledgement after the NetworkOps recipient
     /// has processed the exact completed-ledger item. This bridge owns no
-    /// lifecycle decision: it only enqueues the typed acknowledgement for the
-    /// installed coordinator. The strand drains it on its next owner turn, so
-    /// no completed-ledger receiver/resource lock invokes coordinator logic.
+    /// lifecycle decision: it retains the typed acknowledgement in the
+    /// adapter's bounded priority lane. The strand processes that lane before
+    /// completion producers can refill shared control slots, while still
+    /// deferring all runner mutation to the next owner drain.
     pub(crate) fn acknowledge_coordinator_durable_handoff(
         &self,
         handoff: DurableHandoffId,
         session: SessionRef,
     ) -> bool {
-        let guard = self.coordinator.lock().expect("coordinator lock");
-        let Some(coordinator) = guard.as_ref() else {
+        let mut guard = self.coordinator.lock().expect("coordinator lock");
+        let Some(coordinator) = guard.as_mut() else {
             return false;
         };
-        coordinator.try_push_control(AcquisitionEvent::DurableHandoffAcknowledged(
-            DurableHandoffAcknowledgement::new(handoff, session),
-        ))
+        coordinator.retain_durable_handoff_ack(handoff, session)
+    }
+
+    /// True only while the coordinator still awaits this exact recipient ack.
+    /// This filters delayed duplicate completed-ledger deliveries after the
+    /// original session has already transitioned to `Complete`.
+    pub(crate) fn coordinator_durable_handoff_is_pending(
+        &self,
+        handoff: DurableHandoffId,
+        session: SessionRef,
+    ) -> bool {
+        self.coordinator
+            .lock()
+            .expect("coordinator lock")
+            .as_ref()
+            .is_some_and(|coordinator| coordinator.durable_handoff_is_pending(handoff, session))
+    }
+
+    /// Drain exact acknowledgements that the coordinator owner has already
+    /// consumed. A successful control-queue enqueue never appears here until
+    /// the matching runner session transitions to `Complete`.
+    pub(crate) fn take_processed_coordinator_durable_acks(
+        &self,
+    ) -> Vec<(DurableHandoffId, SessionRef)> {
+        self.coordinator
+            .lock()
+            .expect("coordinator lock")
+            .as_mut()
+            .map(|coordinator| coordinator.take_processed_durable_acks())
+            .unwrap_or_default()
     }
 
     /// Report that the NetworkOps recipient could not accept an exact durable

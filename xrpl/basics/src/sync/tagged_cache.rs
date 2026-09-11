@@ -17,13 +17,12 @@ use crate::intrusive_pointer::{
 use crate::mutex::RecursiveMutex;
 use crate::partitioned_unordered_map::{PartitionKey, PartitionedUnorderedMap};
 use crate::shared_weak_cache_pointer::SharedWeakCachePointer;
-use dashmap::DashMap;
 use std::borrow::Borrow;
 use std::collections::HashMap as StdHashMap;
 use std::fmt;
 use std::hash::{BuildHasher, Hash};
 use std::ops::Deref;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use time::Duration;
@@ -375,8 +374,6 @@ pub struct TaggedCache<
     target_age: Duration,
     clock: C,
     instrumentation: TaggedCacheInstrumentation,
-    fast_map: DashMap<K, SP, S>,
-    fast_hits: AtomicU64,
     state: RecursiveMutex<TaggedCacheState<K, T, P, SP, S>>,
 }
 
@@ -433,8 +430,6 @@ where
             target_age: expiration,
             clock,
             instrumentation: TaggedCacheInstrumentation::default(),
-            fast_map: DashMap::with_hasher(hasher.clone()),
-            fast_hits: AtomicU64::new(0),
             state: RecursiveMutex::new(TaggedCacheState {
                 cache_count: 0,
                 cache: PartitionedUnorderedMap::with_hasher(None, hasher),
@@ -459,8 +454,6 @@ where
             target_age: expiration,
             clock,
             instrumentation: TaggedCacheInstrumentation { metrics, logger },
-            fast_map: DashMap::with_hasher(hasher.clone()),
-            fast_hits: AtomicU64::new(0),
             state: RecursiveMutex::new(TaggedCacheState {
                 cache_count: 0,
                 cache: PartitionedUnorderedMap::with_hasher(None, hasher),
@@ -472,6 +465,14 @@ where
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub const fn target_size(&self) -> usize {
+        self.target_size
+    }
+
+    pub const fn target_age(&self) -> Duration {
+        self.target_age
     }
 
     pub fn clock(&self) -> &C {
@@ -503,14 +504,22 @@ where
             .len()
     }
 
+    /// Returns the aggregate entry capacity reserved by the cache partitions.
+    pub fn total_capacity(&self) -> usize {
+        self.state
+            .lock()
+            .expect("TaggedCache mutex must not be poisoned")
+            .cache
+            .total_capacity()
+    }
+
     pub fn get_hit_rate(&self) -> f32 {
         let state = self
             .state
             .lock()
             .expect("TaggedCache mutex must not be poisoned");
-        let hits = state.hits + self.fast_hits.load(Ordering::Relaxed);
-        let total = (hits + state.misses) as f32;
-        hits as f32 * (100.0 / total.max(1.0))
+        let total = (state.hits + state.misses) as f32;
+        state.hits as f32 * (100.0 / total.max(1.0))
     }
 
     pub fn rate(&self) -> f64 {
@@ -518,12 +527,11 @@ where
             .state
             .lock()
             .expect("TaggedCache mutex must not be poisoned");
-        let hits = state.hits + self.fast_hits.load(Ordering::Relaxed);
-        let total = hits + state.misses;
+        let total = state.hits + state.misses;
         if total == 0 {
             0.0
         } else {
-            hits as f64 / total as f64
+            state.hits as f64 / total as f64
         }
     }
 
@@ -532,14 +540,17 @@ where
             .state
             .lock()
             .expect("TaggedCache mutex must not be poisoned");
-        let hits = state.hits + self.fast_hits.load(Ordering::Relaxed);
-        let total = hits + state.misses;
-        let hit_rate = if total == 0 { 0 } else { (hits * 100) / total };
+        let total = state.hits + state.misses;
+        let hit_rate = if total == 0 {
+            0
+        } else {
+            (state.hits * 100) / total
+        };
         TaggedCacheMetricsSnapshot {
             size: state.cache_count,
             track_size: state.cache.len(),
             hit_rate,
-            hits,
+            hits: state.hits,
             misses: state.misses,
         }
     }
@@ -550,7 +561,6 @@ where
     }
 
     pub fn clear(&self) {
-        self.fast_map.clear();
         let mut state = self
             .state
             .lock()
@@ -560,8 +570,6 @@ where
     }
 
     pub fn reset(&self) {
-        self.fast_map.clear();
-        self.fast_hits.store(0, Ordering::Relaxed);
         let mut state = self
             .state
             .lock()
@@ -593,15 +601,14 @@ where
 
     pub fn sweep(&self) {
         let now = self.clock.now();
-        let start = Instant::now();
-        // Clear the fast_map before sweep so use_count checks are accurate
-        self.fast_map.clear();
         let mut swept_pointers = Vec::new();
+        let lock_hold_duration;
         {
             let mut state = self
                 .state
                 .lock()
                 .expect("TaggedCache mutex must not be poisoned");
+            let lock_hold_start = Instant::now();
             let when_expire =
                 expiration_cutoff(now, self.target_age, self.target_size, state.cache.len());
 
@@ -618,6 +625,7 @@ where
 
             let track_before = state.cache.len();
             let strong_cache_before = state.cache_count;
+            let capacity_before = state.cache.total_capacity();
             let mut all_counts = SweepCounts::default();
             for partition in state.cache.map_mut() {
                 let (counts, mut removed, _keys) = sweep_value_partition(partition, when_expire);
@@ -639,6 +647,12 @@ where
             }
 
             state.cache_count = state.cache_count.saturating_sub(all_counts.cache_removals);
+            let capacity_entries_released = if all_counts.map_removals != 0 {
+                state.cache.shrink_if_sparse()
+            } else {
+                0
+            };
+            let capacity_after = state.cache.total_capacity();
             tracing::info!(
                 target: "cache_retention",
                 event = "tagged_cache_sweep",
@@ -649,19 +663,23 @@ where
                 track_after = state.cache.len(),
                 strong_cache_before,
                 strong_cache_after = state.cache_count,
+                capacity_before,
+                capacity_after,
+                capacity_entries_released,
                 aged_strong_removals = all_counts.strong_removals,
                 aged_strong_demotions_to_weak = all_counts.strong_demotions,
                 expired_weak_removals = all_counts.expired_weak_removals,
                 "TaggedCache retention sweep completed"
             );
+            lock_hold_duration = lock_hold_start.elapsed();
         }
         // Match the reference `stuffToSweep` lifetime: removed values are destroyed
         // after the cache lock is released, but before the final duration log.
         drop(swept_pointers);
         self.instrumentation.logger.debug(&format!(
-            "{} TaggedCache sweep lock duration {}ms",
+            "{} TaggedCache sweep lock hold duration {}ms",
             self.name,
-            start.elapsed().as_millis()
+            lock_hold_duration.as_millis()
         ));
     }
 
@@ -697,11 +715,6 @@ where
             state.cache.remove(key);
         }
 
-        // Remove from fast_map when entry is no longer strongly cached
-        if removed_from_cache || remove_entry {
-            self.fast_map.remove(key);
-        }
-
         removed_from_cache
     }
 
@@ -711,12 +724,8 @@ where
         Q: Eq + Hash + PartitionKey + ?Sized,
     {
         // rippled's TaggedCache::initialFetch always refreshes lastAccess on
-        // every hit (TaggedCache.ipp:724). The lock-free fast_map path was
-        // skipping this refresh, causing actively-used nodes to be swept
-        // after their original insertion TTL expired. This broke cross-
-        // acquisition cache reuse during ledger sync.
-        //
-        // Always take the slow path which properly touches last_access.
+        // every hit (TaggedCache.ipp:724). Always use the primary recursively
+        // locked map so active entries retain that refresh before sweeping.
         let mut state = self
             .state
             .lock()
@@ -729,8 +738,8 @@ where
     }
 
     pub fn fetch_with(&self, key: &K, handler: impl FnOnce() -> Option<SP>) -> Option<SP> {
-        // Same fix as fetch(): always go through the slow path that refreshes
-        // last_access, matching rippled TaggedCache behavior.
+        // Like fetch(), use the primary recursively locked map so every
+        // cached hit refreshes last_access, matching rippled behavior.
         {
             let mut state = self
                 .state
@@ -750,18 +759,13 @@ where
         state.misses += 1;
         if let Some(entry) = state.cache.get_mut(key) {
             entry.touch(now);
-            let result = entry.ptr.strong_clone();
-            if let Some(ref value) = result {
-                self.fast_map.insert(key.clone(), value.clone());
-            }
-            return result;
+            return entry.ptr.strong_clone();
         }
 
         state
             .cache
             .insert(key.clone(), ValueEntry::new(now, created.clone()));
         state.cache_count += 1;
-        self.fast_map.insert(key.clone(), created.clone());
         Some(created)
     }
 
@@ -798,10 +802,8 @@ where
                     cached.clone(),
                 )) {
                     entry.ptr.set_strong(data.clone());
-                    self.fast_map.insert(key.clone(), data.clone());
                 } else {
-                    *data = cached.clone();
-                    self.fast_map.insert(key.clone(), cached);
+                    *data = cached;
                 }
                 return true;
             }
@@ -813,11 +815,9 @@ where
                     cached.clone(),
                 )) {
                     entry.ptr.set_strong(data.clone());
-                    self.fast_map.insert(key.clone(), data.clone());
                 } else {
                     entry.ptr.set_strong(cached.clone());
-                    *data = cached.clone();
-                    self.fast_map.insert(key.clone(), cached);
+                    *data = cached;
                 }
 
                 state.cache_count += 1;
@@ -826,7 +826,6 @@ where
 
             entry.ptr.set_strong(data.clone());
             state.cache_count += 1;
-            self.fast_map.insert(key.clone(), data.clone());
             return false;
         }
 
@@ -834,7 +833,6 @@ where
             .cache
             .insert(key.clone(), ValueEntry::new(self.clock.now(), data.clone()));
         state.cache_count += 1;
-        self.fast_map.insert(key.clone(), data.clone());
         false
     }
 
@@ -969,6 +967,15 @@ where
             .len()
     }
 
+    /// Returns the aggregate entry capacity reserved by the cache partitions.
+    pub fn total_capacity(&self) -> usize {
+        self.state
+            .lock()
+            .expect("KeyCache mutex must not be poisoned")
+            .cache
+            .total_capacity()
+    }
+
     pub fn clear(&self) {
         self.state
             .lock()
@@ -1011,11 +1018,11 @@ where
 
     pub fn sweep(&self) {
         let now = self.clock.now();
-        let start = Instant::now();
         let mut state = self
             .state
             .lock()
             .expect("KeyCache mutex must not be poisoned");
+        let lock_hold_start = Instant::now();
         let when_expire =
             expiration_cutoff(now, self.target_age, self.target_size, state.cache.len());
 
@@ -1030,6 +1037,9 @@ where
             ));
         }
 
+        let track_before = state.cache.len();
+        let capacity_before = state.cache.total_capacity();
+        let mut all_counts = SweepCounts::default();
         for partition in state.cache.map_mut() {
             let counts = sweep_key_partition(partition, when_expire, now);
             if counts.cache_removals != 0 || counts.map_removals != 0 {
@@ -1041,11 +1051,35 @@ where
                     counts.map_removals
                 ));
             }
+            all_counts.cache_removals += counts.cache_removals;
+            all_counts.map_removals += counts.map_removals;
         }
+        let capacity_entries_released = if all_counts.map_removals != 0 {
+            state.cache.shrink_if_sparse()
+        } else {
+            0
+        };
+        let capacity_after = state.cache.total_capacity();
+        tracing::info!(
+            target: "cache_retention",
+            event = "key_cache_sweep",
+            cache_name = self.name.as_str(),
+            target_size = self.target_size,
+            target_age_seconds = self.target_age.whole_seconds(),
+            track_before,
+            track_after = state.cache.len(),
+            capacity_before,
+            capacity_after,
+            capacity_entries_released,
+            aged_key_removals = all_counts.map_removals,
+            "KeyCache retention sweep completed"
+        );
+        // Compaction runs after all removals and performs at most one shrink per
+        // partition. Logging its in-lock cost makes any allocator stall visible.
         self.instrumentation.logger.debug(&format!(
-            "{} TaggedCache sweep lock duration {}ms",
+            "{} KeyCache sweep lock hold duration {}ms",
             self.name,
-            start.elapsed().as_millis()
+            lock_hold_start.elapsed().as_millis()
         ));
     }
 }
@@ -1214,7 +1248,7 @@ mod tests {
             if message.contains("partition sweep") {
                 assert!(!self.dropped.load(Ordering::SeqCst));
             }
-            if message.contains("sweep lock duration") {
+            if message.contains("sweep lock hold duration") {
                 assert!(self.dropped.load(Ordering::SeqCst));
             }
         }
@@ -1378,6 +1412,77 @@ mod tests {
     }
 
     #[test]
+    fn tagged_cache_sweep_compacts_sparse_partitions_and_preserves_survivors() {
+        let partitions = std::thread::available_parallelism()
+            .map(|parallelism| parallelism.get())
+            .unwrap_or(1);
+        let entry_count = partitions * 2_048;
+        let survivor_count = partitions * 4;
+        let clock = ManualClock::new(0);
+        let cache =
+            TaggedCache::<usize, String, _>::new("compaction", 0, Duration::seconds(2), clock);
+
+        for key in 0..entry_count {
+            assert!(!cache.insert(key, key.to_string()));
+        }
+        cache.clock.advance_seconds(1);
+        let survivors = (0..survivor_count)
+            .map(|key| cache.fetch(&key).expect("surviving entry should exist"))
+            .collect::<Vec<_>>();
+        let capacity_before = cache.total_capacity();
+
+        cache.clock.advance_seconds(1);
+        cache.sweep();
+        let capacity_after = cache.total_capacity();
+
+        assert_eq!(cache.get_track_size(), survivor_count);
+        assert!(
+            capacity_after * 2 < capacity_before,
+            "capacity should fall substantially: {capacity_before} -> {capacity_after}"
+        );
+        for (key, value) in survivors.iter().enumerate() {
+            assert_eq!(value.as_str(), key.to_string());
+            let fetched = cache
+                .fetch(&key)
+                .expect("surviving entry should remain fetchable");
+            assert!(Arc::ptr_eq(value, &fetched));
+        }
+    }
+
+    #[test]
+    fn key_cache_sweep_compacts_sparse_partitions_and_preserves_survivors() {
+        let partitions = std::thread::available_parallelism()
+            .map(|parallelism| parallelism.get())
+            .unwrap_or(1);
+        let entry_count = partitions * 2_048;
+        let survivor_count = partitions * 4;
+        let clock = ManualClock::new(0);
+        let cache = KeyCache::<usize, _>::new("compaction", 0, Duration::seconds(2), clock);
+
+        for key in 0..entry_count {
+            assert!(cache.insert(key));
+        }
+        cache.clock.advance_seconds(1);
+        for key in 0..survivor_count {
+            assert!(cache.touch_if_exists(&key));
+        }
+        let capacity_before = cache.total_capacity();
+
+        cache.clock.advance_seconds(1);
+        cache.sweep();
+        let capacity_after = cache.total_capacity();
+
+        assert_eq!(cache.size(), survivor_count);
+        assert!(
+            capacity_after * 2 < capacity_before,
+            "capacity should fall substantially: {capacity_before} -> {capacity_after}"
+        );
+        for key in 0..survivor_count {
+            assert!(cache.touch_if_exists(&key));
+        }
+    }
+
+    #[test]
     fn fetch_with_reuses_cached_value_and_only_builds_once() {
         let clock = ManualClock::new(0);
         let cache = TaggedCache::<u32, String, _>::new("test", 1, Duration::seconds(1), clock);
@@ -1498,6 +1603,69 @@ mod tests {
     }
 
     #[test]
+    fn primary_cache_lifecycle_refreshes_fetches_and_tracks_metrics() {
+        let clock = ManualClock::new(0);
+        let cache = TaggedCache::<u32, String, _>::new("primary", 2, Duration::seconds(2), clock);
+
+        let mut canonical = Arc::new(String::from("one"));
+        assert!(!cache.canonicalize_replace_client(&1, &mut canonical));
+
+        cache.clock.advance_seconds(1);
+        let fetched = cache.fetch(&1).expect("canonical entry should be fetched");
+        assert!(Arc::ptr_eq(&canonical, &fetched));
+
+        // At t=2, the t=0 insertion is at the sweep cutoff. The t=1 fetch
+        // must have refreshed last_access or the entry would be demoted.
+        cache.clock.advance_seconds(1);
+        cache.sweep();
+        assert_eq!(cache.get_cache_size(), 1);
+        assert_eq!(cache.get_track_size(), 1);
+
+        let mut canonical_with = Arc::new(String::from("two"));
+        assert!(!cache.canonicalize_replace_client(&2, &mut canonical_with));
+        cache.clock.advance_seconds(1);
+        let fetched_with = cache
+            .fetch_with(&2, || panic!("cached fetch_with must not call its handler"))
+            .expect("canonical entry should be fetched without rebuilding");
+        assert!(Arc::ptr_eq(&canonical_with, &fetched_with));
+
+        // At t=4, key 2 is at the same expiry boundary. Its cached fetch_with
+        // must retain a strong cache entry; key 1 is now old enough to demote.
+        cache.clock.advance_seconds(1);
+        cache.sweep();
+        assert_eq!(cache.get_cache_size(), 1);
+        assert_eq!(cache.get_track_size(), 2);
+
+        let mut duplicate = Arc::new(String::from("one"));
+        assert!(cache.canonicalize_replace_client(&1, &mut duplicate));
+        assert!(Arc::ptr_eq(&duplicate, &fetched));
+        assert!(cache.del(&1, true));
+        assert_eq!(cache.get_cache_size(), 1);
+        assert_eq!(cache.get_track_size(), 2);
+
+        drop(duplicate);
+        drop(fetched);
+        drop(canonical);
+        cache.sweep();
+        assert_eq!(cache.get_cache_size(), 1);
+        assert_eq!(cache.get_track_size(), 1);
+
+        drop(fetched_with);
+        drop(canonical_with);
+        cache.clock.advance_seconds(2);
+        cache.sweep();
+        assert_eq!(cache.get_cache_size(), 0);
+        assert_eq!(cache.get_track_size(), 0);
+
+        let snapshot = cache.metrics_snapshot();
+        assert_eq!(snapshot.hits(), 2);
+        assert_eq!(snapshot.misses(), 0);
+        assert_eq!(snapshot.hit_rate(), 100);
+        assert_eq!(cache.get_hit_rate(), 100.0);
+        assert_eq!(cache.rate(), 1.0);
+    }
+
+    #[test]
     fn touch_and_collect_metrics_match_cpp_stats_role() {
         let clock = ManualClock::new(0);
         let metrics = Arc::new(RecordingMetrics::default());
@@ -1568,7 +1736,7 @@ mod tests {
         assert!(
             debugs
                 .iter()
-                .any(|line| line.contains("TaggedCache sweep lock duration"))
+                .any(|line| line.contains("TaggedCache sweep lock hold duration"))
         );
     }
 

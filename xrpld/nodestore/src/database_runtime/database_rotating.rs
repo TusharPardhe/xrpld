@@ -2,6 +2,7 @@ use crate::database::{
     Database as DatabaseTrait, DatabaseDelegate, DatabaseImporter,
     DatabaseRotating as DatabaseRotatingTrait, DatabaseRuntime, DatabaseSource,
 };
+use crate::database_runtime::node_object_cache::NodeObjectCacheMode;
 use crate::{
     AsyncReadWork, Backend, FetchReport, FetchType, JournalLevel, NodeObject, NodeObjectType,
     NodeStoreJournal, ScheduledWrite, Scheduler, Status,
@@ -246,35 +247,39 @@ impl DatabaseDelegate for DatabaseRotatingCore {
             node_object
         };
 
-        let (mut writable, archive) = self.backends();
+        let (writable, archive) = self.backends();
         let mut node_object = fetch(&writable);
         if node_object.is_none() {
             node_object = fetch(&archive);
             if let Some(node_object_ref) = &node_object {
-                let copy_forward = !duplicate
-                    && self
-                        .rotation_in_flight
-                        .load(std::sync::atomic::Ordering::Acquire);
-                if !(duplicate || copy_forward) {
-                    fetch_report.was_found = true;
-                    return node_object;
-                }
-                // Archive copy-forward is maintenance traffic. Once a
-                // foreground consensus writer queues, allow at most this one
-                // already-admitted object before yielding the write path.
-                let _maintenance = self.write_priority.maintenance();
                 let state = self
                     .state
                     .lock()
                     .expect("rotating backend mutex must not be poisoned");
-                writable = Arc::clone(&state.writable_backend);
+                let pair_changed = !Arc::ptr_eq(&writable, &state.writable_backend)
+                    || !Arc::ptr_eq(&archive, &state.archive_backend);
+                let copy_forward = !duplicate
+                    && (pair_changed
+                        || self
+                            .rotation_in_flight
+                            .load(std::sync::atomic::Ordering::Acquire));
+                if !(duplicate || copy_forward) {
+                    drop(state);
+                    fetch_report.was_found = true;
+                    return node_object;
+                }
+                let writable = Arc::clone(&state.writable_backend);
                 drop(state);
 
-                // While rotation is in flight, copy archive-served reads
-                // forward into the writable backend. The archive is about
-                // to be deleted; without this, a node canonicalized into
-                // the cache after the freshen snapshot would survive only
-                // in RAM once the archive is dropped.
+                // Archive copy-forward is maintenance traffic. Once a
+                // foreground consensus writer queues, allow at most this one
+                // already-admitted object before yielding the write path.
+                let _maintenance = self.write_priority.maintenance();
+
+                // Copy reads served by an archive that is in flight or whose
+                // captured backend pair has already been rotated out. The
+                // latter closes the end-of-rotation race where the in-flight
+                // flag can clear before a slow old-archive fetch returns.
                 if let Err(error) = writable.store(Arc::clone(node_object_ref)) {
                     tracing::error!(target: "nodestore", %error, hash = %hash, "Failed to copy archive node into writable backend");
                     journal.log(JournalLevel::Error, &error);
@@ -327,7 +332,7 @@ impl DatabaseRotatingImp {
         let rotation_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let copy_forward_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let write_priority = Arc::new(WritePriorityGate::default());
-        let database = DatabaseRuntime::new(
+        let database = DatabaseRuntime::new_with_node_object_cache_mode(
             Arc::new(DatabaseRotatingCore {
                 state: Arc::clone(&state),
                 rotation_in_flight: Arc::clone(&rotation_in_flight),
@@ -338,6 +343,7 @@ impl DatabaseRotatingImp {
             read_threads,
             config,
             Arc::clone(&journal),
+            NodeObjectCacheMode::Disabled,
         )?;
 
         Ok(Arc::new(Self {
@@ -395,6 +401,11 @@ impl DatabaseRotatingImp {
                 .lock()
                 .expect("rotating backend mutex must not be poisoned");
 
+            // Publish the stable identity of the new backend pair while the
+            // state lock still prevents readers from capturing it. The
+            // earlier in-flight generation fences the exposure window; this
+            // generation fences the actual pair transition.
+            self.database.advance_store_generation();
             state.archive_backend.set_delete_path();
             let old_archive_backend = Arc::clone(&state.archive_backend);
             state.archive_backend = Arc::clone(&state.writable_backend);
@@ -953,6 +964,7 @@ mod tests {
         delete_path_called: AtomicBool,
         store_count: AtomicUsize,
         batch_count: AtomicUsize,
+        fetch_count: AtomicUsize,
         objects: Mutex<BTreeMap<Uint256, Arc<NodeObject>>>,
         batch_gate: Option<Arc<BatchGate>>,
         fetch_gate: Option<Arc<BatchGate>>,
@@ -967,6 +979,7 @@ mod tests {
                 delete_path_called: AtomicBool::new(false),
                 store_count: AtomicUsize::new(0),
                 batch_count: AtomicUsize::new(0),
+                fetch_count: AtomicUsize::new(0),
                 objects: Mutex::new(BTreeMap::new()),
                 batch_gate: None,
                 fetch_gate: None,
@@ -1006,6 +1019,10 @@ mod tests {
         }
 
         fn fetch(&self, hash: &Uint256) -> (Option<Arc<NodeObject>>, Status) {
+            if let Some(gate) = &self.fetch_gate {
+                gate.block_batch();
+            }
+            self.fetch_count.fetch_add(1, Ordering::Relaxed);
             let object = self
                 .objects
                 .lock()
@@ -1136,6 +1153,77 @@ mod tests {
     }
 
     #[test]
+    fn rotating_reads_never_retain_archive_nodes_and_report_disabled_cache() {
+        let writable = Arc::new(TestBackend::new("writable"));
+        let archive = Arc::new(TestBackend::new("archive"));
+        let object = sample_object(0x45);
+        archive
+            .store(Arc::clone(&object))
+            .expect("archive store should succeed");
+
+        let database = DatabaseRotatingImp::new(
+            Arc::new(DummyScheduler),
+            1,
+            Arc::clone(&writable) as Arc<dyn Backend>,
+            Arc::clone(&archive) as Arc<dyn Backend>,
+            &config(),
+            Arc::new(NullJournal),
+        )
+        .expect("rotating database");
+
+        for _ in 0..2 {
+            assert!(
+                database
+                    .fetch_node_object(object.hash(), 0, FetchType::Synchronous, false)
+                    .is_some()
+            );
+        }
+        assert_eq!(
+            writable.fetch_count.load(Ordering::Relaxed),
+            2,
+            "each rotating read must check writable storage"
+        );
+        assert_eq!(
+            archive.fetch_count.load(Ordering::Relaxed),
+            2,
+            "each rotating read must reach archive storage"
+        );
+
+        let protocol::JsonValue::Object(counts) = database.get_counts_json() else {
+            panic!("counts json should be an object");
+        };
+        assert_eq!(
+            counts.get("node_object_cache_eviction_policy"),
+            Some(&protocol::JsonValue::String("disabled".to_owned()))
+        );
+        for key in [
+            "node_object_cache_capacity_entries",
+            "node_object_cache_capacity_bytes",
+            "node_object_cache_weighted_capacity_bytes",
+            "node_object_cache_weighted_size_bytes",
+            "node_object_cache_entries",
+            "node_object_cache_hits",
+            "node_object_cache_promotions",
+        ] {
+            assert_eq!(
+                counts.get(key),
+                Some(&protocol::JsonValue::String("0".to_owned())),
+                "{key}"
+            );
+        }
+        assert_eq!(
+            counts.get("node_object_cache_misses"),
+            Some(&protocol::JsonValue::String("2".to_owned()))
+        );
+        assert_eq!(
+            counts.get("node_object_cache_durable_loads"),
+            Some(&protocol::JsonValue::String("2".to_owned()))
+        );
+
+        database.stop();
+    }
+
+    #[test]
     fn rotating_duplicate_fetch_bypasses_cached_archive_hit_and_copies_forward() {
         let writable = Arc::new(TestBackend::new("writable"));
         let archive = Arc::new(TestBackend::new("archive"));
@@ -1243,6 +1331,53 @@ mod tests {
             database.store_generation() > rotation_generation,
             "a direct rotation must also fence pre-rotation callbacks"
         );
+        database.stop();
+    }
+
+    #[test]
+    fn archive_read_crossing_rotation_end_is_preserved_in_new_writable() {
+        let writable = Arc::new(TestBackend::new("writable"));
+        let fetch_gate = Arc::new(BatchGate::default());
+        let archive = Arc::new(TestBackend::new_with_fetch_gate(
+            "archive",
+            Arc::clone(&fetch_gate),
+        ));
+        let object = sample_object(0x47);
+        archive.store(Arc::clone(&object)).expect("seed archive");
+
+        let database = DatabaseRotatingImp::new(
+            Arc::new(DummyScheduler),
+            1,
+            Arc::clone(&writable) as Arc<dyn Backend>,
+            Arc::clone(&archive) as Arc<dyn Backend>,
+            &config(),
+            Arc::new(NullJournal),
+        )
+        .expect("rotating database");
+        database.set_rotation_in_flight(true);
+
+        let fetch_database = Arc::clone(&database);
+        let hash = *object.hash();
+        let fetch_thread = std::thread::spawn(move || {
+            fetch_database.fetch_node_object(&hash, 0, FetchType::Synchronous, false)
+        });
+        fetch_gate.wait_until_entered();
+
+        database.rotate(Box::new(TestBackend::new("next")), |_, _| {});
+        database.set_rotation_in_flight(false);
+        fetch_gate.release();
+
+        assert!(
+            fetch_thread.join().expect("fetch thread").is_some(),
+            "the crossing read must still return the archive object"
+        );
+        assert!(
+            database
+                .fetch_node_object(object.hash(), 0, FetchType::Synchronous, false)
+                .is_some(),
+            "the old-archive object must survive in the new writable pair"
+        );
+        assert_eq!(database.take_copy_forward_count(), 1);
         database.stop();
     }
 

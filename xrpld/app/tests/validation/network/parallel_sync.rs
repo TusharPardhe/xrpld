@@ -12,11 +12,11 @@ use shamap::sync::{SHAMapType, SyncState, SyncTree};
 use shamap::tree_node::{SHAMapNodeType, SHAMapTreeNode};
 
 fn leaf_node(key: Uint256, data: &[u8]) -> SharedIntrusive<SHAMapTreeNode> {
-    make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         SHAMapItem::new(key, data.to_vec()),
         0,
-    ))
+    )
 }
 
 fn key(fill: u8) -> Uint256 {
@@ -255,7 +255,7 @@ fn backpressure_limits_are_enforced() {
 /// Test: SHAMap immutable after sync complete.
 #[test]
 fn tree_becomes_immutable_after_sync() {
-    let root = make_shared_intrusive(SHAMapTreeNode::new_inner(0));
+    let root = SHAMapTreeNode::new_inner(0);
     let tree =
         SyncTree::from_root_with_type(root, SHAMapType::State, false, 100, SyncState::Immutable);
 

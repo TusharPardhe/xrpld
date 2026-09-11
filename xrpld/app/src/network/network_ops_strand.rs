@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use acquisition::{DurableHandoffId, SessionRef};
 use basics::base_uint::Uint256;
 use consensus::algorithm::ConsensusPhase;
+use shamap::family::FullBelowCache;
 
 use crate::ApplicationRoot;
 use crate::consensus::rcl_consensus::{ConsensusRunner, PendingAcceptWork};
@@ -101,6 +102,48 @@ impl CoordinatorHandoffDedup {
         let key = (handoff, session);
         self.seen.remove(&key);
         self.order.retain(|entry| *entry != key);
+    }
+}
+
+/// Bounded recipient ownership held between persistence and the coordinator's
+/// exact processed-ack receipt. Values cannot become releasable merely because
+/// an acknowledgement entered (or failed to enter) the control queue.
+struct PendingDurableAckGate<T> {
+    items: VecDeque<(DurableHandoffId, SessionRef, T)>,
+}
+
+impl<T> Default for PendingDurableAckGate<T> {
+    fn default() -> Self {
+        Self {
+            items: VecDeque::new(),
+        }
+    }
+}
+
+impl<T> PendingDurableAckGate<T> {
+    fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    fn retain(
+        &mut self,
+        handoff: DurableHandoffId,
+        session: SessionRef,
+        value: T,
+    ) -> Result<(), T> {
+        if self.items.len() >= MAX_PENDING_DURABLE_ACKS {
+            return Err(value);
+        }
+        self.items.push_back((handoff, session, value));
+        Ok(())
+    }
+
+    fn take_processed(&mut self, handoff: DurableHandoffId, session: SessionRef) -> Option<T> {
+        let index = self
+            .items
+            .iter()
+            .position(|(candidate, owner, _)| *candidate == handoff && *owner == session)?;
+        self.items.remove(index).map(|(_, _, value)| value)
     }
 }
 
@@ -560,6 +603,7 @@ fn strand_loop(
     let mut provisional_lcl_waiter: Option<ProvisionalLclWaiter> = None;
     let mut coordinator_handoff_dedup = CoordinatorHandoffDedup::default();
     let mut pending_durable_acks = VecDeque::new();
+    let mut pending_durable_graphs = PendingDurableAckGate::default();
     // Durable overflow recovery crosses the same FIFO as ordinary map
     // completions. A saturated FIFO retains these exact items here.
     let mut pending_recovered_txsets = VecDeque::new();
@@ -609,11 +653,25 @@ fn strand_loop(
         // strand so coordinator state never needs its own thread or lock
         // choreography. Effects are dispatched to the resource ports inside the
         // registry's coordinator adapter after each event.
-        let (_, coordinator_work_remains) = shared_inbound.coordinator_drain_with_status();
+        let (_, mut coordinator_work_remains) = shared_inbound.coordinator_drain_with_status();
+        for (handoff, session) in shared_inbound.take_processed_coordinator_durable_acks() {
+            if let Some(ledger) = pending_durable_graphs.take_processed(handoff, session) {
+                release_processed_durable_graphs(&root, handoff, session, &ledger);
+            } else {
+                tracing::warn!(
+                    target: "acquisition_trace",
+                    event = "durable_handoff_ack_receipt_unmatched",
+                    handoff = handoff.get(),
+                    session_id = session.session_id().get(),
+                    "processed durable acknowledgement had no retained recipient graph"
+                );
+            }
+        }
         while let Some(&(handoff, session)) = pending_durable_acks.front() {
             if !shared_inbound.acknowledge_coordinator_durable_handoff(handoff, session) {
                 break;
             }
+            coordinator_work_remains = true;
             pending_durable_acks.pop_front();
         }
 
@@ -961,6 +1019,7 @@ fn strand_loop(
                 let lm = lm_rt.ledger_master();
                 let receipt_budget = MAX_PENDING_DURABLE_ACKS
                     .saturating_sub(pending_durable_acks.len())
+                    .min(MAX_PENDING_DURABLE_ACKS.saturating_sub(pending_durable_graphs.len()))
                     .min(MAX_LEDGER_COMPLETIONS_PER_TURN);
                 let completed = {
                     let rx_guard = lm_rt
@@ -980,6 +1039,7 @@ fn strand_loop(
                         &item,
                         &mut coordinator_handoff_dedup,
                         &mut pending_durable_acks,
+                        &mut pending_durable_graphs,
                     );
                 }
             }
@@ -988,7 +1048,11 @@ fn strand_loop(
                     .ledger_master_runtime()
                     .map(|lm_rt| lm_rt.ledger_master());
                 if let Some(lm) = lm {
-                    drain_bounded(rx, MAX_LEDGER_COMPLETIONS_PER_TURN, |item| {
+                    let receipt_budget = MAX_PENDING_DURABLE_ACKS
+                        .saturating_sub(pending_durable_acks.len())
+                        .min(MAX_PENDING_DURABLE_ACKS.saturating_sub(pending_durable_graphs.len()))
+                        .min(MAX_LEDGER_COMPLETIONS_PER_TURN);
+                    drain_bounded(rx, receipt_budget, |item| {
                         process_coordinator_completed_inbound_ledger(
                             &root,
                             &lm,
@@ -996,6 +1060,7 @@ fn strand_loop(
                             &item,
                             &mut coordinator_handoff_dedup,
                             &mut pending_durable_acks,
+                            &mut pending_durable_graphs,
                         );
                     });
                 }
@@ -2585,6 +2650,52 @@ fn trace_completed_inbound_handoff(
     );
 }
 
+/// Release a durable ledger's deep SHAMap ownership only after the coordinator
+/// emitted an exact processed-ack receipt for the same handoff and session.
+fn release_processed_durable_graphs(
+    root: &ApplicationRoot,
+    handoff: DurableHandoffId,
+    session: SessionRef,
+    durable_ledger: &Arc<ledger::Ledger>,
+) {
+    let generation = root
+        .node_family_full_below_cache()
+        .map(|cache| cache.generation());
+    let graph_release = durable_ledger.release_durable_map_graphs(generation, 2);
+    if let Some(released) = graph_release {
+        tracing::info!(
+            target: "acquisition_trace",
+            event = "durable_handoff_graph_release",
+            handoff = handoff.get(),
+            session_id = session.session_id().get(),
+            ledger_hash = %durable_ledger.header().hash,
+            ledger_seq = durable_ledger.header().seq,
+            state_full_below = released.state_full_below,
+            state_deep = released.state_deep,
+            transaction_full_below = released.transaction_full_below,
+            transaction_deep = released.transaction_deep,
+            released_total = released.total(),
+            "released durable acquired SHAMap child graphs after coordinator acknowledgement"
+        );
+    } else {
+        tracing::warn!(
+            target: "acquisition_trace",
+            event = "durable_handoff_graph_release_skipped",
+            handoff = handoff.get(),
+            session_id = session.session_id().get(),
+            ledger_hash = %durable_ledger.header().hash,
+            ledger_seq = durable_ledger.header().seq,
+            immutable = durable_ledger.is_immutable(),
+            has_node_fetcher = durable_ledger.has_node_fetcher(),
+            state_backed = durable_ledger.state_map().backed(),
+            transaction_backed = durable_ledger.tx_map().backed(),
+            state_synching = durable_ledger.state_map().is_synching(),
+            transaction_synching = durable_ledger.tx_map().is_synching(),
+            "durable acquired ledger did not satisfy graph-release guards after acknowledgement"
+        );
+    }
+}
+
 /// Process one complete coordinator durable handoff. The acknowledgement is
 /// queued only after the existing persistence, register, and checkAccept path
 /// returns. This means enqueue alone cannot complete a coordinator session.
@@ -2595,10 +2706,21 @@ fn process_coordinator_completed_inbound_ledger(
     item: &crate::ledger::inbound_ledgers::CompletedInboundLedger,
     dedup: &mut CoordinatorHandoffDedup,
     pending_acks: &mut VecDeque<(DurableHandoffId, SessionRef)>,
+    pending_graphs: &mut PendingDurableAckGate<Arc<ledger::Ledger>>,
 ) {
     let Some((handoff, session)) = item.coordinator_handoff() else {
         return;
     };
+    if !shared_inbound.coordinator_durable_handoff_is_pending(handoff, session) {
+        tracing::debug!(
+            target: "lcl_trace",
+            event = "coordinator_durable_handoff_not_pending",
+            handoff = handoff.get(),
+            session_id = session.session_id().get(),
+            "skipping delayed durable handoff after its coordinator lifecycle advanced"
+        );
+        return;
+    }
     if !dedup.claim(handoff, session) {
         tracing::debug!(
             target: "lcl_trace",
@@ -2623,14 +2745,17 @@ fn process_coordinator_completed_inbound_ledger(
         ledger_seq = item.ledger.header().seq,
         "acquisition trace: NetworkOps received exact durable coordinator handoff"
     );
+    // Normalize once so persistence, resolver registration, acceptance, and
+    // post-durability graph release all operate on the exact same fetchable Arc.
+    let durable_ledger = root.ledger_with_node_fetcher(Arc::clone(&item.ledger));
     let persisted = process_completed_inbound_ledger(
         root,
         lm,
         shared_inbound,
         "coordinator_durable",
-        *item.ledger.header().hash.as_uint256(),
+        *durable_ledger.header().hash.as_uint256(),
         item.acquisition_id,
-        Arc::clone(&item.ledger),
+        Arc::clone(&durable_ledger),
         item.reason,
         false,
     );
@@ -2639,6 +2764,24 @@ fn process_coordinator_completed_inbound_ledger(
     // publish a ledger: the next accepted-boundary reconciliation recomputes
     // current preference before applying switch policy.
     if persisted.acknowledged {
+        // Retain the exact normalized Arc before enqueueing its acknowledgement.
+        // Only a later receipt emitted by the coordinator after processing this
+        // exact `(handoff, session)` may release either SHAMap graph.
+        if pending_graphs
+            .retain(handoff, session, Arc::clone(&durable_ledger))
+            .is_err()
+        {
+            tracing::error!(
+                target: "acquisition_trace",
+                event = "durable_handoff_graph_retention_full",
+                handoff = handoff.get(),
+                session_id = session.session_id().get(),
+                "bounded durable graph retention unexpectedly exhausted"
+            );
+            dedup.release(handoff, session);
+            let _ = shared_inbound.reject_coordinator_durable_handoff(handoff, session);
+            return;
+        }
         let acknowledgement_enqueued =
             shared_inbound.acknowledge_coordinator_durable_handoff(handoff, session);
         tracing::info!(
@@ -3089,9 +3232,10 @@ fn should_acquire_history(
 mod tests {
     use super::{
         ConsensusJobScheduler, CoordinatorHandoffDedup, LclAuditSampler, MAX_COMMANDS_PER_TURN,
-        MAX_COORDINATOR_HANDOFF_DEDUP, MAX_LEDGER_COMPLETIONS_PER_TURN, PreferredLclReconciliation,
-        coordinator_publication_is_fresh, drain_bounded, effective_validation_recovery_target,
-        enqueue_recovered_txsets, heartbeat_operating_mode_reassertion, history_acquire_allowed,
+        MAX_COORDINATOR_HANDOFF_DEDUP, MAX_LEDGER_COMPLETIONS_PER_TURN, PendingDurableAckGate,
+        PreferredLclReconciliation, coordinator_publication_is_fresh, drain_bounded,
+        effective_validation_recovery_target, enqueue_recovered_txsets,
+        heartbeat_operating_mode_reassertion, history_acquire_allowed,
         history_fetch_pack_requested, persist_completed_inbound_ledger,
         preferred_candidate_passes_switch_admission, process_completed_inbound_ledger,
         published_ledger_is_contiguous_with_lcl, reconcile_preferred_lcl_with_status_broadcaster,
@@ -3149,9 +3293,7 @@ mod tests {
 
     #[test]
     fn partial_resident_preference_cannot_supersede_stable_anchor() {
-        let root_node = basics::intrusive_pointer::make_shared_intrusive(
-            shamap::tree_node::SHAMapTreeNode::new_inner(1),
-        );
+        let root_node = shamap::tree_node::SHAMapTreeNode::new_inner(1);
         root_node.set_child_hash(0, SHAMapHash::new(Uint256::from_array([0x22; 32])));
         root_node.update_hash();
         let mut header = LedgerHeader {
@@ -3493,12 +3635,10 @@ mod tests {
         let key =
             Uint256::from_hex("2200000000000000000000000000000000000000000000000000000000000000")
                 .expect("state key should parse");
-        let leaf = basics::intrusive_pointer::make_shared_intrusive(
-            shamap::tree_node::SHAMapTreeNode::new_leaf(
-                shamap::tree_node::SHAMapNodeType::AccountState,
-                shamap::item::SHAMapItem::new(key, vec![0x24; 12]),
-                0,
-            ),
+        let leaf = shamap::tree_node::SHAMapTreeNode::new_leaf(
+            shamap::tree_node::SHAMapNodeType::AccountState,
+            shamap::item::SHAMapItem::new(key, vec![0x24; 12]),
+            0,
         );
         root.node_writer_result_from_store()
             .expect("test node store writer")(
@@ -3513,9 +3653,7 @@ mod tests {
         // Model an acquisition ledger after its strong child was released:
         // the backed root retains only the child's hash and the Ledger object
         // itself carries no NodeStore fetch seam.
-        let weak_root = basics::intrusive_pointer::make_shared_intrusive(
-            shamap::tree_node::SHAMapTreeNode::new_inner(1),
-        );
+        let weak_root = shamap::tree_node::SHAMapTreeNode::new_inner(1);
         weak_root.set_child_hash(2, leaf.get_hash());
         weak_root.update_hash();
         let mut header = LedgerHeader {
@@ -4168,6 +4306,60 @@ mod tests {
             dedup.claim(DurableHandoffId::new(1), session),
             "the bounded local cache evicts the oldest completed delivery"
         );
+    }
+
+    #[test]
+    fn pending_durable_graph_gate_survives_control_queue_backpressure() {
+        let mut ids = IdCounter::new();
+        let session = SessionRef::new(
+            ids.next_id(),
+            ids.next_id(),
+            Uint256::from(1),
+            ids.next_id(),
+            StoreGeneration::new(1),
+        );
+        let handoff = DurableHandoffId::new(7);
+        let mut gate = PendingDurableAckGate::default();
+        gate.retain(handoff, session, "retained graph")
+            .expect("one graph fits");
+
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        tx.try_send(acquisition::AcquisitionEvent::Heartbeat)
+            .expect("fill the control queue");
+        let acknowledgement = acquisition::AcquisitionEvent::DurableHandoffAcknowledged(
+            acquisition::DurableHandoffAcknowledgement::new(handoff, session),
+        );
+        assert!(matches!(
+            tx.try_send(acknowledgement),
+            Err(std::sync::mpsc::TrySendError::Full(_))
+        ));
+        assert_eq!(gate.len(), 1, "queue pressure retains graph ownership");
+        assert!(
+            gate.take_processed(DurableHandoffId::new(8), session)
+                .is_none(),
+            "a different receipt cannot release the retained graph"
+        );
+
+        assert!(matches!(
+            rx.recv().expect("queued control fact"),
+            acquisition::AcquisitionEvent::Heartbeat
+        ));
+        tx.try_send(acquisition::AcquisitionEvent::DurableHandoffAcknowledged(
+            acquisition::DurableHandoffAcknowledgement::new(handoff, session),
+        ))
+        .expect("retry enters the freed control slot");
+        let processed = match rx.recv().expect("owner receives exact acknowledgement") {
+            acquisition::AcquisitionEvent::DurableHandoffAcknowledged(ack) => {
+                (ack.handoff(), ack.session())
+            }
+            other => panic!("expected durable acknowledgement, got {other:?}"),
+        };
+        assert_eq!(
+            gate.take_processed(processed.0, processed.1),
+            Some("retained graph"),
+            "only the exact owner-processed receipt releases graph ownership"
+        );
+        assert_eq!(gate.len(), 0);
     }
 
     #[test]

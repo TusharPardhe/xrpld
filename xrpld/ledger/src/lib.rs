@@ -532,6 +532,25 @@ pub type LedgerNodeBatchWriterResult =
 pub type LedgerNodeWriter =
     Arc<dyn Fn(LedgerNodeObjectType, basics::base_uint::Uint256, Vec<u8>, u32) + Send + Sync>;
 
+/// Counts child-owner graphs released only after a completed immutable ledger
+/// has crossed its durable persistence acknowledgement boundary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DurableMapReleaseStats {
+    pub state_full_below: usize,
+    pub state_deep: usize,
+    pub transaction_full_below: usize,
+    pub transaction_deep: usize,
+}
+
+impl DurableMapReleaseStats {
+    pub const fn total(self) -> usize {
+        self.state_full_below
+            + self.state_deep
+            + self.transaction_full_below
+            + self.transaction_deep
+    }
+}
+
 #[derive(Clone)]
 pub struct Ledger {
     header: LedgerHeader,
@@ -1140,6 +1159,38 @@ impl Ledger {
     pub fn release_maps_to_disk(&self) {
         self.state_map.release_to_disk();
         self.tx_map.release_to_disk();
+    }
+
+    /// Release deep decoded graph ownership after the caller has received the
+    /// durable completion acknowledgement for this exact ledger.
+    ///
+    /// The method deliberately refuses mutable, non-fetchable, unbacked, or
+    /// still-synchronizing maps. Durability itself is a lifecycle fact owned by
+    /// the coordinator and therefore remains a caller precondition; ordinary
+    /// cache/history insertion must never call this method.
+    pub fn release_durable_map_graphs(
+        &self,
+        full_below_generation: Option<u32>,
+        keep_depth: usize,
+    ) -> Option<DurableMapReleaseStats> {
+        if !self.is_immutable()
+            || !self.has_node_fetcher()
+            || !self.state_map.backed()
+            || !self.tx_map.backed()
+            || self.state_map.is_synching()
+            || self.tx_map.is_synching()
+        {
+            return None;
+        }
+
+        let mut released = DurableMapReleaseStats::default();
+        if let Some(generation) = full_below_generation {
+            released.state_full_below = self.state_map.spill_full_below_subtrees(generation);
+            released.transaction_full_below = self.tx_map.spill_full_below_subtrees(generation);
+        }
+        released.state_deep = self.state_map.release_deep_children(keep_depth);
+        released.transaction_deep = self.tx_map.release_deep_children(keep_depth);
+        Some(released)
     }
 
     pub fn needed_tx_hashes_with_family<CLOCK, S, C, F, MR, NS>(
@@ -3926,18 +3977,14 @@ mod tests {
         };
         let fee_payload = encode_fee_settings_entry(fees, false);
         let fee_key = fee_settings_keylet().key;
-        let fee_leaf = basics::intrusive_pointer::make_shared_intrusive(
-            shamap::tree_node::SHAMapTreeNode::new_leaf(
-                SHAMapNodeType::AccountState,
-                SHAMapItem::new(fee_key, fee_payload),
-                0,
-            ),
+        let fee_leaf = shamap::tree_node::SHAMapTreeNode::new_leaf(
+            SHAMapNodeType::AccountState,
+            SHAMapItem::new(fee_key, fee_payload),
+            0,
         );
         let fee_leaf_hash = fee_leaf.get_hash();
 
-        let root = basics::intrusive_pointer::make_shared_intrusive(
-            shamap::tree_node::SHAMapTreeNode::new_inner(0),
-        );
+        let root = shamap::tree_node::SHAMapTreeNode::new_inner(0);
         let branch =
             shamap::node_id::select_branch(shamap::node_id::SHAMapNodeId::default(), fee_key);
         root.set_child_hash(branch, fee_leaf_hash);

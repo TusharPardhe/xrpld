@@ -1,11 +1,5 @@
 //! Intrusive-pointer ownership types for the shared and weak parts of
 //! `xrpl/basics/IntrusivePointer.h`.
-//!
-//! This module covers the intrusive-pointer ownership surface used by the
-//! landed cache callers:
-//! - `SharedIntrusive<T>`
-//! - `WeakIntrusive<T>`
-//! - `SharedWeakUnion<T>`
 
 use crate::intrusive_ref_counts::{
     IntrusiveRefCounts, ReleaseStrongRefAction, ReleaseWeakRefAction,
@@ -13,6 +7,7 @@ use crate::intrusive_ref_counts::{
 use std::fmt;
 use std::marker::PhantomData;
 use std::mem;
+use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::ptr::NonNull;
 
@@ -20,6 +15,26 @@ pub trait IntrusiveObject {
     fn intrusive_ref_counts(&self) -> &IntrusiveRefCounts;
 
     fn partial_destructor(&self) {}
+
+    fn initialize_intrusive_owner<Owner: IntrusiveObject>(&self, owner: NonNull<Owner>) {
+        self.intrusive_ref_counts().initialize_owner_metadata(owner);
+    }
+
+    fn dispatch_intrusive_partial_destroy(&self) {
+        self.intrusive_ref_counts().dispatch_partial_destroy();
+    }
+
+    fn dispatch_intrusive_final_destroy(&self) {
+        self.intrusive_ref_counts().dispatch_final_destroy();
+    }
+}
+
+unsafe fn dispatch_partial<T: IntrusiveObject>(ptr: NonNull<T>) {
+    unsafe { ptr.as_ref() }.dispatch_intrusive_partial_destroy();
+}
+
+unsafe fn dispatch_final<T: IntrusiveObject>(ptr: NonNull<T>) {
+    unsafe { ptr.as_ref() }.dispatch_intrusive_final_destroy();
 }
 
 pub trait IntrusiveStaticCast<Target: IntrusiveObject>: IntrusiveObject + Sized {
@@ -42,64 +57,42 @@ pub enum SharedIntrusiveAdopt {
     NoIncrement,
 }
 
-#[derive(Clone, Copy)]
-struct IntrusiveOps {
-    destroy: unsafe fn(*mut ()),
-    partial_destructor: unsafe fn(*mut ()),
+const NULL_SENTINEL: usize = 1;
+
+fn assert_intrusive_alignment<T>(ptr: NonNull<T>) {
+    assert!(
+        std::mem::align_of::<T>() >= 2 && (ptr.as_ptr() as usize & 1) == 0,
+        "intrusive objects and cast views must have alignment >= 2"
+    );
 }
 
-impl IntrusiveOps {
-    fn of<T: IntrusiveObject>() -> Self {
-        Self {
-            destroy: destroy_impl::<T>,
-            partial_destructor: partial_destructor_impl::<T>,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct IntrusiveOwner {
-    raw: NonNull<()>,
-    ops: IntrusiveOps,
-}
-
-impl IntrusiveOwner {
-    fn of<T: IntrusiveObject>(ptr: NonNull<T>) -> Self {
-        Self {
-            raw: ptr.cast(),
-            ops: IntrusiveOps::of::<T>(),
-        }
-    }
-
-    fn destroy(self) {
-        // SAFETY: The owner stores the original allocation type and the
-        // matching destroy function for that allocation.
-        unsafe { (self.ops.destroy)(self.raw.as_ptr()) };
-    }
-
-    fn partial_destructor(self) {
-        // SAFETY: The owner stores the original allocation type and the
-        // matching partial-destructor function for that allocation.
-        unsafe { (self.ops.partial_destructor)(self.raw.as_ptr()) };
-    }
+fn null_handle() -> NonZeroUsize {
+    // SAFETY: the sentinel is deliberately non-zero and never represents an object.
+    unsafe { NonZeroUsize::new_unchecked(NULL_SENTINEL) }
 }
 
 pub struct SharedIntrusive<T: IntrusiveObject> {
-    ptr: Option<NonNull<T>>,
-    owner: Option<IntrusiveOwner>,
+    ptr: NonZeroUsize,
     marker: PhantomData<T>,
 }
 
 pub struct WeakIntrusive<T: IntrusiveObject> {
-    ptr: Option<NonNull<T>>,
-    owner: Option<IntrusiveOwner>,
+    ptr: NonZeroUsize,
     marker: PhantomData<T>,
 }
 
 pub struct SharedWeakUnion<T: IntrusiveObject> {
     tagged_ptr: usize,
-    owner: Option<IntrusiveOwner>,
     marker: PhantomData<T>,
+}
+
+const _: () = assert!(std::mem::size_of::<SharedIntrusive<PointerLayoutProbe>>() == 8);
+
+struct PointerLayoutProbe;
+impl IntrusiveObject for PointerLayoutProbe {
+    fn intrusive_ref_counts(&self) -> &IntrusiveRefCounts {
+        unreachable!()
+    }
 }
 
 impl<T: IntrusiveObject> Default for SharedIntrusive<T> {
@@ -123,22 +116,36 @@ impl<T: IntrusiveObject> Default for SharedWeakUnion<T> {
 impl<T: IntrusiveObject> SharedIntrusive<T> {
     pub const fn new() -> Self {
         Self {
-            ptr: None,
-            owner: None,
+            ptr: unsafe { NonZeroUsize::new_unchecked(NULL_SENTINEL) },
             marker: PhantomData,
         }
     }
 
+    fn pointer_bits(ptr: NonNull<T>) -> NonZeroUsize {
+        assert_intrusive_alignment(ptr);
+        NonZeroUsize::new(ptr.as_ptr() as usize).expect("non-null intrusive pointer")
+    }
+
+    fn from_ptr(ptr: NonNull<T>) -> Self {
+        Self {
+            ptr: Self::pointer_bits(ptr),
+            marker: PhantomData,
+        }
+    }
+
+    fn raw(&self) -> Option<NonNull<T>> {
+        (self.ptr.get() != NULL_SENTINEL).then(|| {
+            // SAFETY: all non-sentinel values are created from NonNull<T>.
+            unsafe { NonNull::new_unchecked(self.ptr.get() as *mut T) }
+        })
+    }
+
     pub fn is_null(&self) -> bool {
-        self.ptr.is_none()
+        self.ptr.get() == NULL_SENTINEL
     }
 
     pub fn get(&self) -> Option<&T> {
-        self.ptr.map(|ptr| {
-            // SAFETY: A strong intrusive pointer guarantees the pointee stays
-            // alive until this handle releases it.
-            unsafe { ptr.as_ref() }
-        })
+        self.raw().map(|ptr| unsafe { ptr.as_ref() })
     }
 
     pub fn use_count(&self) -> usize {
@@ -147,24 +154,24 @@ impl<T: IntrusiveObject> SharedIntrusive<T> {
     }
 
     pub fn reset(&mut self) {
-        self.release_and_store(None, None);
+        self.release_and_store(None);
     }
 
     /// # Safety
-    ///
     /// `ptr` must satisfy the same lifetime and initialization guarantees as
     /// [`SharedIntrusive::from_raw`].
     pub unsafe fn adopt(&mut self, ptr: *mut T, adopt: SharedIntrusiveAdopt) {
         let next = NonNull::new(ptr);
-        if let Some(raw) = next
-            && matches!(adopt, SharedIntrusiveAdopt::IncrementStrong)
-        {
-            // SAFETY: guaranteed by the caller contract for `adopt`.
-            unsafe { raw.as_ref() }
-                .intrusive_ref_counts()
-                .add_strong_ref();
+        if let Some(raw) = next {
+            assert_intrusive_alignment(raw);
+            let object = unsafe { raw.as_ref() };
+            let counts = object.intrusive_ref_counts();
+            object.initialize_intrusive_owner(raw);
+            if matches!(adopt, SharedIntrusiveAdopt::IncrementStrong) {
+                counts.add_strong_ref();
+            }
         }
-        self.release_and_store(next, next.map(IntrusiveOwner::of));
+        self.release_and_store(next);
     }
 
     pub fn downgrade(&self) -> WeakIntrusive<T> {
@@ -172,49 +179,61 @@ impl<T: IntrusiveObject> SharedIntrusive<T> {
     }
 
     /// # Safety
-    ///
     /// `ptr` must either be null or point to a valid intrusive object whose
     /// refcount storage remains alive for the lifetime represented by the
-    /// returned handle. When `adopt` is `IncrementStrong`, the pointed-to value
-    /// must already be initialized enough for intrusive refcount operations.
+    /// returned handle.
     pub unsafe fn from_raw(ptr: *mut T, adopt: SharedIntrusiveAdopt) -> Self {
-        let ptr = NonNull::new(ptr);
-        if let Some(raw) = ptr
-            && matches!(adopt, SharedIntrusiveAdopt::IncrementStrong)
-        {
-            // SAFETY: `raw` came from the caller and is assumed valid for the
-            // intrusive lifetime operations.
-            unsafe { raw.as_ref() }
-                .intrusive_ref_counts()
-                .add_strong_ref();
+        let Some(raw) = NonNull::new(ptr) else {
+            return Self::new();
+        };
+        assert_intrusive_alignment(raw);
+        let object = unsafe { raw.as_ref() };
+        let counts = object.intrusive_ref_counts();
+        object.initialize_intrusive_owner(raw);
+        if matches!(adopt, SharedIntrusiveAdopt::IncrementStrong) {
+            counts.add_strong_ref();
         }
-
-        Self {
-            ptr,
-            owner: ptr.map(IntrusiveOwner::of),
-            marker: PhantomData,
-        }
+        Self::from_ptr(raw)
     }
 
-    fn release_and_store(&mut self, next: Option<NonNull<T>>, next_owner: Option<IntrusiveOwner>) {
-        let previous = mem::replace(&mut self.ptr, next);
-        let previous_owner = mem::replace(&mut self.owner, next_owner);
+    /// Creates a public view over `ptr` while recording `owner` as the original
+    /// concrete allocation. This supports compact polymorphic allocations whose
+    /// public intrusive type is a prefix/base view.
+    ///
+    /// # Safety
+    /// `ptr` must be a valid view into `owner`; both must share the same
+    /// intrusive control word, and `owner` must be the original Box allocation.
+    pub unsafe fn from_raw_with_owner<Owner: IntrusiveObject>(
+        ptr: *mut T,
+        owner: *mut Owner,
+        adopt: SharedIntrusiveAdopt,
+    ) -> Self {
+        let Some(raw) = NonNull::new(ptr) else {
+            return Self::new();
+        };
+        let owner = NonNull::new(owner).expect("non-null intrusive owner");
+        assert_intrusive_alignment(raw);
+        assert_intrusive_alignment(owner);
+        let object = unsafe { raw.as_ref() };
+        let counts = object.intrusive_ref_counts();
+        object.initialize_intrusive_owner(owner);
+        if matches!(adopt, SharedIntrusiveAdopt::IncrementStrong) {
+            counts.add_strong_ref();
+        }
+        Self::from_ptr(raw)
+    }
+
+    fn release_and_store(&mut self, next: Option<NonNull<T>>) {
+        let previous = self.raw();
+        self.ptr = next.map_or_else(null_handle, Self::pointer_bits);
         let Some(previous) = previous else {
             return;
         };
-        let Some(previous_owner) = previous_owner else {
-            debug_assert!(false, "intrusive pointer lost its owner metadata");
-            return;
-        };
-
-        let value = unsafe { previous.as_ref() };
-        match value.intrusive_ref_counts().release_strong_ref() {
+        let counts = unsafe { previous.as_ref() }.intrusive_ref_counts();
+        match counts.release_strong_ref() {
             ReleaseStrongRefAction::Noop => {}
-            ReleaseStrongRefAction::Destroy => previous_owner.destroy(),
-            ReleaseStrongRefAction::PartialDestroy => {
-                previous_owner.partial_destructor();
-                value.intrusive_ref_counts().partial_destructor_finished();
-            }
+            ReleaseStrongRefAction::Destroy => unsafe { dispatch_final(previous) },
+            ReleaseStrongRefAction::PartialDestroy => unsafe { dispatch_partial(previous) },
         }
     }
 
@@ -223,20 +242,13 @@ impl<T: IntrusiveObject> SharedIntrusive<T> {
         T: IntrusiveStaticCast<U>,
         U: IntrusiveObject,
     {
-        let Some(ptr) = self.ptr else {
+        let Some(ptr) = self.raw() else {
             return SharedIntrusive::new();
         };
-
         unsafe { ptr.as_ref() }
             .intrusive_ref_counts()
             .add_strong_ref();
-
-        let casted = T::intrusive_static_cast(ptr);
-        SharedIntrusive {
-            ptr: Some(casted),
-            owner: self.owner,
-            marker: PhantomData,
-        }
+        SharedIntrusive::from_ptr(T::intrusive_static_cast(ptr))
     }
 
     pub fn static_pointer_cast_owned<U>(self) -> SharedIntrusive<U>
@@ -244,19 +256,13 @@ impl<T: IntrusiveObject> SharedIntrusive<T> {
         T: IntrusiveStaticCast<U>,
         U: IntrusiveObject,
     {
-        let mut value = mem::ManuallyDrop::new(self);
-        let ptr = value.ptr.take().map(T::intrusive_static_cast);
-
-        SharedIntrusive {
-            ptr,
-            owner: value.owner.take(),
-            marker: PhantomData,
+        let value = mem::ManuallyDrop::new(self);
+        match value.raw() {
+            Some(ptr) => SharedIntrusive::from_ptr(T::intrusive_static_cast(ptr)),
+            None => SharedIntrusive::new(),
         }
     }
 
-    /// Move this intrusive owner into a related target view without
-    /// incrementing the strong count, matching the reference converting move
-    /// constructor/assignment role for compatible intrusive pointer types.
     pub fn into_shared_intrusive<U>(self) -> SharedIntrusive<U>
     where
         T: IntrusiveStaticCast<U>,
@@ -265,35 +271,25 @@ impl<T: IntrusiveObject> SharedIntrusive<T> {
         self.static_pointer_cast_owned()
     }
 
-    /// Rebind this intrusive pointer from a compatible shared owner by
-    /// incrementing the strong count, matching the reference
-    /// `SharedIntrusive::operator=(SharedIntrusive const&)` role for related
-    /// types.
     pub fn assign_from_shared<Source>(&mut self, shared: &SharedIntrusive<Source>)
     where
         Source: IntrusiveStaticCast<T> + IntrusiveObject,
     {
-        let next = shared.ptr.map(Source::intrusive_static_cast);
+        let next = shared.raw().map(Source::intrusive_static_cast);
         if let Some(raw) = next {
-            // SAFETY: `raw` is still owned by the source strong handle and the
-            // increment happens before this owner releases its previous value.
             unsafe { raw.as_ref() }
                 .intrusive_ref_counts()
                 .add_strong_ref();
         }
-        self.release_and_store(next, shared.owner);
+        self.release_and_store(next);
     }
 
-    /// Rebind this intrusive pointer by taking ownership from a compatible
-    /// shared owner, matching the reference converting move-assignment role.
     pub fn assign_from_shared_owned<Source>(&mut self, shared: SharedIntrusive<Source>)
     where
         Source: IntrusiveStaticCast<T> + IntrusiveObject,
     {
-        let mut shared = mem::ManuallyDrop::new(shared);
-        let next = shared.ptr.take().map(Source::intrusive_static_cast);
-        let next_owner = shared.owner.take();
-        self.release_and_store(next, next_owner);
+        let shared = mem::ManuallyDrop::new(shared);
+        self.release_and_store(shared.raw().map(Source::intrusive_static_cast));
     }
 
     pub fn from_borrowed_static_cast<U>(value: &SharedIntrusive<T>) -> SharedIntrusive<U>
@@ -317,23 +313,16 @@ impl<T: IntrusiveObject> SharedIntrusive<T> {
         T: IntrusiveDynamicCast<U>,
         U: IntrusiveObject,
     {
-        let Some(ptr) = self.ptr else {
+        let Some(ptr) = self.raw() else {
             return SharedIntrusive::new();
         };
-
         let Some(casted) = T::intrusive_dynamic_cast(ptr) else {
             return SharedIntrusive::new();
         };
-
         unsafe { ptr.as_ref() }
             .intrusive_ref_counts()
             .add_strong_ref();
-
-        SharedIntrusive {
-            ptr: Some(casted),
-            owner: self.owner,
-            marker: PhantomData,
-        }
+        SharedIntrusive::from_ptr(casted)
     }
 
     pub fn from_borrowed_dynamic_cast<U>(value: &SharedIntrusive<T>) -> SharedIntrusive<U>
@@ -349,24 +338,14 @@ impl<T: IntrusiveObject> SharedIntrusive<T> {
         T: IntrusiveDynamicCast<U>,
         U: IntrusiveObject,
     {
-        let mut value = mem::ManuallyDrop::new(self);
-        let Some(ptr) = value.ptr.take() else {
+        let value = mem::ManuallyDrop::new(self);
+        let Some(ptr) = value.raw() else {
             return Ok(SharedIntrusive::new());
         };
-
-        let Some(casted) = T::intrusive_dynamic_cast(ptr) else {
-            return Err(SharedIntrusive {
-                ptr: Some(ptr),
-                owner: value.owner.take(),
-                marker: PhantomData,
-            });
-        };
-
-        Ok(SharedIntrusive {
-            ptr: Some(casted),
-            owner: value.owner.take(),
-            marker: PhantomData,
-        })
+        match T::intrusive_dynamic_cast(ptr) {
+            Some(casted) => Ok(SharedIntrusive::from_ptr(casted)),
+            None => Err(SharedIntrusive::from_ptr(ptr)),
+        }
     }
 
     pub fn from_owned_dynamic_cast<U>(value: SharedIntrusive<T>) -> Result<SharedIntrusive<U>, Self>
@@ -380,15 +359,13 @@ impl<T: IntrusiveObject> SharedIntrusive<T> {
 
 impl<T: IntrusiveObject> Clone for SharedIntrusive<T> {
     fn clone(&self) -> Self {
-        if let Some(ptr) = self.ptr {
+        if let Some(ptr) = self.raw() {
             unsafe { ptr.as_ref() }
                 .intrusive_ref_counts()
                 .add_strong_ref();
         }
-
         Self {
             ptr: self.ptr,
-            owner: self.owner,
             marker: PhantomData,
         }
     }
@@ -396,13 +373,12 @@ impl<T: IntrusiveObject> Clone for SharedIntrusive<T> {
 
 impl<T: IntrusiveObject> Drop for SharedIntrusive<T> {
     fn drop(&mut self) {
-        self.release_and_store(None, None);
+        self.release_and_store(None);
     }
 }
 
 impl<T: IntrusiveObject> Deref for SharedIntrusive<T> {
     type Target = T;
-
     fn deref(&self) -> &Self::Target {
         self.get()
             .expect("cannot dereference a null SharedIntrusive pointer")
@@ -412,7 +388,7 @@ impl<T: IntrusiveObject> Deref for SharedIntrusive<T> {
 impl<T: IntrusiveObject> fmt::Debug for SharedIntrusive<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SharedIntrusive")
-            .field("ptr", &self.ptr)
+            .field("ptr", &self.raw())
             .field("use_count", &self.use_count())
             .finish()
     }
@@ -421,103 +397,98 @@ impl<T: IntrusiveObject> fmt::Debug for SharedIntrusive<T> {
 impl<T: IntrusiveObject> WeakIntrusive<T> {
     pub const fn new() -> Self {
         Self {
-            ptr: None,
-            owner: None,
+            ptr: unsafe { NonZeroUsize::new_unchecked(NULL_SENTINEL) },
             marker: PhantomData,
         }
+    }
+
+    fn pointer_bits(ptr: NonNull<T>) -> NonZeroUsize {
+        assert_intrusive_alignment(ptr);
+        NonZeroUsize::new(ptr.as_ptr() as usize).expect("non-null intrusive pointer")
+    }
+
+    fn from_ptr(ptr: NonNull<T>) -> Self {
+        Self {
+            ptr: Self::pointer_bits(ptr),
+            marker: PhantomData,
+        }
+    }
+
+    fn raw(&self) -> Option<NonNull<T>> {
+        (self.ptr.get() != NULL_SENTINEL)
+            .then(|| unsafe { NonNull::new_unchecked(self.ptr.get() as *mut T) })
     }
 
     pub fn from_shared(shared: &SharedIntrusive<T>) -> Self {
-        let ptr = shared.ptr;
-        if let Some(raw) = ptr {
-            unsafe { raw.as_ref() }
-                .intrusive_ref_counts()
-                .add_weak_ref();
-        }
-
-        Self {
-            ptr,
-            owner: shared.owner,
-            marker: PhantomData,
-        }
+        let Some(ptr) = shared.raw() else {
+            return Self::new();
+        };
+        unsafe { ptr.as_ref() }
+            .intrusive_ref_counts()
+            .add_weak_ref();
+        Self::from_ptr(ptr)
     }
 
-    /// Rebind this weak intrusive pointer from a compatible shared owner,
-    /// matching the reference `WeakIntrusive::operator=(SharedIntrusive const&)`
-    /// role for related types.
     pub fn assign_from_shared<Source>(&mut self, shared: &SharedIntrusive<Source>)
     where
         Source: IntrusiveStaticCast<T> + IntrusiveObject,
     {
-        self.release_no_store();
-        self.ptr = shared.ptr.map(Source::intrusive_static_cast);
-        self.owner = shared.owner;
-        if let Some(raw) = self.ptr {
+        let next = shared.raw().map(Source::intrusive_static_cast);
+        if let Some(raw) = next {
             unsafe { raw.as_ref() }
                 .intrusive_ref_counts()
                 .add_weak_ref();
         }
+        self.release_and_store(next);
     }
 
     pub fn lock(&self) -> SharedIntrusive<T> {
-        let Some(ptr) = self.ptr else {
+        let Some(ptr) = self.raw() else {
             return SharedIntrusive::new();
         };
-
-        let value = unsafe { ptr.as_ref() };
-        if value.intrusive_ref_counts().checkout_strong_ref_from_weak() {
-            SharedIntrusive {
-                ptr: Some(ptr),
-                owner: self.owner,
-                marker: PhantomData,
-            }
+        if unsafe { ptr.as_ref() }
+            .intrusive_ref_counts()
+            .checkout_strong_ref_from_weak()
+        {
+            SharedIntrusive::from_ptr(ptr)
         } else {
             SharedIntrusive::new()
         }
     }
 
     pub fn expired(&self) -> bool {
-        self.ptr
+        self.raw()
             .is_none_or(|ptr| unsafe { ptr.as_ref() }.intrusive_ref_counts().expired())
     }
 
     pub fn reset(&mut self) {
-        self.release_no_store();
-        self.ptr = None;
-        self.owner = None;
+        self.release_and_store(None);
     }
 
     /// # Safety
-    ///
     /// `ptr` must be null or point to a valid intrusive object whose refcount
-    /// storage remains alive for the lifetime represented by this weak handle.
+    /// storage remains alive for this weak handle.
     pub unsafe fn adopt(&mut self, ptr: *mut T) {
-        self.release_no_store();
-        self.ptr = NonNull::new(ptr);
-        self.owner = self.ptr.map(IntrusiveOwner::of);
-        if let Some(raw) = self.ptr {
-            // SAFETY: guaranteed by the caller contract for `adopt`.
-            unsafe { raw.as_ref() }
-                .intrusive_ref_counts()
-                .add_weak_ref();
+        let next = NonNull::new(ptr);
+        if let Some(raw) = next {
+            assert_intrusive_alignment(raw);
+            let object = unsafe { raw.as_ref() };
+            let counts = object.intrusive_ref_counts();
+            object.initialize_intrusive_owner(raw);
+            counts.add_weak_ref();
         }
+        self.release_and_store(next);
     }
 
-    fn release_no_store(&mut self) {
-        let Some(ptr) = self.ptr else {
+    fn release_and_store(&mut self, next: Option<NonNull<T>>) {
+        let previous = self.raw();
+        self.ptr = next.map_or_else(null_handle, Self::pointer_bits);
+        let Some(ptr) = previous else {
             return;
         };
-        let Some(owner) = self.owner else {
-            debug_assert!(false, "intrusive weak pointer lost its owner metadata");
-            return;
-        };
-
-        let value = unsafe { ptr.as_ref() };
-        if matches!(
-            value.intrusive_ref_counts().release_weak_ref(),
-            ReleaseWeakRefAction::Destroy
-        ) {
-            owner.destroy();
+        let counts = unsafe { ptr.as_ref() }.intrusive_ref_counts();
+        if matches!(counts.release_weak_ref(), ReleaseWeakRefAction::Destroy) {
+            unsafe { dispatch_final(ptr) };
         }
     }
 }
@@ -528,20 +499,13 @@ where
     Target: IntrusiveObject,
 {
     fn from(value: &SharedIntrusive<Source>) -> Self {
-        let ptr = value.ptr.map(Source::intrusive_static_cast);
-        if let Some(raw) = ptr {
-            // SAFETY: `raw` came from a live intrusive strong owner and the
-            // weak handle immediately increments the weak count.
-            unsafe { raw.as_ref() }
-                .intrusive_ref_counts()
-                .add_weak_ref();
-        }
-
-        Self {
-            ptr,
-            owner: value.owner,
-            marker: PhantomData,
-        }
+        let Some(ptr) = value.raw().map(Source::intrusive_static_cast) else {
+            return Self::new();
+        };
+        unsafe { ptr.as_ref() }
+            .intrusive_ref_counts()
+            .add_weak_ref();
+        Self::from_ptr(ptr)
     }
 }
 
@@ -550,13 +514,11 @@ impl<T: IntrusiveObject> From<&SharedIntrusive<T>> for bool {
         !value.is_null()
     }
 }
-
 impl<T: IntrusiveObject> From<&WeakIntrusive<T>> for bool {
     fn from(value: &WeakIntrusive<T>) -> Self {
         !value.expired()
     }
 }
-
 impl<T: IntrusiveObject> From<&SharedWeakUnion<T>> for bool {
     fn from(value: &SharedWeakUnion<T>) -> Self {
         value.get().is_some()
@@ -570,77 +532,54 @@ impl<T: IntrusiveObject> SharedWeakUnion<T> {
     pub const fn new() -> Self {
         Self {
             tagged_ptr: 0,
-            owner: None,
             marker: PhantomData,
         }
     }
 
     pub fn get_strong(&self) -> SharedIntrusive<T> {
-        let Some(ptr) = self.unsafe_get_raw_ptr() else {
+        let Some(ptr) = self.raw() else {
             return SharedIntrusive::new();
         };
-
         if self.is_strong() {
             unsafe { ptr.as_ref() }
                 .intrusive_ref_counts()
                 .add_strong_ref();
-            SharedIntrusive {
-                ptr: Some(ptr),
-                owner: self.owner,
-                marker: PhantomData,
-            }
+            SharedIntrusive::from_ptr(ptr)
         } else {
             SharedIntrusive::new()
         }
     }
 
     pub fn reset(&mut self) {
-        self.unsafe_release_no_store();
-        self.unsafe_set_raw_ptr(None, RefStrength::Strong);
-        self.owner = None;
+        self.release_no_store();
+        self.tagged_ptr = 0;
     }
 
     pub fn get(&self) -> Option<&T> {
-        if self.is_strong() {
-            self.unsafe_get_raw_ptr().map(|ptr| unsafe { ptr.as_ref() })
-        } else {
-            None
-        }
+        self.is_strong()
+            .then(|| self.raw().map(|ptr| unsafe { ptr.as_ref() }))
+            .flatten()
     }
-
     pub fn use_count(&self) -> usize {
         self.get()
             .map_or(0, |value| value.intrusive_ref_counts().use_count())
     }
-
     pub fn expired(&self) -> bool {
-        self.unsafe_get_raw_ptr()
+        self.raw()
             .is_none_or(|ptr| unsafe { ptr.as_ref() }.intrusive_ref_counts().expired())
     }
 
     pub fn lock(&self) -> SharedIntrusive<T> {
-        let Some(ptr) = self.unsafe_get_raw_ptr() else {
+        let Some(ptr) = self.raw() else {
             return SharedIntrusive::new();
         };
-
+        let counts = unsafe { ptr.as_ref() }.intrusive_ref_counts();
         if self.is_strong() {
-            unsafe { ptr.as_ref() }
-                .intrusive_ref_counts()
-                .add_strong_ref();
-            return SharedIntrusive {
-                ptr: Some(ptr),
-                owner: self.owner,
-                marker: PhantomData,
-            };
+            counts.add_strong_ref();
+            return SharedIntrusive::from_ptr(ptr);
         }
-
-        let value = unsafe { ptr.as_ref() };
-        if value.intrusive_ref_counts().checkout_strong_ref_from_weak() {
-            SharedIntrusive {
-                ptr: Some(ptr),
-                owner: self.owner,
-                marker: PhantomData,
-            }
+        if counts.checkout_strong_ref_from_weak() {
+            SharedIntrusive::from_ptr(ptr)
         } else {
             SharedIntrusive::new()
         }
@@ -649,7 +588,6 @@ impl<T: IntrusiveObject> SharedWeakUnion<T> {
     pub fn is_strong(&self) -> bool {
         (self.tagged_ptr & Self::TAG_MASK) == 0
     }
-
     pub fn is_weak(&self) -> bool {
         !self.is_strong()
     }
@@ -658,16 +596,13 @@ impl<T: IntrusiveObject> SharedWeakUnion<T> {
         if self.is_strong() {
             return true;
         }
-
-        let Some(ptr) = self.unsafe_get_raw_ptr() else {
+        let Some(ptr) = self.raw() else {
             return false;
         };
-
-        let value = unsafe { ptr.as_ref() };
-        if value.intrusive_ref_counts().checkout_strong_ref_from_weak() {
-            let action = value.intrusive_ref_counts().release_weak_ref();
-            debug_assert_eq!(action, ReleaseWeakRefAction::Noop);
-            self.unsafe_set_raw_ptr(Some(ptr), RefStrength::Strong);
+        let counts = unsafe { ptr.as_ref() }.intrusive_ref_counts();
+        if counts.checkout_strong_ref_from_weak() {
+            debug_assert_eq!(counts.release_weak_ref(), ReleaseWeakRefAction::Noop);
+            self.set_raw(Some(ptr), RefStrength::Strong);
             true
         } else {
             false
@@ -678,141 +613,100 @@ impl<T: IntrusiveObject> SharedWeakUnion<T> {
         if self.is_weak() {
             return true;
         }
-
-        let Some(ptr) = self.unsafe_get_raw_ptr() else {
+        let Some(ptr) = self.raw() else {
             return false;
         };
-
-        let value = unsafe { ptr.as_ref() };
-        match value.intrusive_ref_counts().add_weak_release_strong_ref() {
+        let counts = unsafe { ptr.as_ref() }.intrusive_ref_counts();
+        match counts.add_weak_release_strong_ref() {
             ReleaseStrongRefAction::Noop => {}
             ReleaseStrongRefAction::Destroy => {
                 debug_assert!(false, "cannot destroy a freshly added weak ref");
-                if let Some(owner) = self.owner {
-                    owner.destroy();
-                }
-                self.unsafe_set_raw_ptr(None, RefStrength::Strong);
-                self.owner = None;
+                unsafe { dispatch_final(ptr) };
+                self.tagged_ptr = 0;
                 return true;
             }
-            ReleaseStrongRefAction::PartialDestroy => {
-                if let Some(owner) = self.owner {
-                    owner.partial_destructor();
-                }
-                value.intrusive_ref_counts().partial_destructor_finished();
-            }
+            ReleaseStrongRefAction::PartialDestroy => unsafe { dispatch_partial(ptr) },
         }
-
-        self.unsafe_set_raw_ptr(Some(ptr), RefStrength::Weak);
+        self.set_raw(Some(ptr), RefStrength::Weak);
         true
     }
 
-    /// Rebind this union from a compatible shared owner while retaining a
-    /// strong representation, matching the reference borrowed strong assignment
-    /// role.
     pub fn assign_from_shared<Source>(&mut self, shared: &SharedIntrusive<Source>)
     where
         Source: IntrusiveStaticCast<T> + IntrusiveObject,
     {
-        self.unsafe_release_no_store();
-        let ptr = shared.ptr.map(Source::intrusive_static_cast);
-        if let Some(raw) = ptr {
+        let next = shared.raw().map(Source::intrusive_static_cast);
+        if let Some(raw) = next {
             unsafe { raw.as_ref() }
                 .intrusive_ref_counts()
                 .add_strong_ref();
         }
-        self.unsafe_set_raw_ptr(ptr, RefStrength::Strong);
-        self.owner = shared.owner;
+        self.release_no_store();
+        self.set_raw(next, RefStrength::Strong);
     }
 
-    /// Rebind this union by taking ownership from a compatible shared owner,
-    /// matching the reference move-assignment role for strong intrusive inputs.
     pub fn assign_from_shared_owned<Source>(&mut self, shared: SharedIntrusive<Source>)
     where
         Source: IntrusiveStaticCast<T> + IntrusiveObject,
     {
-        self.unsafe_release_no_store();
-        let mut shared = mem::ManuallyDrop::new(shared);
-        let ptr = shared.ptr.take().map(Source::intrusive_static_cast);
-        self.unsafe_set_raw_ptr(ptr, RefStrength::Strong);
-        self.owner = shared.owner;
+        let shared = mem::ManuallyDrop::new(shared);
+        let next = shared.raw().map(Source::intrusive_static_cast);
+        self.release_no_store();
+        self.set_raw(next, RefStrength::Strong);
     }
 
-    fn ensure_alignment() {
-        assert!(
-            std::mem::align_of::<T>() >= 2,
-            "SharedWeakUnion requires T alignment >= 2"
-        );
-    }
-
-    fn unsafe_get_raw_ptr(&self) -> Option<NonNull<T>> {
+    fn raw(&self) -> Option<NonNull<T>> {
         NonNull::new((self.tagged_ptr & Self::PTR_MASK) as *mut T)
     }
 
-    fn unsafe_set_raw_ptr(&mut self, ptr: Option<NonNull<T>>, strength: RefStrength) {
+    fn set_raw(&mut self, ptr: Option<NonNull<T>>, strength: RefStrength) {
         self.tagged_ptr = ptr.map_or(0, |raw| {
-            Self::ensure_alignment();
-            let tagged = raw.as_ptr() as usize;
+            assert_intrusive_alignment(raw);
             match strength {
-                RefStrength::Strong => tagged,
-                RefStrength::Weak => tagged | Self::TAG_MASK,
+                RefStrength::Strong => raw.as_ptr() as usize,
+                RefStrength::Weak => raw.as_ptr() as usize | Self::TAG_MASK,
             }
         });
     }
 
-    fn unsafe_release_no_store(&mut self) {
-        let Some(ptr) = self.unsafe_get_raw_ptr() else {
+    fn release_no_store(&mut self) {
+        let Some(ptr) = self.raw() else {
             return;
         };
-        let Some(owner) = self.owner else {
-            debug_assert!(false, "intrusive union lost its owner metadata");
-            return;
-        };
-
-        let value = unsafe { ptr.as_ref() };
+        let counts = unsafe { ptr.as_ref() }.intrusive_ref_counts();
         if self.is_strong() {
-            match value.intrusive_ref_counts().release_strong_ref() {
+            match counts.release_strong_ref() {
                 ReleaseStrongRefAction::Noop => {}
-                ReleaseStrongRefAction::Destroy => owner.destroy(),
-                ReleaseStrongRefAction::PartialDestroy => {
-                    owner.partial_destructor();
-                    value.intrusive_ref_counts().partial_destructor_finished();
-                }
+                ReleaseStrongRefAction::Destroy => unsafe { dispatch_final(ptr) },
+                ReleaseStrongRefAction::PartialDestroy => unsafe { dispatch_partial(ptr) },
             }
-        } else if matches!(
-            value.intrusive_ref_counts().release_weak_ref(),
-            ReleaseWeakRefAction::Destroy
-        ) {
-            owner.destroy();
+        } else if matches!(counts.release_weak_ref(), ReleaseWeakRefAction::Destroy) {
+            unsafe { dispatch_final(ptr) };
         }
     }
 }
 
 impl<T: IntrusiveObject> Clone for SharedWeakUnion<T> {
     fn clone(&self) -> Self {
-        if let Some(raw) = self.unsafe_get_raw_ptr() {
-            let value = unsafe { raw.as_ref() };
+        if let Some(raw) = self.raw() {
+            let counts = unsafe { raw.as_ref() }.intrusive_ref_counts();
             if self.is_strong() {
-                value.intrusive_ref_counts().add_strong_ref();
+                counts.add_strong_ref();
             } else {
-                value.intrusive_ref_counts().add_weak_ref();
+                counts.add_weak_ref();
             }
         }
-
         Self {
             tagged_ptr: self.tagged_ptr,
-            owner: self.owner,
             marker: PhantomData,
         }
     }
 }
-
 impl<T: IntrusiveObject> Drop for SharedWeakUnion<T> {
     fn drop(&mut self) {
-        self.unsafe_release_no_store();
+        self.release_no_store();
     }
 }
-
 impl<T: IntrusiveObject> fmt::Debug for SharedWeakUnion<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SharedWeakUnion")
@@ -824,7 +718,6 @@ impl<T: IntrusiveObject> fmt::Debug for SharedWeakUnion<T> {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StaticCastTagSharedIntrusive;
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DynamicCastTagSharedIntrusive;
 
@@ -834,18 +727,14 @@ where
     Target: IntrusiveObject,
 {
     fn from(value: &SharedIntrusive<Source>) -> Self {
-        let ptr = value.ptr.map(Source::intrusive_static_cast);
+        let ptr = value.raw().map(Source::intrusive_static_cast);
         if let Some(raw) = ptr {
-            // SAFETY: `raw` stays alive while the added strong ref is held by
-            // the returned union.
             unsafe { raw.as_ref() }
                 .intrusive_ref_counts()
                 .add_strong_ref();
         }
-
         let mut result = Self::new();
-        result.unsafe_set_raw_ptr(ptr, RefStrength::Strong);
-        result.owner = value.owner;
+        result.set_raw(ptr, RefStrength::Strong);
         result
     }
 }
@@ -856,28 +745,26 @@ where
     Target: IntrusiveObject,
 {
     fn from(value: SharedIntrusive<Source>) -> Self {
-        let mut value = mem::ManuallyDrop::new(value);
-        let ptr = value.ptr.take().map(Source::intrusive_static_cast);
-
+        let value = mem::ManuallyDrop::new(value);
         let mut result = Self::new();
-        result.unsafe_set_raw_ptr(ptr, RefStrength::Strong);
-        result.owner = value.owner;
+        result.set_raw(
+            value.raw().map(Source::intrusive_static_cast),
+            RefStrength::Strong,
+        );
         result
     }
 }
 
 impl<T: IntrusiveObject> From<&WeakIntrusive<T>> for SharedWeakUnion<T> {
     fn from(value: &WeakIntrusive<T>) -> Self {
-        let ptr = value.ptr;
+        let ptr = value.raw();
         if let Some(raw) = ptr {
             unsafe { raw.as_ref() }
                 .intrusive_ref_counts()
                 .add_weak_ref();
         }
-
         let mut result = Self::new();
-        result.unsafe_set_raw_ptr(ptr, RefStrength::Weak);
-        result.owner = value.owner;
+        result.set_raw(ptr, RefStrength::Weak);
         result
     }
 }
@@ -891,7 +778,6 @@ where
         value.static_pointer_cast()
     }
 }
-
 impl<Target, Source> From<(StaticCastTagSharedIntrusive, &SharedIntrusive<Source>)>
     for SharedIntrusive<Target>
 where
@@ -902,7 +788,6 @@ where
         value.static_pointer_cast()
     }
 }
-
 impl<Target, Source> From<(StaticCastTagSharedIntrusive, SharedIntrusive<Source>)>
     for SharedIntrusive<Target>
 where
@@ -913,7 +798,6 @@ where
         value.static_pointer_cast_owned()
     }
 }
-
 impl<Target, Source> From<(DynamicCastTagSharedIntrusive, &SharedIntrusive<Source>)>
     for SharedIntrusive<Target>
 where
@@ -924,7 +808,6 @@ where
         value.dynamic_pointer_cast()
     }
 }
-
 impl<Target, Source> TryFrom<(DynamicCastTagSharedIntrusive, SharedIntrusive<Source>)>
     for SharedIntrusive<Target>
 where
@@ -932,7 +815,6 @@ where
     Target: IntrusiveObject,
 {
     type Error = SharedIntrusive<Source>;
-
     fn try_from(
         (_, value): (DynamicCastTagSharedIntrusive, SharedIntrusive<Source>),
     ) -> Result<Self, Self::Error> {
@@ -942,30 +824,26 @@ where
 
 impl<T: IntrusiveObject> Clone for WeakIntrusive<T> {
     fn clone(&self) -> Self {
-        if let Some(ptr) = self.ptr {
+        if let Some(ptr) = self.raw() {
             unsafe { ptr.as_ref() }
                 .intrusive_ref_counts()
                 .add_weak_ref();
         }
-
         Self {
             ptr: self.ptr,
-            owner: self.owner,
             marker: PhantomData,
         }
     }
 }
-
 impl<T: IntrusiveObject> Drop for WeakIntrusive<T> {
     fn drop(&mut self) {
-        self.release_no_store();
+        self.release_and_store(None);
     }
 }
-
 impl<T: IntrusiveObject> fmt::Debug for WeakIntrusive<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WeakIntrusive")
-            .field("ptr", &self.ptr)
+            .field("ptr", &self.raw())
             .field("expired", &self.expired())
             .finish()
     }
@@ -977,20 +855,6 @@ enum RefStrength {
     Weak,
 }
 
-fn destroy_impl<T: IntrusiveObject>(ptr: *mut ()) {
-    // SAFETY: `ptr` was created from a `Box<T>` by `IntrusiveOwner::of`.
-    unsafe {
-        drop(Box::from_raw(ptr.cast::<T>()));
-    }
-}
-
-fn partial_destructor_impl<T: IntrusiveObject>(ptr: *mut ()) {
-    // SAFETY: `ptr` points to the original allocation used to create the
-    // intrusive owner, so it is valid to reinterpret it as `T`.
-    let value = unsafe { &*(ptr.cast::<T>()) };
-    value.partial_destructor();
-}
-
 pub fn static_pointer_cast<Target, Source>(
     value: &SharedIntrusive<Source>,
 ) -> SharedIntrusive<Target>
@@ -1000,7 +864,6 @@ where
 {
     value.static_pointer_cast()
 }
-
 pub fn dynamic_pointer_cast<Target, Source>(
     value: &SharedIntrusive<Source>,
 ) -> SharedIntrusive<Target>
@@ -1010,22 +873,16 @@ where
 {
     value.dynamic_pointer_cast()
 }
-
 pub fn make_shared_intrusive<T: IntrusiveObject>(value: T) -> SharedIntrusive<T> {
     let raw = Box::into_raw(Box::new(value));
     unsafe { SharedIntrusive::from_raw(raw, SharedIntrusiveAdopt::NoIncrement) }
 }
 
 unsafe impl<T> Send for SharedIntrusive<T> where T: IntrusiveObject + Send + Sync {}
-
 unsafe impl<T> Sync for SharedIntrusive<T> where T: IntrusiveObject + Send + Sync {}
-
 unsafe impl<T> Send for WeakIntrusive<T> where T: IntrusiveObject + Send + Sync {}
-
 unsafe impl<T> Sync for WeakIntrusive<T> where T: IntrusiveObject + Send + Sync {}
-
 unsafe impl<T> Send for SharedWeakUnion<T> where T: IntrusiveObject + Send + Sync {}
-
 unsafe impl<T> Sync for SharedWeakUnion<T> where T: IntrusiveObject + Send + Sync {}
 
 #[cfg(test)]

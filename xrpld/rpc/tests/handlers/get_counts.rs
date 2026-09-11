@@ -21,6 +21,7 @@ struct FakeGetCountsSource {
     accepted_ledger_cache_hit_rate: JsonValue,
     fullbelow_size: i64,
     treenode_cache_size: u64,
+    treenode_cache_capacity_entries: u64,
     treenode_track_size: u64,
     node_store_counts: BTreeMap<String, JsonValue>,
 }
@@ -78,6 +79,10 @@ impl GetCountsSource for FakeGetCountsSource {
         self.treenode_cache_size
     }
 
+    fn treenode_cache_capacity_entries(&self) -> u64 {
+        self.treenode_cache_capacity_entries
+    }
+
     fn treenode_track_size(&self) -> u64 {
         self.treenode_track_size
     }
@@ -103,6 +108,7 @@ impl Default for FakeGetCountsSource {
             accepted_ledger_cache_hit_rate: JsonValue::Unsigned(60),
             fullbelow_size: 2,
             treenode_cache_size: 11,
+            treenode_cache_capacity_entries: 17,
             treenode_track_size: 13,
             node_store_counts: BTreeMap::from([(
                 "node_reads_total".to_owned(),
@@ -150,6 +156,10 @@ fn get_counts_defaults_min_count_to_ten() {
     assert_eq!(
         result.get("treenode_cache_size"),
         Some(&JsonValue::Unsigned(11))
+    );
+    assert_eq!(
+        result.get("treenode_cache_capacity_entries"),
+        Some(&JsonValue::Unsigned(17))
     );
     assert_eq!(
         result.get("treenode_track_size"),
@@ -254,6 +264,10 @@ fn get_counts_response_includes_all_fields() {
     assert_eq!(
         result.get("treenode_cache_size"),
         Some(&JsonValue::Unsigned(11))
+    );
+    assert_eq!(
+        result.get("treenode_cache_capacity_entries"),
+        Some(&JsonValue::Unsigned(17))
     );
     assert_eq!(
         result.get("treenode_track_size"),

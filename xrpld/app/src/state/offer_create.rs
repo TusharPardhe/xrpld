@@ -262,7 +262,7 @@ pub fn do_offer_create<V: ledger::ApplyView>(
     }
 
     let mut crossed = false;
-    let (remaining_gets, remaining_pays) = {
+    let (remaining_gets, remaining_pays) = 'cross: {
         // Cross as a payment from the offer creator back to themselves.
         // rippled's takerAmount.in is TakerGets (what the creator supplies)
         // and takerAmount.out is TakerPays (what the creator receives).
@@ -297,11 +297,11 @@ pub fn do_offer_create<V: ledger::ApplyView>(
                 true, // offer crossing
                 domain_id,
             );
-        // `flow()` returns a failed `toStrands` result immediately.  Continuing
-        // with a hand-built BookStep changes both the TER and the state changes
-        // for malformed or otherwise unavailable crossing paths.
+        // rippled's `flow()` returns a failed `toStrands` result immediately,
+        // but OfferCreate::flowCross treats any inner-flow failure as a dry
+        // cross. The unchanged residual offer may still rest on the book.
         if !is_tes_success(strands_ter) {
-            return strands_ter;
+            break 'cross (taker_gets.clone(), taker_pays.clone());
         }
 
         let self_cross_cancellations = ledger::flow_engine::SelfCrossCancellation::default();
@@ -349,17 +349,15 @@ pub fn do_offer_create<V: ledger::ApplyView>(
             return cancellation_result;
         }
 
+        // OfferCreate::flowCross only consumes actual amounts when inner flow
+        // succeeds. Stale/self-cross removals above remain applicable, but any
+        // non-success result leaves the residual offer unchanged.
+        if !is_tes_success(flow_result.ter) {
+            break 'cross (taker_gets.clone(), taker_pays.clone());
+        }
+
         let actual_in = flow_result.actual_in;
         let actual_out = flow_result.actual_out;
-
-        // even after fee deduction), propagate that directly — do not override with tecKILLED.
-        // This matches reference the reference source:359 where flowCross returns {tecUNFUNDED_OFFER, takerAmount}.
-        if flow_result.ter == Ter::TEC_UNFUNDED_OFFER
-            && actual_in.signum() == 0
-            && actual_out.signum() == 0
-        {
-            return Ter::TEC_UNFUNDED_OFFER;
-        }
 
         if actual_in.signum() > 0 || actual_out.signum() > 0 {
             crossed = true;

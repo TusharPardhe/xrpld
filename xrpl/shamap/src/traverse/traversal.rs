@@ -188,7 +188,7 @@ mod tests {
     use crate::node_id::SHAMapNodeId;
     use crate::tree_node::{SHAMapNodeType, SHAMapTreeNode};
     use basics::base_uint::Uint256;
-    use basics::intrusive_pointer::{SharedIntrusive, make_shared_intrusive};
+    use basics::intrusive_pointer::SharedIntrusive;
     use basics::sha_map_hash::SHAMapHash;
     use basics::tagged_cache::ManualClock;
     use std::sync::{Arc, Mutex};
@@ -227,13 +227,13 @@ mod tests {
 
     #[test]
     fn descend_reuses_loaded_child_without_fetching() {
-        let child = make_shared_intrusive(SHAMapTreeNode::new_leaf_with_hash(
+        let child = SHAMapTreeNode::new_leaf_with_hash(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(sample_uint256(1), vec![7; 12]),
             0,
             sample_hash(9),
-        ));
-        let parent = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        );
+        let parent = SHAMapTreeNode::new_inner(1);
         parent.set_child_hash(3, sample_hash(9));
         parent.share_child(3, &child);
 
@@ -250,13 +250,13 @@ mod tests {
 
     #[test]
     fn descend_fetches_and_canonicalizes_missing_child() {
-        let child = make_shared_intrusive(SHAMapTreeNode::new_leaf_with_hash(
+        let child = SHAMapTreeNode::new_leaf_with_hash(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(sample_uint256(2), vec![8; 12]),
             0,
             sample_hash(7),
-        ));
-        let parent = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        );
+        let parent = SHAMapTreeNode::new_inner(1);
         parent.set_child_hash(4, sample_hash(7));
 
         let mut fetch_calls = 0;
@@ -278,13 +278,13 @@ mod tests {
 
     #[test]
     fn descend_no_store_fetches_without_attaching_child() {
-        let child = make_shared_intrusive(SHAMapTreeNode::new_leaf_with_hash(
+        let child = SHAMapTreeNode::new_leaf_with_hash(
             SHAMapNodeType::TransactionNm,
             SHAMapItem::new(sample_uint256(3), vec![9; 12]),
             0,
             sample_hash(6),
-        ));
-        let parent = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        );
+        let parent = SHAMapTreeNode::new_inner(1);
         parent.set_child_hash(5, sample_hash(6));
 
         let fetched = descend_no_store(&parent, 5, true, &mut |_| Some(child.clone()))
@@ -295,7 +295,7 @@ mod tests {
 
     #[test]
     fn descend_throw_reports_missing_non_empty_branch() {
-        let parent = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let parent = SHAMapTreeNode::new_inner(1);
         parent.set_child_hash(2, sample_hash(4));
 
         let error = descend_throw(&parent, 2, true, &mut |_| None)
@@ -335,7 +335,7 @@ mod tests {
             NullNodeFetcher,
             SharedReporter(reporter.clone()),
         );
-        let parent = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let parent = SHAMapTreeNode::new_inner(1);
         parent.set_child_hash(2, sample_hash(4));
 
         assert!(descend_with_family(&parent, 2, true, 700, &family).is_none());
@@ -362,13 +362,13 @@ mod tests {
 
     #[test]
     fn descend_with_id_returns_child_and_next_node_id() {
-        let child = make_shared_intrusive(SHAMapTreeNode::new_leaf_with_hash(
+        let child = SHAMapTreeNode::new_leaf_with_hash(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(sample_uint256(4), vec![1; 12]),
             0,
             sample_hash(5),
-        ));
-        let parent = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        );
+        let parent = SHAMapTreeNode::new_inner(1);
         let parent_id = SHAMapNodeId::default();
         parent.set_child_hash(1, sample_hash(5));
 

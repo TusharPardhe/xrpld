@@ -14,11 +14,16 @@ use std::sync::Arc;
 
 use super::handle_real_dispatch;
 use app::state::application_root::apply_submit_transactor_shell;
-use basics::base_uint::{Uint160, Uint256};
+use basics::{
+    base_uint::{Uint160, Uint256},
+    str_hex::str_hex,
+    string_utilities::str_unhex,
+};
 use ledger::{ApplyView, ReadView, Sandbox};
 use protocol::{
-    AccountID, ApplyFlags, Currency, IOUAmount, Issue, LedgerEntryType, STAmount, STLedgerEntry,
-    STTx, StBase, Ter, TxType, XRPAmount, account_keylet, get_field_by_symbol, sf_generic,
+    AccountID, ApplyFlags, Currency, IOUAmount, Issue, LedgerEntryType, Rules, STAmount,
+    STLedgerEntry, STTx, SerialIter, Serializer, StBase, Ter, TxType, XRPAmount, account_keylet,
+    get_field_by_symbol, sf_generic,
 };
 
 use super::fixtures::*;
@@ -44,6 +49,116 @@ fn get_owner_count(view: &impl ReadView, account: AccountID) -> u32 {
         .flatten()
         .map(|sle| sle.get_field_u32(sf("sfOwnerCount")))
         .unwrap_or(0)
+}
+
+fn xrp_balance(view: &impl ReadView, account: AccountID) -> i64 {
+    view.read(account_keylet(acct_id(account)))
+        .expect("read account root")
+        .expect("account root must exist")
+        .get_field_amount(sf("sfBalance"))
+        .xrp()
+        .drops()
+}
+
+fn run_fok_buy_full_output_below_send_max(taker_has_line: bool) {
+    let maker = acct(0x11);
+    let taker = acct(0x22);
+    let issuer = acct(0x33);
+    let usd = usd_currency();
+
+    let mut entries = vec![
+        account_root(maker, 10_000_000_000, 1, 0),
+        account_root(taker, 10_000_000_000, u32::from(taker_has_line), 0),
+        account_root(issuer, 10_000_000_000, 0, protocol::lsfDefaultRipple),
+        trust_line(maker, issuer, usd, 1_000, 10_000, 0),
+    ];
+    if taker_has_line {
+        entries.push(trust_line(taker, issuer, usd, 0, 10_000, 0));
+    }
+    let ledger = build_ledger_with_features(entries, vec!["fixFillOrKill", "fixReducedOffersV2"]);
+    let mut view = new_view(ledger);
+
+    // The maker offers 100 USD for 1,000,000 drops. The incoming buy asks for
+    // all 50 USD while allowing up to 600,000 drops, so canonical execution
+    // delivers the complete output using only 500,000 drops.
+    let resting = offer_tx(maker, xrp(1_000_000), iou(issuer, usd, 100), 1);
+    assert_eq!(
+        full_apply(&mut view, &resting, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS
+    );
+    let resting_key = protocol::offer_keylet(acct_id(maker), 1);
+    assert!(
+        view.read(resting_key)
+            .expect("read resting maker offer")
+            .is_some()
+    );
+
+    let before = xrp_balance(&view, taker);
+    let buy = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), taker);
+        tx.set_field_amount(sf("sfTakerPays"), iou(issuer, usd, 50));
+        tx.set_field_amount(sf("sfTakerGets"), xrp(600_000));
+        tx.set_field_u32(sf("sfFlags"), protocol::tfFillOrKill);
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(
+        full_apply(&mut view, &buy, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS,
+        "fixFillOrKill buy completion is based on full output, not sendMax exhaustion"
+    );
+
+    let spent_excluding_fee = before - xrp_balance(&view, taker) - 10;
+    assert_eq!(spent_excluding_fee, 500_000);
+    assert!(
+        spent_excluding_fee < 600_000,
+        "buy must leave sendMax unused"
+    );
+    assert!(
+        view.read(protocol::offer_keylet(acct_id(taker), 1))
+            .expect("read taker FOK offer")
+            .is_none(),
+        "a successful FOK buy must not leave a taker residual offer"
+    );
+    let taker_line = view
+        .read(protocol::line(taker, issuer, usd))
+        .expect("read taker trust line")
+        .expect("full output delivery must leave a taker trust line");
+    assert_eq!(
+        taker_line
+            .get_field_amount(sf("sfBalance"))
+            .iou()
+            .to_string(),
+        "50"
+    );
+    let resting_after = view
+        .read(resting_key)
+        .expect("read partially consumed maker offer")
+        .expect("maker offer must retain its unconsumed half");
+    assert_eq!(
+        resting_after
+            .get_field_amount(sf("sfTakerPays"))
+            .xrp()
+            .drops(),
+        500_000
+    );
+    assert_eq!(
+        resting_after
+            .get_field_amount(sf("sfTakerGets"))
+            .iou()
+            .to_string(),
+        "50"
+    );
+}
+
+#[test]
+fn fok_buy_full_output_uses_less_than_send_max_with_existing_trust_line() {
+    run_fok_buy_full_output_below_send_max(true);
+}
+
+#[test]
+fn fok_buy_full_output_uses_less_than_send_max_and_creates_trust_line() {
+    run_fok_buy_full_output_below_send_max(false);
 }
 
 /// `BookStep::execOffer` applies issuer authorization to synthetic AMM offers
@@ -482,6 +597,87 @@ fn offer_replacement() {
     let r2 = handle_real_dispatch(&mut view, &tx2, TxType::OFFER_CREATE, None);
     assert_eq!(r2, Ter::TES_SUCCESS);
     // Old offer removed, new one placed — still 2 (trust + offer)
+    assert_eq!(get_owner_count(&view, alice), 2);
+}
+
+/// A failed inner payment-flow strand does not fail OfferCreate crossing.
+///
+/// rippled's `OfferCreate::flowCross` leaves the offer unchanged when `flow()`
+/// returns a non-success TER, then returns `tesSUCCESS` so a non-IOC/FOK offer
+/// can rest. Testnet transaction
+/// 5BD7047C8A4DE85068B1139532978858EFFA1E65227674F78F4F7BAB0756C4EC
+/// exercised this with an issuer-side NoRipple flag: the old OfferSequence
+/// target was deleted and the replacement was created without crossing.
+#[test]
+fn offer_sequence_replacement_rests_after_no_ripple_crossing_path() {
+    let alice = acct(0x11);
+    let gw = acct(0x33);
+    let usd = usd_currency();
+
+    let ledger = build_ledger(vec![
+        account_root(alice, 10_000_000_000, 1, 0),
+        account_root(gw, 10_000_000_000, 0, 0),
+        trust_line(alice, gw, usd, 1_000, 10_000, 0),
+    ]);
+    let mut view = new_view(ledger);
+
+    let original = offer_tx(alice, xrp(1_000_000_000), iou(gw, usd, 1_000), 1);
+    assert_eq!(
+        full_apply(&mut view, &original, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS
+    );
+
+    // Make the default IOU -> XRP crossing strand fail exactly as the live
+    // transaction did. The OfferCreate preclaim still succeeds because Alice
+    // owns funded IOU; only flow's crossing path is unavailable.
+    let line_keylet = protocol::line(alice, gw, usd);
+    let mut line = (*view
+        .read(line_keylet)
+        .expect("read trust line")
+        .expect("funding trust line must exist"))
+    .clone();
+    let issuer_no_ripple = if gw > alice {
+        protocol::lsfHighNoRipple
+    } else {
+        protocol::lsfLowNoRipple
+    };
+    let line_flags = line.get_field_u32(sf("sfFlags"));
+    line.set_field_u32(sf("sfFlags"), line_flags | issuer_no_ripple);
+    view.update(Arc::new(line))
+        .expect("set issuer-side NoRipple flag");
+
+    let replacement = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), alice);
+        tx.set_field_amount(sf("sfTakerPays"), xrp(2_000_000_000));
+        tx.set_field_amount(sf("sfTakerGets"), iou(gw, usd, 2_000));
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 2);
+        tx.set_field_u32(sf("sfOfferSequence"), 1);
+    });
+    assert_eq!(
+        full_apply(&mut view, &replacement, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS,
+        "a dry no-ripple crossing path must not escape flowCross"
+    );
+
+    assert!(
+        view.read(protocol::offer_keylet(acct_id(alice), 1))
+            .expect("read cancelled offer")
+            .is_none(),
+        "OfferSequence must delete the old offer"
+    );
+    let replacement_offer = view
+        .read(protocol::offer_keylet(acct_id(alice), 2))
+        .expect("read replacement offer")
+        .expect("the unchanged replacement must rest on the book");
+    assert_eq!(
+        replacement_offer.get_field_amount(sf("sfTakerPays")),
+        xrp(2_000_000_000)
+    );
+    assert_eq!(
+        replacement_offer.get_field_amount(sf("sfTakerGets")),
+        iou(gw, usd, 2_000)
+    );
     assert_eq!(get_owner_count(&view, alice), 2);
 }
 
@@ -1169,7 +1365,7 @@ fn offer_crossing_frozen_trust_line() {
 
     // Alice tries to sell frozen USD — should be unfunded
     let tx = offer_tx(alice, xrp(1_000_000_000), iou(gw, usd, 1000), 1);
-    let result = handle_real_dispatch(&mut view, &tx, TxType::OFFER_CREATE, None);
+    let result = full_apply(&mut view, &tx, TxType::OFFER_CREATE);
     assert_eq!(result, Ter::TEC_UNFUNDED_OFFER);
 }
 
@@ -1195,7 +1391,7 @@ fn offer_globally_frozen_issuer() {
     // OfferCreate.cpp:190-212 rejects GlobalFreeze before accountFunds;
     // Freeze_test.cpp:480-489 expects tecFROZEN in both offer directions.
     let tx = offer_tx(alice, xrp(1_000_000_000), iou(gw, usd, 1000), 1);
-    let result = handle_real_dispatch(&mut view, &tx, TxType::OFFER_CREATE, None);
+    let result = full_apply(&mut view, &tx, TxType::OFFER_CREATE);
     assert_eq!(result, Ter::TEC_FROZEN);
 }
 
@@ -1617,4 +1813,126 @@ fn offer_passive_no_cross_same_quality() {
     // Both offers should remain on book (passive didn't cross)
     assert_eq!(get_owner_count(&view, alice), 2); // trust + offer
     assert_eq!(get_owner_count(&view, bob), 2); // trust + offer
+}
+
+/// Testnet ledger 20,660,471 contains only this passive sell OfferCreate.
+/// Seven bounded parent entries are sufficient to execute the crossing: the
+/// taker and issuer roots, the issuer owner-directory root and overflow page,
+/// the resting offer, its book directory, and FeeSettings. Exact canonical
+/// metadata therefore pins the divergent transition without downloading the
+/// unrelated multi-million-SLE state.
+#[test]
+fn testnet_20660471_passive_sell_cross_matches_canonical_metadata() {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../fixtures/offer_create_testnet_20660471.json"
+    ))
+    .expect("canonical Testnet OfferCreate fixture");
+
+    let entries = fixture["entries"]
+        .as_array()
+        .expect("fixture parent entries")
+        .iter()
+        .map(|entry| {
+            let key = Uint256::from_hex(entry["index"].as_str().expect("parent SLE index"))
+                .expect("canonical parent SLE index");
+            let bytes = str_unhex(
+                entry["node_binary"]
+                    .as_str()
+                    .expect("canonical parent SLE bytes"),
+            )
+            .expect("hex parent SLE");
+            STLedgerEntry::from_serial_iter(&mut SerialIter::new(&bytes), key)
+        })
+        .collect();
+    let parent_seq = fixture["header"]["ledger"]["ledger_index"]
+        .as_u64()
+        .or_else(|| {
+            fixture["header"]["ledger"]["ledger_index"]
+                .as_str()
+                .and_then(|value| value.parse().ok())
+        })
+        .expect("parent sequence") as u32;
+    let mut parent = build_ledger_at_sequence(parent_seq, entries);
+    parent.set_total_drops(
+        fixture["header"]["ledger"]["total_coins"]
+            .as_str()
+            .expect("parent XRP drops")
+            .parse()
+            .expect("numeric parent XRP drops"),
+    );
+    parent.set_fees(ledger::Fees {
+        base: 10,
+        reserve: 1_000_000,
+        increment: 200_000,
+    });
+    parent.set_rules(Rules::new(
+        fixture["enabled_amendments"]
+            .as_array()
+            .expect("enabled amendments")
+            .iter()
+            .map(|id| {
+                Uint256::from_hex(id.as_str().expect("amendment ID"))
+                    .expect("canonical amendment ID")
+            }),
+    ));
+
+    let tx_bytes = str_unhex(
+        fixture["transaction"]["tx"]
+            .as_str()
+            .expect("canonical transaction bytes"),
+    )
+    .expect("hex transaction");
+    let tx = STTx::from_serial_iter(&mut SerialIter::new(&tx_bytes));
+    let tx_id = tx.get_transaction_id();
+    assert_eq!(
+        tx_id.to_string(),
+        "B0CDE71530F5EC99E6239D8EF3CA5C7DD86C87C67522C5FE31ABC57710EB8AEC"
+    );
+
+    let root = app::state::application_root::ApplicationRoot::with_options(
+        app::state::application_root::ApplicationRootOptions {
+            io_threads: 0,
+            job_queue_threads: 1,
+            ..Default::default()
+        },
+    )
+    .expect("OfferCreate replay application root");
+    root.on_closed_ledger(Arc::new(parent));
+    let child = &fixture["canonical_child"];
+    root.accept_ledger_with_txns(
+        child["seq"].as_u64().expect("child sequence") as u32,
+        child["close_time"].as_u64().expect("child close time") as u32,
+        child["close_time_resolution"]
+            .as_u64()
+            .expect("child close resolution") as u8,
+        child["close_flags"].as_i64().expect("child close flags") == 0,
+        10,
+        vec![Arc::new(tx)],
+    )
+    .expect("build the bounded canonical OfferCreate ledger");
+
+    let built = root.closed_ledger().expect("built OfferCreate ledger");
+    let (_, mut metadata) = built
+        .tx_read(tx_id)
+        .expect("read built transaction map")
+        .expect("built transaction exists");
+    assert_eq!(metadata.get_result_ter(), Ter::TES_SUCCESS);
+    let mut serialized = Serializer::default();
+    let ter = metadata.get_result_ter();
+    let index = metadata.get_index();
+    metadata.add_raw(&mut serialized, ter, index);
+    let actual_metadata = str_hex(serialized.data());
+    let expected_metadata = fixture["transaction"]["meta"]
+        .as_str()
+        .expect("canonical metadata");
+    assert_eq!(
+        actual_metadata, expected_metadata,
+        "single-transaction passive sell crossing must match canonical metadata bytes"
+    );
+    assert_eq!(
+        built.header().tx_hash.as_uint256().to_string(),
+        child["transaction_hash"]
+            .as_str()
+            .expect("canonical child transaction root")
+    );
 }

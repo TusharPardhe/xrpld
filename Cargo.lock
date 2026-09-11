@@ -141,6 +141,7 @@ dependencies = [
  "shamap",
  "tempfile",
  "tikv-jemalloc-ctl",
+ "tikv-jemallocator",
  "time",
  "tokio",
  "tokio-util",
@@ -292,7 +293,6 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 name = "basics"
 version = "0.8.0"
 dependencies = [
- "dashmap",
  "libc",
  "lz4_flex",
  "openssl",
@@ -301,6 +301,7 @@ dependencies = [
  "regex",
  "rocksdb",
  "tar",
+ "tikv-jemalloc-sys",
  "time",
  "tracing",
  "xxhash-rust",
@@ -2439,8 +2440,6 @@ dependencies = [
  "server",
  "shamap",
  "tempfile",
- "tikv-jemalloc-ctl",
- "tikv-jemallocator",
  "time",
  "tokio",
  "tracing",

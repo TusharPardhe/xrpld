@@ -1115,6 +1115,8 @@ pub const transitions: &str = "transitions";
 #[allow(non_upper_case_globals)]
 pub const treenode_cache_size: &str = "treenode_cache_size";
 #[allow(non_upper_case_globals)]
+pub const treenode_cache_capacity_entries: &str = "treenode_cache_capacity_entries";
+#[allow(non_upper_case_globals)]
 pub const treenode_track_size: &str = "treenode_track_size";
 #[allow(non_upper_case_globals)]
 pub const trusted: &str = "trusted";
@@ -1805,6 +1807,7 @@ pub const ALL: &[&str] = &[
     "transfer_rate",
     "transitions",
     "treenode_cache_size",
+    "treenode_cache_capacity_entries",
     "treenode_track_size",
     "trusted",
     "trusted_validator_keys",

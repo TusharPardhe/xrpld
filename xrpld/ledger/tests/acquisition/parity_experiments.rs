@@ -139,7 +139,7 @@ fn family(
 }
 
 fn shared_hash_tree(child_hash: SHAMapHash) -> SyncTree {
-    let root = make_shared_intrusive(SHAMapTreeNode::new_inner(0));
+    let root = SHAMapTreeNode::new_inner(0);
     // The same physical hash is reachable from two independent branches.
     root.set_child_hash(2, child_hash);
     root.set_child_hash(11, child_hash);
@@ -195,11 +195,11 @@ fn parity_deferred_shared_missing_hash_schedules_once_and_fans_out() {
 
 #[test]
 fn parity_shared_hash_present_and_missing_oracle_is_deterministic() {
-    let shared = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let shared = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         shamap::item::SHAMapItem::new(Uint256::from_array([0xA1; 32]), vec![0x42; 12]),
         0,
-    ));
+    );
     let shared_hash = shared.get_hash();
 
     let present_fetches = Arc::new(Mutex::new(Vec::new()));

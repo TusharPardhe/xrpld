@@ -6,18 +6,62 @@
 //! polymorphism so we can preserve intrusive lifetimes without requiring
 //! trait-object intrusive pointers in the first SHAMap slice.
 
-use crate::item::SHAMapItem;
+use crate::item::{SHAMapItem, shamap_item_memory_stats};
 use basics::base_uint::Uint256;
-use basics::intrusive_pointer::{IntrusiveObject, SharedIntrusive, make_shared_intrusive};
+use basics::intrusive_pointer::{IntrusiveObject, SharedIntrusive, SharedIntrusiveAdopt};
 use basics::intrusive_ref_counts::IntrusiveRefCounts;
 use basics::sha_map_hash::SHAMapHash;
-use parking_lot::RwLock;
 use sha2::{Digest, Sha512};
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::fmt;
 use std::marker::PhantomData;
 use std::ptr::{self, NonNull};
-use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
+
+static ALLOCATED_INNER_NODES: AtomicU64 = AtomicU64::new(0);
+static ALLOCATED_LEAF_NODES: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_INNER_NODES: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_LEAF_NODES: AtomicU64 = AtomicU64::new(0);
+static ALLOCATED_CHILD_SLOTS: AtomicU64 = AtomicU64::new(0);
+static LOADED_CHILD_LINKS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SHAMapMemoryStats {
+    pub allocated_inner_nodes: u64,
+    pub allocated_leaf_nodes: u64,
+    pub active_inner_nodes: u64,
+    pub active_leaf_nodes: u64,
+    pub allocated_child_slots: u64,
+    pub loaded_child_links: u64,
+    pub allocated_items: u64,
+    pub allocated_item_bytes: u64,
+    pub structural_bytes: u64,
+}
+pub fn shamap_memory_stats() -> SHAMapMemoryStats {
+    let allocated_inner_nodes = ALLOCATED_INNER_NODES.load(Ordering::Relaxed);
+    let allocated_leaf_nodes = ALLOCATED_LEAF_NODES.load(Ordering::Relaxed);
+    let allocated_child_slots = ALLOCATED_CHILD_SLOTS.load(Ordering::Relaxed);
+    let (allocated_items, allocated_item_bytes) = shamap_item_memory_stats();
+    SHAMapMemoryStats {
+        allocated_inner_nodes,
+        allocated_leaf_nodes,
+        active_inner_nodes: ACTIVE_INNER_NODES.load(Ordering::Relaxed),
+        active_leaf_nodes: ACTIVE_LEAF_NODES.load(Ordering::Relaxed),
+        allocated_child_slots,
+        loaded_child_links: LOADED_CHILD_LINKS.load(Ordering::Relaxed),
+        allocated_items,
+        allocated_item_bytes,
+        structural_bytes: allocated_inner_nodes
+            .saturating_mul(64)
+            .saturating_add(allocated_leaf_nodes.saturating_mul(56))
+            .saturating_add(allocated_item_bytes)
+            .saturating_add(allocated_child_slots.saturating_mul(
+                (std::mem::size_of::<SHAMapHash>()
+                    + std::mem::size_of::<Option<SharedIntrusive<SHAMapTreeNode>>>())
+                    as u64,
+            )),
+    }
+}
 
 pub const BRANCH_FACTOR: usize = 16;
 const HASH_PREFIX_TRANSACTION_ID: u32 = 0x54584E00;
@@ -32,31 +76,13 @@ pub const WIRE_TYPE_TRANSACTION_WITH_META: u8 = 4;
 const MIN_SHAMAP_ITEM_BYTES: usize = 12;
 const TAGGED_POINTER_BOUNDARIES: [usize; 4] = [2, 4, 6, BRANCH_FACTOR];
 
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SHAMapNodeType {
     Inner = 1,
     TransactionNm = 2,
     TransactionMd = 3,
     AccountState = 4,
-}
-
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone)]
-pub enum SHAMapTreeNodeKind {
-    Inner(SHAMapInnerNodeData),
-    Leaf(SHAMapLeafNodeData),
-}
-
-#[derive(Debug, Clone)]
-pub struct SHAMapInnerNodeData {
-    is_branch: u16,
-    full_below_gen: u32,
-}
-
-#[derive(Debug, Clone)]
-pub struct SHAMapLeafNodeData {
-    node_type: SHAMapNodeType,
-    item: SHAMapItem,
 }
 
 /// reference-shape `TaggedPointer`: low two bits are the capacity tag, and the
@@ -91,6 +117,7 @@ impl TaggedPointer {
         let raw = ptr.as_ptr() as usize;
         debug_assert_eq!(raw & 0b11, 0);
         debug_assert_eq!(layout.align() & 0b11, 0);
+        ALLOCATED_CHILD_SLOTS.fetch_add(capacity as u64, Ordering::Relaxed);
         Self {
             tagged: raw | tag,
             _marker: PhantomData,
@@ -153,15 +180,6 @@ impl TaggedPointer {
         unsafe { (&*self.children().add(index)).clone() }
     }
 
-    unsafe fn get_child_ptr_at_index(&self, index: usize) -> Option<*const SHAMapTreeNode> {
-        debug_assert!(index < self.capacity());
-        unsafe {
-            (&*self.children().add(index))
-                .as_ref()
-                .map(|si| &**si as *const SHAMapTreeNode)
-        }
-    }
-
     fn has_child_at_index(&self, index: usize) -> bool {
         debug_assert!(index < self.capacity());
         unsafe { (&*self.children().add(index)).is_some() }
@@ -170,7 +188,17 @@ impl TaggedPointer {
     fn set_child_at_index(&self, index: usize, child: Option<SharedIntrusive<SHAMapTreeNode>>) {
         debug_assert!(index < self.capacity());
         unsafe {
-            *self.children().add(index) = child;
+            let slot = &mut *self.children().add(index);
+            match (slot.is_some(), child.is_some()) {
+                (false, true) => {
+                    LOADED_CHILD_LINKS.fetch_add(1, Ordering::Relaxed);
+                }
+                (true, false) => {
+                    LOADED_CHILD_LINKS.fetch_sub(1, Ordering::Relaxed);
+                }
+                _ => {}
+            }
+            *slot = child;
         }
     }
 
@@ -251,6 +279,9 @@ impl TaggedPointer {
             };
             let hash = unsafe { *self.hashes().add(src_index) };
             let child = unsafe { (&mut *self.children().add(src_index)).take() };
+            if child.is_some() {
+                LOADED_CHILD_LINKS.fetch_sub(1, Ordering::Relaxed);
+            }
             let effective_dst_index = if dst_dense { branch } else { dst_index };
             next.set_hash_at_index(effective_dst_index, hash);
             next.set_child_at_index(effective_dst_index, child);
@@ -271,85 +302,55 @@ impl Drop for TaggedPointer {
         let children = self.children();
         unsafe {
             for index in 0..capacity {
+                if (&*children.add(index)).is_some() {
+                    LOADED_CHILD_LINKS.fetch_sub(1, Ordering::Relaxed);
+                }
                 ptr::drop_in_place(hashes.add(index));
                 ptr::drop_in_place(children.add(index));
             }
             dealloc(ptr.as_ptr(), tagged_arrays_layout(capacity));
         }
+        ALLOCATED_CHILD_SLOTS.fetch_sub(capacity as u64, Ordering::Relaxed);
         self.tagged = 0;
     }
 }
 
-/// Inner-node-specific arrays. Only allocated for inner nodes.
-#[derive(Debug)]
-pub struct InnerNodeArrays {
-    hashes_and_children: std::cell::UnsafeCell<TaggedPointer>,
-    /// Packed spinlock for children — one bit per branch, matching reference
-    /// `std::atomic<uint16_t> lock_` with `packed_spinlock`.
-    /// fetch_or to acquire, fetch_and to release. No RwLock overhead.
-    children_lock: AtomicU16,
-}
-
-impl InnerNodeArrays {
-    fn new(num_allocated_children: usize) -> Self {
-        Self {
-            hashes_and_children: std::cell::UnsafeCell::new(TaggedPointer::new(
-                num_allocated_children,
-            )),
-            children_lock: AtomicU16::new(0),
-        }
-    }
-
-    pub fn children_lock(&self) -> &AtomicU16 {
-        &self.children_lock
-    }
-
-    fn tagged(&self) -> &TaggedPointer {
-        unsafe { &*self.hashes_and_children.get() }
-    }
-
-    #[allow(clippy::mut_from_ref)]
-    fn tagged_mut(&self) -> &mut TaggedPointer {
-        unsafe { &mut *self.hashes_and_children.get() }
-    }
-}
-
-unsafe impl Sync for InnerNodeArrays {}
-unsafe impl Send for InnerNodeArrays {}
-
-#[derive(Debug)]
-/// SHAMap tree node — matches reference SHAMapInnerNode / SHAMapLeafNode layout.
-///
-///   isBranch_      → plain u16, read without lock
-///   fullBelowGen_  → plain u32, read without lock
-///   getChildHash   → array read without lock
-///   getChild       → packed_spinlock (1 bit per child)
-///
-/// We mirror this with atomic fields outside the RwLock for hot-path reads.
-/// The RwLock only protects the children pointer array and leaf data.
-///
+/// Public prefix/base view for concrete SHAMap allocations. Public handles stay
+/// `SharedIntrusive<SHAMapTreeNode>` while factories allocate concrete shells.
+#[repr(C, align(8))]
 pub struct SHAMapTreeNode {
     ref_counts: IntrusiveRefCounts,
     hash: std::cell::UnsafeCell<SHAMapHash>,
     cowid: AtomicU32,
-    /// Lock-free branch occupancy bitfield (reference isBranch_).
-    /// Updated atomically when branches change.
-    is_branch: AtomicU16,
-    /// Lock-free full-below generation (reference fullBelowGen_).
-    full_below_gen: AtomicU32,
-    /// Inner-node arrays (child hashes + child pointers + spinlock).
-    /// None for leaf nodes — saves ~640 bytes per leaf (~9 GB for mainnet).
-    inner_arrays: Option<Box<InnerNodeArrays>>,
-    /// Leaf data + inner metadata behind RwLock.
-    kind: RwLock<SHAMapTreeNodeKind>,
+    node_type: SHAMapNodeType,
+    base_padding: [u8; 3],
 }
-
-// Safety: child_hashes uses UnsafeCell for lock-free reads. Writes only happen
-// under the kind write lock. The SHAMap is accessed from a single thread during
-// sync scans. All other fields are already Sync (RwLock, Atomic).
+#[repr(C)]
+pub struct SHAMapInnerNode {
+    node: SHAMapTreeNode,
+    tagged: std::cell::UnsafeCell<TaggedPointer>,
+    is_branch: AtomicU16,
+    children_lock: AtomicU16,
+    full_below_gen: AtomicU32,
+}
+#[repr(C)]
+pub struct SHAMapLeafNode {
+    node: SHAMapTreeNode,
+    item: std::cell::UnsafeCell<Option<SHAMapItem>>,
+}
+const _: () = assert!(std::mem::size_of::<SHAMapTreeNode>() == 48);
+const _: () = assert!(std::mem::align_of::<SHAMapTreeNode>() == 8);
+const _: () = assert!(std::mem::size_of::<SHAMapInnerNode>() == 64);
+const _: () = assert!(std::mem::align_of::<SHAMapInnerNode>() == 8);
+const _: () = assert!(std::mem::size_of::<SHAMapLeafNode>() == 56);
+const _: () = assert!(std::mem::align_of::<SHAMapLeafNode>() == 8);
+const _: () = assert!(std::mem::size_of::<SharedIntrusive<SHAMapTreeNode>>() == 8);
 unsafe impl Sync for SHAMapTreeNode {}
 unsafe impl Send for SHAMapTreeNode {}
-
+unsafe impl Sync for SHAMapInnerNode {}
+unsafe impl Send for SHAMapInnerNode {}
+unsafe impl Sync for SHAMapLeafNode {}
+unsafe impl Send for SHAMapLeafNode {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SHAMapCodecError {
     ShortPrefixNode,
@@ -367,55 +368,166 @@ pub enum SHAMapCodecError {
     InvalidAccountStateNode,
     EmptyInnerNodeSerialization,
 }
+struct InnerLock<'a>(&'a SHAMapInnerNode);
+impl Drop for InnerLock<'_> {
+    fn drop(&mut self) {
+        self.0.children_lock.store(0, Ordering::Release);
+    }
+}
+// Leaf item synchronization must not consume a COW-ID bit: all `u32` COW
+// values, including the high bit, are public and valid. Address-striped locks
+// serialize leaf item access without adding a byte to the 56-byte leaf layout.
+const NODE_LOCK_STRIPES: usize = 256;
+static LEAF_ITEM_LOCKS: [AtomicBool; NODE_LOCK_STRIPES] =
+    [const { AtomicBool::new(false) }; NODE_LOCK_STRIPES];
+static NODE_HASH_LOCKS: [AtomicBool; NODE_LOCK_STRIPES] =
+    [const { AtomicBool::new(false) }; NODE_LOCK_STRIPES];
 
-impl SHAMapInnerNodeData {
-    fn new() -> Self {
-        Self {
-            is_branch: 0,
-            full_below_gen: 0,
+// Test-only scheduling hooks make the COW/leaf-item interleaving reproducible
+// without adding a byte to either concrete runtime node layout.
+#[cfg(test)]
+mod hash_lock_test_hooks {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    pub(super) static TARGET: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static PAUSE_WRITER: AtomicBool = AtomicBool::new(false);
+    pub(super) static WRITER_ACQUIRED: AtomicBool = AtomicBool::new(false);
+
+    pub(super) fn after_write_acquire(address: usize) {
+        if TARGET.load(Ordering::SeqCst) == address && PAUSE_WRITER.load(Ordering::SeqCst) {
+            WRITER_ACQUIRED.store(true, Ordering::SeqCst);
+            while PAUSE_WRITER.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
         }
     }
 
-    fn is_empty(&self) -> bool {
-        self.is_branch == 0
-    }
-
-    fn is_empty_branch(&self, branch: usize) -> bool {
-        (self.is_branch & (1 << branch)) == 0
-    }
-
-    fn branch_count(&self) -> usize {
-        self.is_branch.count_ones() as usize
-    }
-
-    fn iter_non_empty_child_indexes<F>(&self, arrays: &InnerNodeArrays, f: F)
-    where
-        F: FnMut(usize, usize),
-    {
-        arrays
-            .tagged()
-            .iter_non_empty_child_indexes(self.is_branch, f);
+    pub(super) fn reset() {
+        PAUSE_WRITER.store(false, Ordering::SeqCst);
+        WRITER_ACQUIRED.store(false, Ordering::SeqCst);
+        TARGET.store(0, Ordering::SeqCst);
     }
 }
 
-impl SHAMapTreeNode {
-    pub fn new_inner(cowid: u32) -> Self {
-        Self::new_inner_with_capacity(cowid, 0)
-    }
+#[cfg(test)]
+mod leaf_lock_test_hooks {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    fn new_inner_with_capacity(cowid: u32, num_allocated_children: usize) -> Self {
-        Self {
-            ref_counts: IntrusiveRefCounts::new(),
-            hash: std::cell::UnsafeCell::new(SHAMapHash::default()),
-            cowid: AtomicU32::new(cowid),
-            is_branch: AtomicU16::new(0),
-            full_below_gen: AtomicU32::new(0),
-            inner_arrays: Some(Box::new(InnerNodeArrays::new(num_allocated_children))),
-            kind: RwLock::new(SHAMapTreeNodeKind::Inner(SHAMapInnerNodeData::new())),
+    pub(super) static PAUSE_AFTER_ACQUIRE: AtomicBool = AtomicBool::new(false);
+    pub(super) static ACQUIRED: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static UNSHARE_ENTERED: AtomicUsize = AtomicUsize::new(0);
+
+    pub(super) fn after_acquire() {
+        if PAUSE_AFTER_ACQUIRE.load(Ordering::SeqCst) {
+            ACQUIRED.fetch_add(1, Ordering::SeqCst);
+            while PAUSE_AFTER_ACQUIRE.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
         }
     }
 
-    pub fn new_leaf(node_type: SHAMapNodeType, item: SHAMapItem, cowid: u32) -> Self {
+    pub(super) fn reset() {
+        PAUSE_AFTER_ACQUIRE.store(false, Ordering::SeqCst);
+        ACQUIRED.store(0, Ordering::SeqCst);
+        UNSHARE_ENTERED.store(0, Ordering::SeqCst);
+    }
+}
+
+struct NodeStripedLock(&'static AtomicBool);
+impl NodeStripedLock {
+    fn acquire(lock: &'static AtomicBool) -> Self {
+        loop {
+            if lock
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Self(lock);
+            }
+            std::hint::spin_loop();
+        }
+    }
+}
+impl Drop for NodeStripedLock {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+type LeafLock = NodeStripedLock;
+impl SHAMapInnerNode {
+    fn tagged(&self) -> &TaggedPointer {
+        unsafe { &*self.tagged.get() }
+    }
+    fn tagged_mut(&self) -> &mut TaggedPointer {
+        unsafe { &mut *self.tagged.get() }
+    }
+    fn lock(&self) -> InnerLock<'_> {
+        loop {
+            if self
+                .children_lock
+                .compare_exchange(0, u16::MAX, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                return InnerLock(self);
+            }
+            std::hint::spin_loop();
+        }
+    }
+}
+impl SHAMapLeafNode {
+    fn item_lock(&self) -> &'static AtomicBool {
+        let address = self as *const Self as usize;
+        &LEAF_ITEM_LOCKS[(address >> 3) % NODE_LOCK_STRIPES]
+    }
+
+    fn lock(&self) -> LeafLock {
+        let guard = LeafLock::acquire(self.item_lock());
+        #[cfg(test)]
+        leaf_lock_test_hooks::after_acquire();
+        guard
+    }
+    fn item(&self) -> &Option<SHAMapItem> {
+        unsafe { &*self.item.get() }
+    }
+    fn item_mut(&self) -> &mut Option<SHAMapItem> {
+        unsafe { &mut *self.item.get() }
+    }
+}
+impl SHAMapTreeNode {
+    fn base(cowid: u32, node_type: SHAMapNodeType, hash: SHAMapHash) -> Self {
+        Self {
+            ref_counts: IntrusiveRefCounts::new(),
+            hash: std::cell::UnsafeCell::new(hash),
+            cowid: AtomicU32::new(cowid),
+            node_type,
+            base_padding: [0; 3],
+        }
+    }
+    pub fn new_inner(cowid: u32) -> SharedIntrusive<Self> {
+        Self::new_inner_with_capacity(cowid, 0)
+    }
+    fn new_inner_with_capacity(cowid: u32, capacity: usize) -> SharedIntrusive<Self> {
+        let raw = Box::into_raw(Box::new(SHAMapInnerNode {
+            node: Self::base(cowid, SHAMapNodeType::Inner, SHAMapHash::default()),
+            tagged: std::cell::UnsafeCell::new(TaggedPointer::new(capacity)),
+            is_branch: AtomicU16::new(0),
+            children_lock: AtomicU16::new(0),
+            full_below_gen: AtomicU32::new(0),
+        }));
+        ALLOCATED_INNER_NODES.fetch_add(1, Ordering::Relaxed);
+        ACTIVE_INNER_NODES.fetch_add(1, Ordering::Relaxed);
+        unsafe {
+            SharedIntrusive::from_raw_with_owner(
+                (&mut (*raw).node) as *mut Self,
+                raw,
+                SharedIntrusiveAdopt::NoIncrement,
+            )
+        }
+    }
+    pub fn new_leaf(
+        node_type: SHAMapNodeType,
+        item: SHAMapItem,
+        cowid: u32,
+    ) -> SharedIntrusive<Self> {
         assert!(
             item.size() >= MIN_SHAMAP_ITEM_BYTES,
             "SHAMap leaf item payload below minimum size"
@@ -423,664 +535,481 @@ impl SHAMapTreeNode {
         let hash = compute_leaf_hash(node_type, &item);
         Self::new_leaf_with_hash(node_type, item, cowid, hash)
     }
-
     pub fn new_leaf_with_hash(
         node_type: SHAMapNodeType,
         item: SHAMapItem,
         cowid: u32,
         hash: SHAMapHash,
-    ) -> Self {
+    ) -> SharedIntrusive<Self> {
         assert!(
             item.size() >= MIN_SHAMAP_ITEM_BYTES,
             "SHAMap leaf item payload below minimum size"
         );
-        Self {
-            ref_counts: IntrusiveRefCounts::new(),
-            hash: std::cell::UnsafeCell::new(hash),
-            cowid: AtomicU32::new(cowid),
-            is_branch: AtomicU16::new(0),
-            full_below_gen: AtomicU32::new(0),
-            inner_arrays: None,
-            kind: RwLock::new(SHAMapTreeNodeKind::Leaf(SHAMapLeafNodeData {
-                node_type,
-                item,
-            })),
+        assert_ne!(node_type, SHAMapNodeType::Inner, "inner is not a leaf type");
+        let raw = Box::into_raw(Box::new(SHAMapLeafNode {
+            node: Self::base(cowid, node_type, hash),
+            item: std::cell::UnsafeCell::new(Some(item)),
+        }));
+        ALLOCATED_LEAF_NODES.fetch_add(1, Ordering::Relaxed);
+        ACTIVE_LEAF_NODES.fetch_add(1, Ordering::Relaxed);
+        unsafe {
+            SharedIntrusive::from_raw_with_owner(
+                (&mut (*raw).node) as *mut Self,
+                raw,
+                SharedIntrusiveAdopt::NoIncrement,
+            )
         }
     }
-
-    /// Access inner-node arrays. Panics if called on a leaf node.
-    #[inline]
-    fn arrays(&self) -> &InnerNodeArrays {
-        self.inner_arrays
-            .as_ref()
-            .expect("inner_arrays accessed on a leaf node")
+    fn inner(&self) -> &SHAMapInnerNode {
+        assert!(self.is_inner(), "inner operation on leaf");
+        unsafe { &*(self as *const Self as *const SHAMapInnerNode) }
     }
-
+    fn leaf(&self) -> &SHAMapLeafNode {
+        assert!(self.is_leaf(), "leaf operation on inner");
+        unsafe { &*(self as *const Self as *const SHAMapLeafNode) }
+    }
     pub fn cowid(&self) -> u32 {
         self.cowid.load(Ordering::Acquire)
     }
-
     pub fn unshare(&self) {
-        self.cowid.store(0, Ordering::Release);
+        if self.is_leaf() {
+            // Lock the item first. This makes the COW transition and all
+            // UnsafeCell access mutually exclusive: a writer either mutates
+            // while still owned or observes zero and rejects the operation.
+            #[cfg(test)]
+            leaf_lock_test_hooks::UNSHARE_ENTERED.fetch_add(1, Ordering::SeqCst);
+            let _guard = self.leaf().lock();
+            self.cowid.store(0, Ordering::Release);
+        } else {
+            self.cowid.store(0, Ordering::Release);
+        }
+    }
+    fn hash_lock(&self) -> NodeStripedLock {
+        let address = self as *const Self as usize;
+        NodeStripedLock::acquire(&NODE_HASH_LOCKS[(address >> 3) % NODE_LOCK_STRIPES])
     }
 
-    pub fn get_hash(&self) -> SHAMapHash {
+    fn hash_write_lock(&self) -> NodeStripedLock {
+        let guard = self.hash_lock();
+        #[cfg(test)]
+        hash_lock_test_hooks::after_write_acquire(self as *const Self as usize);
+        guard
+    }
+
+    fn get_hash_locked(&self) -> SHAMapHash {
         unsafe { *self.hash.get() }
     }
 
+    fn set_hash_locked(&self, hash: SHAMapHash) {
+        unsafe { *self.hash.get() = hash }
+    }
+
+    pub fn get_hash(&self) -> SHAMapHash {
+        let _guard = self.hash_lock();
+        self.get_hash_locked()
+    }
     pub fn set_hash(&self, hash: SHAMapHash) {
-        unsafe {
-            *self.hash.get() = hash;
-        }
+        let _guard = self.hash_write_lock();
+        self.set_hash_locked(hash)
     }
-
     pub fn zero_hash(&self) {
-        self.set_hash(SHAMapHash::default());
+        self.set_hash(SHAMapHash::default())
     }
-
     pub fn get_type(&self) -> SHAMapNodeType {
-        // OPTIMIZATION: the Inner arm never needs the lock — inner_arrays
-        // is Some for every inner node and None for every leaf, set once at
-        // construction and never mutated thereafter.  Only leaf nodes must enter
-        // the lock to read the concrete SHAMapNodeType variant.
-        // Not present in rippled which uses a virtual dispatch / type tag instead.
-        if self.inner_arrays.is_some() {
-            return SHAMapNodeType::Inner;
-        }
-        let kind = self.kind.read();
-        match &*kind {
-            SHAMapTreeNodeKind::Leaf(leaf) => leaf.node_type,
-            // inner_arrays.is_some() already handled above; this branch is
-            // unreachable in practice but keeps the match exhaustive.
-            SHAMapTreeNodeKind::Inner(_) => SHAMapNodeType::Inner,
-        }
+        self.node_type
     }
-
-    /// Returns `true` if this node is a leaf node.
-    ///
-    /// # Lock-free
-    /// `inner_arrays` is `None` for every leaf and `Some` for every inner node.
-    /// It is set once at construction (`new_leaf` / `new_inner_with_capacity`)
-    /// and never changed afterward, so no lock is required.
     #[inline]
     pub fn is_leaf(&self) -> bool {
-        self.inner_arrays.is_none()
+        self.node_type != SHAMapNodeType::Inner
     }
-
-    /// Returns `true` if this node is an inner node.
-    ///
-    /// # Lock-free
-    /// `inner_arrays` is `Some` for every inner node and `None` for every leaf.
-    /// It is set once at construction (`new_inner_with_capacity`) and never
-    /// changed afterward, so no lock is required.
-    ///
-    /// # Note: `peek_item_unchecked` not added
-    /// A zero-copy `peek_item_unchecked()` that bypasses the `kind` RwLock
-    /// entirely would require a raw `UnsafeCell<SHAMapLeafNodeData>` field,
-    /// because `parking_lot::RwLock` does not expose a `data_ptr()` accessor.
-    /// Restructuring the layout to enable that is left for a future phase.
     #[inline]
     pub fn is_inner(&self) -> bool {
-        self.inner_arrays.is_some()
+        self.node_type == SHAMapNodeType::Inner
     }
-
     pub fn clone_with_cowid(&self, cowid: u32) -> SharedIntrusive<Self> {
-        let hash = self.get_hash();
-        let cloned = {
-            let kind = self.kind.read();
-            match &*kind {
-                SHAMapTreeNodeKind::Inner(inner) => {
-                    let cloned =
-                        SHAMapTreeNode::new_inner_with_capacity(cowid, inner.branch_count());
-                    cloned.set_hash(hash);
-                    // Copy lock-free fields
-                    cloned.is_branch.store(inner.is_branch, Ordering::Relaxed);
-                    cloned.full_below_gen.store(
-                        self.full_below_gen.load(Ordering::Relaxed),
-                        Ordering::Relaxed,
-                    );
-                    cloned
-                        .arrays()
-                        .tagged_mut()
-                        .resize(inner.is_branch, inner.branch_count());
-                    inner.iter_non_empty_child_indexes(self.arrays(), |branch, index| {
-                        let hash = self.arrays().tagged().get_hash(inner.is_branch, branch);
-                        cloned.arrays().tagged().set_hash_at_index(index, hash);
-                    });
-                    {
-                        let mut cloned_kind = cloned.kind.write();
-                        if let SHAMapTreeNodeKind::Inner(cloned_inner) = &mut *cloned_kind {
-                            cloned_inner.is_branch = inner.is_branch;
-                            cloned_inner.full_below_gen = inner.full_below_gen;
-                        }
-                    }
-                    inner.iter_non_empty_child_indexes(self.arrays(), |branch, index| {
-                        if let Some(child) = self.get_child(branch) {
-                            cloned
-                                .arrays()
-                                .tagged()
-                                .set_child_at_index(index, Some(child));
-                        }
-                    });
-                    cloned
-                }
-                SHAMapTreeNodeKind::Leaf(leaf) => SHAMapTreeNode::new_leaf_with_hash(
-                    leaf.node_type,
-                    leaf.item.clone(),
-                    cowid,
-                    hash,
-                ),
-            }
-        };
-
-        make_shared_intrusive(cloned)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        let kind = self.kind.read();
-        match &*kind {
-            SHAMapTreeNodeKind::Inner(inner) => inner.is_empty(),
-            SHAMapTreeNodeKind::Leaf(_) => false,
+        if self.is_leaf() {
+            let leaf = self.leaf();
+            let _l = leaf.lock();
+            return Self::new_leaf_with_hash(
+                self.node_type,
+                leaf.item().as_ref().expect("active leaf").clone(),
+                cowid,
+                self.get_hash(),
+            );
         }
+        let src = self.inner();
+        let _src = src.lock();
+        let branches = src.is_branch.load(Ordering::Relaxed);
+        let cloned = Self::new_inner_with_capacity(cowid, branches.count_ones() as usize);
+        cloned.set_hash(self.get_hash());
+        {
+            let dst = cloned.inner();
+            let _dst = dst.lock();
+            dst.is_branch.store(branches, Ordering::Relaxed);
+            dst.full_below_gen.store(
+                src.full_below_gen.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            for branch in 0..BRANCH_FACTOR {
+                if branches & (1 << branch) == 0 {
+                    continue;
+                }
+                let si = src.tagged().child_index(branches, branch).unwrap();
+                let di = dst.tagged().child_index(branches, branch).unwrap();
+                dst.tagged()
+                    .set_hash_at_index(di, src.tagged().get_hash(branches, branch));
+                if let Some(child) = src.tagged().get_child_at_index(si) {
+                    dst.tagged().set_child_at_index(di, Some(child));
+                }
+            }
+        }
+        cloned
     }
-
-    /// Lock-free branch check — matches reference isEmptyBranch (plain bitfield read).
+    pub fn is_empty(&self) -> bool {
+        self.is_inner() && self.inner().is_branch.load(Ordering::Relaxed) == 0
+    }
     pub fn is_empty_branch(&self, branch: usize) -> bool {
         validate_branch(branch);
-        (self.is_branch.load(Ordering::Relaxed) & (1 << branch)) == 0
+        self.is_inner() && (self.inner().is_branch.load(Ordering::Relaxed) & (1 << branch)) == 0
     }
-
-    /// Lock-free branch count — matches reference getBranchCount.
     pub fn branch_count(&self) -> usize {
-        self.is_branch.load(Ordering::Relaxed).count_ones() as usize
+        if self.is_inner() {
+            self.inner().is_branch.load(Ordering::Relaxed).count_ones() as usize
+        } else {
+            0
+        }
     }
-
-    /// Lock-free child hash read — matches reference getChildHash (no lock).
-    #[inline(always)]
     pub fn get_child_hash(&self, branch: usize) -> SHAMapHash {
         validate_branch(branch);
-        let is_branch = self.is_branch.load(Ordering::Relaxed);
-        self.arrays().tagged().get_hash(is_branch, branch)
+        if !self.is_inner() {
+            return SHAMapHash::default();
+        }
+        let i = self.inner();
+        let _l = i.lock();
+        let b = i.is_branch.load(Ordering::Relaxed);
+        i.tagged().get_hash(b, branch)
     }
-
     pub fn set_child_hash(&self, branch: usize, hash: SHAMapHash) {
         validate_branch(branch);
-        let arrays = self.inner_arrays.as_ref().unwrap();
-        let mut kind = self.kind.write();
-        if let SHAMapTreeNodeKind::Inner(inner) = &mut *kind {
-            let src_branches = inner.is_branch;
-            let dst_branches = if hash.is_non_zero() {
-                src_branches | (1 << branch)
-            } else {
-                src_branches & !(1 << branch)
-            };
-            arrays.tagged_mut().rebuild(
-                src_branches,
-                dst_branches,
-                dst_branches.count_ones() as usize,
-            );
-            inner.is_branch = dst_branches;
-            self.is_branch.store(dst_branches, Ordering::Relaxed);
-            if hash.is_non_zero() {
-                let index = arrays
-                    .tagged()
-                    .child_index(inner.is_branch, branch)
-                    .expect("non-zero hash branch must be allocated");
-                arrays.tagged().set_hash_at_index(index, hash);
-            }
-        }
-    }
-
-    pub fn set_child(&self, branch: usize, child: Option<SharedIntrusive<SHAMapTreeNode>>) {
-        validate_branch(branch);
-        assert!(
-            self.cowid() != 0,
-            "owned inner nodes must have a non-zero cowid"
-        );
-        let arrays = self.inner_arrays.as_ref().unwrap();
-        let mut kind = self.kind.write();
-        let SHAMapTreeNodeKind::Inner(inner) = &mut *kind else {
-            return;
-        };
-
-        let src_branches = inner.is_branch;
-        if let Some(ref child) = child {
-            let dst_branches = src_branches | (1 << branch);
-            arrays.tagged_mut().rebuild(
-                src_branches,
-                dst_branches,
-                dst_branches.count_ones() as usize,
-            );
-            inner.is_branch = dst_branches;
-            self.is_branch.store(dst_branches, Ordering::Relaxed);
-            let index = arrays
-                .tagged()
-                .child_index(inner.is_branch, branch)
-                .expect("child branch must be allocated");
-            arrays
-                .tagged()
-                .set_hash_at_index(index, SHAMapHash::default());
-            arrays
-                .tagged()
-                .set_child_at_index(index, Some(child.clone()));
+        let i = self.inner();
+        let _l = i.lock();
+        let src = i.is_branch.load(Ordering::Relaxed);
+        let dst = if hash.is_non_zero() {
+            src | (1 << branch)
         } else {
-            let dst_branches = src_branches & !(1 << branch);
-            arrays.tagged_mut().rebuild(
-                src_branches,
-                dst_branches,
-                dst_branches.count_ones() as usize,
-            );
-            inner.is_branch = dst_branches;
-            self.is_branch.store(dst_branches, Ordering::Relaxed);
+            src & !(1 << branch)
+        };
+        i.tagged_mut().rebuild(src, dst, dst.count_ones() as usize);
+        i.is_branch.store(dst, Ordering::Relaxed);
+        if hash.is_non_zero() {
+            let n = i.tagged().child_index(dst, branch).unwrap();
+            i.tagged().set_hash_at_index(n, hash)
         }
-
-        drop(kind);
-        self.zero_hash();
     }
-
-    pub fn share_child(&self, branch: usize, child: &SharedIntrusive<SHAMapTreeNode>) {
+    pub fn set_child(&self, branch: usize, child: Option<SharedIntrusive<Self>>) {
         validate_branch(branch);
         assert!(
             self.cowid() != 0,
             "owned inner nodes must have a non-zero cowid"
         );
-        assert!(!self.is_empty_branch(branch), "branch must already exist");
-        let is_branch = self.is_branch.load(Ordering::Relaxed);
-        let index = self
-            .arrays()
-            .tagged()
-            .child_index(is_branch, branch)
-            .expect("non-empty branch must have a child index");
-        self.arrays()
-            .tagged()
-            .set_child_at_index(index, Some(child.clone()));
-    }
-
-    /// Per-branch child read — matches reference getChild (packed_spinlock per child).
-    pub fn get_child(&self, branch: usize) -> Option<SharedIntrusive<SHAMapTreeNode>> {
-        validate_branch(branch);
-        let is_branch = self.is_branch.load(Ordering::Relaxed);
-        let index = self.arrays().tagged().child_index(is_branch, branch)?;
-        let mask = 1u16 << index;
-        // Acquire spinlock for this branch
-        loop {
-            if self
-                .arrays()
-                .children_lock()
-                .fetch_or(mask, Ordering::Acquire)
-                & mask
-                == 0
-            {
-                break;
-            }
-            while self.arrays().children_lock().load(Ordering::Relaxed) & mask != 0 {
-                std::hint::spin_loop();
-            }
-        }
-        let result = self.arrays().tagged().get_child_at_index(index);
-        self.arrays()
-            .children_lock()
-            .fetch_and(!mask, Ordering::Release);
-        result
-    }
-
-    /// Evict all loaded children from this inner node, freeing their memory.
-    ///
-    /// The branch bitmap (`is_branch`) and branch hashes are preserved — only
-    /// the loaded child pointers are set to `None`. After this call:
-    /// - `is_empty_branch(b)` returns the same value as before (topology intact)
-    /// - `get_child_hash(b)` returns the same hash as before (identity intact)
-    /// - `get_child(b)` returns `None` for all branches (data evicted)
-    ///
-    /// This enables the backed-fetch path (`descend()` in SHAMap traversal) to
-    /// re-load individual nodes from NuDB on demand — the standard lazy-load
-    /// mechanism that already handles `None` children on backed trees.
-    ///
-    /// Thread-safety: uses the existing per-branch spinlock (`children_lock`)
-    /// identically to `get_child` / `canonicalize_child`. Concurrent readers
-    /// will either see the child (before eviction of that slot) or None (after),
-    /// both of which are valid states for a backed tree.
-    ///
-    /// Does NOT require `cowid != 0` — this is a memory-management operation,
-    /// not a tree mutation. The tree's logical content is unchanged.
-    pub fn release_loaded_children(&self) {
-        let Some(arrays) = self.inner_arrays.as_ref() else {
-            return; // Leaf node — nothing to release.
+        let i = self.inner();
+        let _l = i.lock();
+        let src = i.is_branch.load(Ordering::Relaxed);
+        let dst = if child.is_some() {
+            src | (1 << branch)
+        } else {
+            src & !(1 << branch)
         };
-
-        let is_branch = self.is_branch.load(Ordering::Relaxed);
-        if is_branch == 0 {
-            return; // No branches — nothing loaded.
+        i.tagged_mut().rebuild(src, dst, dst.count_ones() as usize);
+        i.is_branch.store(dst, Ordering::Relaxed);
+        if let Some(child) = child {
+            let n = i.tagged().child_index(dst, branch).unwrap();
+            i.tagged().set_hash_at_index(n, SHAMapHash::default());
+            i.tagged().set_child_at_index(n, Some(child));
         }
-
-        let tagged = arrays.tagged();
-        let num_children = is_branch.count_ones() as usize;
-
-        // Iterate over all compact indices that correspond to non-empty branches.
-        // Each index is locked independently via the per-branch spinlock.
-        for index in 0..num_children {
-            let mask = 1u16 << index;
-
-            // Acquire spinlock for this slot
-            loop {
-                if arrays.children_lock().fetch_or(mask, Ordering::Acquire) & mask == 0 {
-                    break;
-                }
-                while arrays.children_lock().load(Ordering::Relaxed) & mask != 0 {
-                    std::hint::spin_loop();
-                }
-            }
-
-            // Drop the child pointer (the hash at this index is untouched)
-            tagged.set_child_at_index(index, None);
-
-            // Release spinlock
-            arrays.children_lock().fetch_and(!mask, Ordering::Release);
-        }
+        self.zero_hash()
     }
-
-    /// Raw pointer child access — no ref counting, no clone.
-    /// Safety: caller must ensure the parent outlives the returned pointer.
-    #[inline(always)]
-    /// # Safety
-    /// Caller must ensure the returned pointer is not dereferenced after the node is dropped.
-    pub unsafe fn get_child_ptr(&self, branch: usize) -> Option<*const SHAMapTreeNode> {
-        let is_branch = self.is_branch.load(Ordering::Relaxed);
-        let index = self.arrays().tagged().child_index(is_branch, branch)?;
-        let mask = 1u16 << index;
-        loop {
-            if self
-                .arrays()
-                .children_lock()
-                .fetch_or(mask, Ordering::Acquire)
-                & mask
-                == 0
-            {
-                break;
-            }
-            while self.arrays().children_lock().load(Ordering::Relaxed) & mask != 0 {
-                std::hint::spin_loop();
-            }
-        }
-        let result = unsafe { self.arrays().tagged().get_child_ptr_at_index(index) };
-        self.arrays()
-            .children_lock()
-            .fetch_and(!mask, Ordering::Release);
-        result
+    pub fn share_child(&self, branch: usize, child: &SharedIntrusive<Self>) {
+        validate_branch(branch);
+        assert!(
+            self.cowid() != 0,
+            "owned inner nodes must have a non-zero cowid"
+        );
+        let i = self.inner();
+        let _l = i.lock();
+        let b = i.is_branch.load(Ordering::Relaxed);
+        let n = i
+            .tagged()
+            .child_index(b, branch)
+            .expect("branch must already exist");
+        i.tagged().set_child_at_index(n, Some(child.clone()))
     }
-
-    /// Check if a child is loaded without cloning.
-    #[inline(always)]
+    pub fn get_child(&self, branch: usize) -> Option<SharedIntrusive<Self>> {
+        validate_branch(branch);
+        if !self.is_inner() {
+            return None;
+        }
+        let i = self.inner();
+        let _l = i.lock();
+        let b = i.is_branch.load(Ordering::Relaxed);
+        i.tagged()
+            .child_index(b, branch)
+            .and_then(|n| i.tagged().get_child_at_index(n))
+    }
+    pub fn release_loaded_children(&self) {
+        if !self.is_inner() {
+            return;
+        }
+        let i = self.inner();
+        let _l = i.lock();
+        let b = i.is_branch.load(Ordering::Relaxed);
+        i.tagged()
+            .iter_non_empty_child_indexes(b, |_, n| i.tagged().set_child_at_index(n, None));
+    }
     pub fn has_child(&self, branch: usize) -> bool {
         validate_branch(branch);
-        let is_branch = self.is_branch.load(Ordering::Relaxed);
-        let Some(index) = self.arrays().tagged().child_index(is_branch, branch) else {
+        if !self.is_inner() {
             return false;
-        };
-        let mask = 1u16 << index;
-        loop {
-            if self
-                .arrays()
-                .children_lock()
-                .fetch_or(mask, Ordering::Acquire)
-                & mask
-                == 0
-            {
-                break;
-            }
-            while self.arrays().children_lock().load(Ordering::Relaxed) & mask != 0 {
-                std::hint::spin_loop();
-            }
         }
-        let result = self.arrays().tagged().has_child_at_index(index);
-        self.arrays()
-            .children_lock()
-            .fetch_and(!mask, Ordering::Release);
-        result
+        let i = self.inner();
+        let _l = i.lock();
+        let b = i.is_branch.load(Ordering::Relaxed);
+        i.tagged()
+            .child_index(b, branch)
+            .is_some_and(|n| i.tagged().has_child_at_index(n))
     }
-
-    /// Returns true if any non-empty branch has a loaded child pointer.
-    /// Used to avoid unnecessary release_loaded_children calls on nodes
-    /// that already have all children released.
     pub fn has_any_loaded_child(&self) -> bool {
-        let Some(arrays) = self.inner_arrays.as_ref() else {
-            return false;
-        };
-        let is_branch = self.is_branch.load(Ordering::Relaxed);
-        if is_branch == 0 {
+        if !self.is_inner() {
             return false;
         }
-        let tagged = arrays.tagged();
-        let num_children = is_branch.count_ones() as usize;
-        for index in 0..num_children {
-            if tagged.has_child_at_index(index) {
-                return true;
-            }
-        }
-        false
+        let i = self.inner();
+        let _l = i.lock();
+        let b = i.is_branch.load(Ordering::Relaxed);
+        let mut yes = false;
+        i.tagged()
+            .iter_non_empty_child_indexes(b, |_, n| yes |= i.tagged().has_child_at_index(n));
+        yes
     }
-
     pub fn canonicalize_child(
         &self,
         branch: usize,
-        node: SharedIntrusive<SHAMapTreeNode>,
-    ) -> SharedIntrusive<SHAMapTreeNode> {
+        node: SharedIntrusive<Self>,
+    ) -> SharedIntrusive<Self> {
         validate_branch(branch);
-        let node_hash = node.get_hash();
-        let stored_hash = self.get_child_hash(branch);
-        assert!(!self.is_empty_branch(branch), "branch must already exist");
         assert_eq!(
-            node_hash, stored_hash,
+            node.get_hash(),
+            self.get_child_hash(branch),
             "canonicalized node hash must match the stored branch hash"
         );
-
-        let is_branch = self.is_branch.load(Ordering::Relaxed);
-        let index = self
-            .arrays()
+        let i = self.inner();
+        let _l = i.lock();
+        let b = i.is_branch.load(Ordering::Relaxed);
+        let n = i
             .tagged()
-            .child_index(is_branch, branch)
-            .expect("non-empty branch must have a child index");
-        let mask = 1u16 << index;
-        loop {
-            if self
-                .arrays()
-                .children_lock()
-                .fetch_or(mask, Ordering::Acquire)
-                & mask
-                == 0
-            {
-                break;
-            }
-            while self.arrays().children_lock().load(Ordering::Relaxed) & mask != 0 {
-                std::hint::spin_loop();
-            }
-        }
-        let existing = self.arrays().tagged().get_child_at_index(index);
-        let result = if let Some(existing) = existing {
-            existing.clone()
+            .child_index(b, branch)
+            .expect("branch must already exist");
+        if let Some(old) = i.tagged().get_child_at_index(n) {
+            old
         } else {
-            self.arrays()
-                .tagged()
-                .set_child_at_index(index, Some(node.clone()));
-            // Also update inner data for serialization paths
+            i.tagged().set_child_at_index(n, Some(node.clone()));
             node
-        };
-        self.arrays()
-            .children_lock()
-            .fetch_and(!mask, Ordering::Release);
-        result
+        }
     }
-
-    /// Lock-free full-below check — matches reference isFullBelow (plain field read).
     pub fn is_full_below(&self, generation: u32) -> bool {
-        self.full_below_gen.load(Ordering::Relaxed) == generation
+        self.is_inner() && self.inner().full_below_gen.load(Ordering::Relaxed) == generation
     }
-
-    /// Lock-free full-below set — matches reference setFullBelowGen.
     pub fn set_full_below_gen(&self, generation: u32) {
-        self.full_below_gen.store(generation, Ordering::Relaxed);
+        if self.is_inner() {
+            self.inner()
+                .full_below_gen
+                .store(generation, Ordering::Relaxed)
+        }
     }
 
     pub fn peek_item(&self) -> Option<SHAMapItem> {
-        let kind = self.kind.read();
-        match &*kind {
-            SHAMapTreeNodeKind::Leaf(leaf) => Some(leaf.item.clone()),
-            SHAMapTreeNodeKind::Inner(_) => None,
+        if !self.is_leaf() {
+            return None;
         }
+        let l = self.leaf();
+        let _g = l.lock();
+        l.item().as_ref().cloned()
     }
-
     pub fn set_item(&self, item: SHAMapItem) -> bool {
+        let l = self.leaf();
+        let _g = l.lock();
+        // The ownership decision and item mutation must share this guard. An
+        // unshare that wins first publishes zero before releasing the same lock,
+        // so a later writer cannot mutate a now-shareable leaf.
         assert!(
-            self.cowid() != 0,
+            self.cowid.load(Ordering::Acquire) != 0,
             "owned leaf nodes must have a non-zero cowid"
         );
-
-        let old_hash = self.get_hash();
-        let new_hash = {
-            let mut kind = self.kind.write();
-            let SHAMapTreeNodeKind::Leaf(leaf) = &mut *kind else {
-                panic!("set_item is only valid for leaf nodes");
-            };
-            leaf.item = item;
-            compute_leaf_hash(leaf.node_type, &leaf.item)
-        };
-
-        self.set_hash(new_hash);
-        old_hash != new_hash
+        let old = self.get_hash();
+        *l.item_mut() = Some(item);
+        let next = compute_leaf_hash(self.node_type, l.item().as_ref().expect("active leaf"));
+        self.set_hash(next);
+        old != next
     }
-
     pub fn update_hash(&self) {
-        let next_hash = {
-            let kind = self.kind.read();
-            match &*kind {
-                SHAMapTreeNodeKind::Inner(inner) => compute_inner_hash(inner, self.arrays()),
-                SHAMapTreeNodeKind::Leaf(leaf) => compute_leaf_hash(leaf.node_type, &leaf.item),
-            }
+        let next = if self.is_inner() {
+            let i = self.inner();
+            let _g = i.lock();
+            compute_inner_hash(i.is_branch.load(Ordering::Relaxed), i.tagged())
+        } else {
+            let l = self.leaf();
+            let _g = l.lock();
+            compute_leaf_hash(self.node_type, l.item().as_ref().expect("active leaf"))
         };
-
-        self.set_hash(next_hash);
+        self.set_hash(next)
     }
-
     pub fn update_hash_deep(&self) {
-        let next_hash = {
-            let mut kind = self.kind.write();
-            let SHAMapTreeNodeKind::Inner(inner) = &mut *kind else {
-                panic!("update_hash_deep is only valid for inner nodes");
-            };
-
-            for branch in 0..BRANCH_FACTOR {
-                if inner.is_empty_branch(branch) {
-                    continue;
-                }
-
-                let index = self
-                    .arrays()
-                    .tagged()
-                    .child_index(inner.is_branch, branch)
-                    .expect("non-empty branch must have a child index");
-                if let Some(child) = self.arrays().tagged().get_child_at_index(index) {
-                    let h = child.get_hash();
-                    self.arrays().tagged().set_hash_at_index(index, h);
-                }
+        let i = self.inner();
+        let _g = i.lock();
+        let b = i.is_branch.load(Ordering::Relaxed);
+        i.tagged().iter_non_empty_child_indexes(b, |_, n| {
+            if let Some(c) = i.tagged().get_child_at_index(n) {
+                i.tagged().set_hash_at_index(n, c.get_hash())
             }
-
-            compute_inner_hash(inner, self.arrays())
-        };
-
-        self.set_hash(next_hash);
+        });
+        self.set_hash(compute_inner_hash(b, i.tagged()))
     }
-
     pub fn serialize_for_wire(&self) -> Result<Vec<u8>, SHAMapCodecError> {
-        let kind = self.kind.read();
-        match &*kind {
-            SHAMapTreeNodeKind::Leaf(leaf) => Ok(serialize_leaf_for_wire(leaf)),
-            SHAMapTreeNodeKind::Inner(inner) => serialize_inner_for_wire(inner, self.arrays()),
+        if self.is_inner() {
+            let i = self.inner();
+            let _g = i.lock();
+            serialize_inner_for_wire(i.is_branch.load(Ordering::Relaxed), i.tagged())
+        } else {
+            let l = self.leaf();
+            let _g = l.lock();
+            Ok(serialize_leaf_for_wire(
+                self.node_type,
+                l.item().as_ref().expect("active leaf"),
+            ))
         }
     }
-
     pub fn serialize_with_prefix(&self) -> Result<Vec<u8>, SHAMapCodecError> {
-        let kind = self.kind.read();
-        match &*kind {
-            SHAMapTreeNodeKind::Leaf(leaf) => Ok(serialize_leaf_with_prefix(leaf)),
-            SHAMapTreeNodeKind::Inner(inner) => serialize_inner_with_prefix(inner, self.arrays()),
+        if self.is_inner() {
+            let i = self.inner();
+            let _g = i.lock();
+            serialize_inner_with_prefix(i.is_branch.load(Ordering::Relaxed), i.tagged())
+        } else {
+            let l = self.leaf();
+            let _g = l.lock();
+            Ok(serialize_leaf_with_prefix(
+                self.node_type,
+                l.item().as_ref().expect("active leaf"),
+            ))
         }
     }
-
-    pub fn make_from_wire(
-        raw_node: &[u8],
-    ) -> Result<Option<SharedIntrusive<SHAMapTreeNode>>, SHAMapCodecError> {
-        let Some((&node_type, payload)) = raw_node.split_last() else {
+    pub fn make_from_wire(raw: &[u8]) -> Result<Option<SharedIntrusive<Self>>, SHAMapCodecError> {
+        let Some((&ty, data)) = raw.split_last() else {
             return Ok(None);
         };
-
-        let node = match node_type {
-            WIRE_TYPE_TRANSACTION => make_transaction_node(payload, None)?,
-            WIRE_TYPE_ACCOUNT_STATE => make_account_state_node(payload, None)?,
-            WIRE_TYPE_INNER => make_full_inner(payload, None)?,
-            WIRE_TYPE_COMPRESSED_INNER => make_compressed_inner(payload)?,
-            WIRE_TYPE_TRANSACTION_WITH_META => make_transaction_with_meta_node(payload, None)?,
-            other => {
-                tracing::warn!(
-                    target: "shamap",
-                    wire_type = other,
-                    wire_bytes = raw_node.len(),
-                    "Failed to decode wire node"
-                );
-                return Err(SHAMapCodecError::UnknownWireType(other));
-            }
-        };
-
-        Ok(Some(node))
+        Ok(Some(match ty {
+            WIRE_TYPE_TRANSACTION => make_transaction_node(data, None)?,
+            WIRE_TYPE_ACCOUNT_STATE => make_account_state_node(data, None)?,
+            WIRE_TYPE_INNER => make_full_inner(data, None)?,
+            WIRE_TYPE_COMPRESSED_INNER => make_compressed_inner(data)?,
+            WIRE_TYPE_TRANSACTION_WITH_META => make_transaction_with_meta_node(data, None)?,
+            other => return Err(SHAMapCodecError::UnknownWireType(other)),
+        }))
     }
-
     pub fn make_from_prefix(
-        raw_node: &[u8],
+        raw: &[u8],
         hash: SHAMapHash,
-    ) -> Result<SharedIntrusive<SHAMapTreeNode>, SHAMapCodecError> {
-        if raw_node.len() < u32::BITS as usize / 8 {
-            tracing::warn!(target: "shamap", "Failed to decode prefix node");
+    ) -> Result<SharedIntrusive<Self>, SHAMapCodecError> {
+        if raw.len() < 4 {
             return Err(SHAMapCodecError::ShortPrefixNode);
         }
-
-        let (prefix_bytes, payload) = raw_node.split_at(4);
-        let prefix = u32::from_be_bytes(
-            prefix_bytes
-                .try_into()
-                .expect("prefix split must yield exactly four bytes"),
-        );
-
-        match prefix {
-            HASH_PREFIX_TRANSACTION_ID => make_transaction_node(payload, Some(hash)),
-            HASH_PREFIX_LEAF_NODE => make_account_state_node(payload, Some(hash)),
-            HASH_PREFIX_INNER_NODE => make_full_inner(payload, Some(hash)),
-            HASH_PREFIX_TX_NODE => make_transaction_with_meta_node(payload, Some(hash)),
-            other => {
-                tracing::warn!(target: "shamap", "Failed to decode prefix node");
-                Err(SHAMapCodecError::UnknownPrefixType(other))
-            }
+        let (p, d) = raw.split_at(4);
+        match u32::from_be_bytes(p.try_into().unwrap()) {
+            HASH_PREFIX_TRANSACTION_ID => make_transaction_node(d, Some(hash)),
+            HASH_PREFIX_LEAF_NODE => make_account_state_node(d, Some(hash)),
+            HASH_PREFIX_INNER_NODE => make_full_inner(d, Some(hash)),
+            HASH_PREFIX_TX_NODE => make_transaction_with_meta_node(d, Some(hash)),
+            x => Err(SHAMapCodecError::UnknownPrefixType(x)),
         }
     }
+    fn partial_inner(&self) {
+        let i = self.inner();
+        ACTIVE_INNER_NODES.fetch_sub(1, Ordering::Relaxed);
+        let _g = i.lock();
+        let b = i.is_branch.load(Ordering::Relaxed);
+        i.tagged()
+            .iter_non_empty_child_indexes(b, |_, n| i.tagged().set_child_at_index(n, None));
+    }
+    fn partial_leaf(&self) {
+        let l = self.leaf();
+        ACTIVE_LEAF_NODES.fetch_sub(1, Ordering::Relaxed);
+        let _g = l.lock();
+        drop(l.item_mut().take());
+    }
 }
-
 impl IntrusiveObject for SHAMapTreeNode {
     fn intrusive_ref_counts(&self) -> &IntrusiveRefCounts {
         &self.ref_counts
     }
 
     fn partial_destructor(&self) {
-        // OPTIMIZATION: use the lock-free inner_arrays presence check instead of
-        // acquiring the kind RwLock just to distinguish node type.
-        // inner_arrays is set once at construction and is immutable thereafter,
-        // so reading it without a lock is safe.
-        if self.inner_arrays.is_some() {
-            let is_branch = self.is_branch.load(Ordering::Relaxed);
-            let arrays = self.arrays();
-            arrays
-                .tagged()
-                .iter_non_empty_child_indexes(is_branch, |_, index| {
-                    arrays.tagged().set_child_at_index(index, None);
-                });
+        if self.is_inner() {
+            self.partial_inner()
+        } else {
+            self.partial_leaf()
         }
+    }
+
+    fn initialize_intrusive_owner<Owner: IntrusiveObject>(&self, _owner: std::ptr::NonNull<Owner>) {
+        // The compact base discriminator supplies the same concrete destruction
+        // dispatch as rippled's vtable. Registering every live node in the
+        // generic owner map would add an out-of-object allocation per node.
+    }
+
+    fn dispatch_intrusive_partial_destroy(&self) {
+        self.ref_counts
+            .dispatch_partial_destroy_with(|| self.partial_destructor());
+    }
+
+    fn dispatch_intrusive_final_destroy(&self) {
+        let raw = self as *const Self as *mut Self;
+        unsafe {
+            if self.is_inner() {
+                drop(Box::from_raw(raw.cast::<SHAMapInnerNode>()));
+            } else {
+                drop(Box::from_raw(raw.cast::<SHAMapLeafNode>()));
+            }
+        }
+    }
+}
+impl IntrusiveObject for SHAMapInnerNode {
+    fn intrusive_ref_counts(&self) -> &IntrusiveRefCounts {
+        self.node.intrusive_ref_counts()
+    }
+    fn partial_destructor(&self) {
+        self.node.partial_inner()
+    }
+}
+impl IntrusiveObject for SHAMapLeafNode {
+    fn intrusive_ref_counts(&self) -> &IntrusiveRefCounts {
+        self.node.intrusive_ref_counts()
+    }
+    fn partial_destructor(&self) {
+        self.node.partial_leaf()
+    }
+}
+impl Drop for SHAMapInnerNode {
+    fn drop(&mut self) {
+        if !self.node.ref_counts.partial_destroy_started() {
+            ACTIVE_INNER_NODES.fetch_sub(1, Ordering::Relaxed);
+        }
+        ALLOCATED_INNER_NODES.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+impl Drop for SHAMapLeafNode {
+    fn drop(&mut self) {
+        if !self.node.ref_counts.partial_destroy_started() {
+            ACTIVE_LEAF_NODES.fetch_sub(1, Ordering::Relaxed);
+        }
+        ALLOCATED_LEAF_NODES.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -1136,255 +1065,209 @@ fn children_ptr(ptr: NonNull<u8>, capacity: usize) -> *mut Option<SharedIntrusiv
     unsafe { ptr.as_ptr().add(child_offset(capacity)).cast() }
 }
 
-fn serialize_leaf_for_wire(leaf: &SHAMapLeafNodeData) -> Vec<u8> {
-    let wire_type = match leaf.node_type {
+fn serialize_leaf_for_wire(node_type: SHAMapNodeType, item: &SHAMapItem) -> Vec<u8> {
+    let ty = match node_type {
         SHAMapNodeType::Inner => panic!("inner nodes are not serialized as leaves"),
         SHAMapNodeType::TransactionNm => WIRE_TYPE_TRANSACTION,
         SHAMapNodeType::TransactionMd => WIRE_TYPE_TRANSACTION_WITH_META,
         SHAMapNodeType::AccountState => WIRE_TYPE_ACCOUNT_STATE,
     };
-
-    let mut bytes = Vec::with_capacity(leaf.item.size() + Uint256::BYTES + 1);
-    bytes.extend_from_slice(leaf.item.data());
-    if !matches!(leaf.node_type, SHAMapNodeType::TransactionNm) {
-        bytes.extend_from_slice(leaf.item.key().data());
+    let mut out = Vec::with_capacity(item.size() + Uint256::BYTES + 1);
+    out.extend_from_slice(item.data());
+    if node_type != SHAMapNodeType::TransactionNm {
+        out.extend_from_slice(item.key().data())
     }
-    bytes.push(wire_type);
-    bytes
+    out.push(ty);
+    out
 }
-
-fn serialize_leaf_with_prefix(leaf: &SHAMapLeafNodeData) -> Vec<u8> {
-    let prefix = match leaf.node_type {
+fn serialize_leaf_with_prefix(node_type: SHAMapNodeType, item: &SHAMapItem) -> Vec<u8> {
+    let p = match node_type {
         SHAMapNodeType::Inner => panic!("inner nodes are not serialized as leaves"),
         SHAMapNodeType::TransactionNm => HASH_PREFIX_TRANSACTION_ID,
         SHAMapNodeType::TransactionMd => HASH_PREFIX_TX_NODE,
         SHAMapNodeType::AccountState => HASH_PREFIX_LEAF_NODE,
     };
-
-    let mut bytes = Vec::with_capacity(4 + leaf.item.size() + Uint256::BYTES);
-    bytes.extend_from_slice(&prefix.to_be_bytes());
-    bytes.extend_from_slice(leaf.item.data());
-    if !matches!(leaf.node_type, SHAMapNodeType::TransactionNm) {
-        bytes.extend_from_slice(leaf.item.key().data());
+    let mut out = Vec::with_capacity(4 + item.size() + Uint256::BYTES);
+    out.extend_from_slice(&p.to_be_bytes());
+    out.extend_from_slice(item.data());
+    if node_type != SHAMapNodeType::TransactionNm {
+        out.extend_from_slice(item.key().data())
     }
-    bytes
+    out
 }
-
 fn serialize_inner_for_wire(
-    inner: &SHAMapInnerNodeData,
-    arrays: &InnerNodeArrays,
+    branches: u16,
+    arrays: &TaggedPointer,
 ) -> Result<Vec<u8>, SHAMapCodecError> {
-    if inner.is_empty() {
+    if branches == 0 {
         return Err(SHAMapCodecError::EmptyInnerNodeSerialization);
     }
-
-    if inner.branch_count() < 12 {
-        let mut bytes = Vec::with_capacity(inner.branch_count() * (Uint256::BYTES + 1) + 1);
-        for branch in 0..BRANCH_FACTOR {
-            if inner.is_empty_branch(branch) {
-                continue;
+    if branches.count_ones() < 12 {
+        let mut out = Vec::new();
+        for b in 0..BRANCH_FACTOR {
+            if branches & (1 << b) != 0 {
+                out.extend_from_slice(arrays.get_hash(branches, b).as_uint256().data());
+                out.push(b as u8)
             }
-            let hash = arrays.tagged().get_hash(inner.is_branch, branch);
-            bytes.extend_from_slice(hash.as_uint256().data());
-            bytes.push(branch as u8);
         }
-        bytes.push(WIRE_TYPE_COMPRESSED_INNER);
-        Ok(bytes)
+        out.push(WIRE_TYPE_COMPRESSED_INNER);
+        Ok(out)
     } else {
-        let mut bytes = Vec::with_capacity(BRANCH_FACTOR * Uint256::BYTES + 1);
-        for i in 0..BRANCH_FACTOR {
-            let hash = arrays.tagged().get_hash(inner.is_branch, i);
-            bytes.extend_from_slice(hash.as_uint256().data());
+        let mut out = Vec::new();
+        for b in 0..BRANCH_FACTOR {
+            out.extend_from_slice(arrays.get_hash(branches, b).as_uint256().data())
         }
-        bytes.push(WIRE_TYPE_INNER);
-        Ok(bytes)
+        out.push(WIRE_TYPE_INNER);
+        Ok(out)
     }
 }
-
 fn serialize_inner_with_prefix(
-    inner: &SHAMapInnerNodeData,
-    arrays: &InnerNodeArrays,
+    branches: u16,
+    arrays: &TaggedPointer,
 ) -> Result<Vec<u8>, SHAMapCodecError> {
-    if inner.is_empty() {
+    if branches == 0 {
         return Err(SHAMapCodecError::EmptyInnerNodeSerialization);
     }
-
-    let mut bytes = Vec::with_capacity(4 + BRANCH_FACTOR * Uint256::BYTES);
-    bytes.extend_from_slice(&HASH_PREFIX_INNER_NODE.to_be_bytes());
-    for i in 0..BRANCH_FACTOR {
-        let hash = arrays.tagged().get_hash(inner.is_branch, i);
-        bytes.extend_from_slice(hash.as_uint256().data());
+    let mut out = Vec::with_capacity(4 + BRANCH_FACTOR * Uint256::BYTES);
+    out.extend_from_slice(&HASH_PREFIX_INNER_NODE.to_be_bytes());
+    for b in 0..BRANCH_FACTOR {
+        out.extend_from_slice(arrays.get_hash(branches, b).as_uint256().data())
     }
-    Ok(bytes)
+    Ok(out)
 }
-
 fn make_transaction_node(
     data: &[u8],
-    known_hash: Option<SHAMapHash>,
+    known: Option<SHAMapHash>,
 ) -> Result<SharedIntrusive<SHAMapTreeNode>, SHAMapCodecError> {
     validate_leaf_payload(SHAMapNodeType::TransactionNm, data)?;
-    let key = sha512_half_bytes(HASH_PREFIX_TRANSACTION_ID, [data]);
-    let item = SHAMapItem::new(key, data.to_vec());
-    Ok(make_shared_intrusive(match known_hash {
+    let item = SHAMapItem::new(
+        sha512_half_bytes(HASH_PREFIX_TRANSACTION_ID, [data]),
+        data.to_vec(),
+    );
+    Ok(match known {
         Some(hash) => {
             SHAMapTreeNode::new_leaf_with_hash(SHAMapNodeType::TransactionNm, item, 0, hash)
         }
         None => SHAMapTreeNode::new_leaf(SHAMapNodeType::TransactionNm, item, 0),
-    }))
+    })
 }
-
 fn make_transaction_with_meta_node(
     data: &[u8],
-    known_hash: Option<SHAMapHash>,
+    known: Option<SHAMapHash>,
 ) -> Result<SharedIntrusive<SHAMapTreeNode>, SHAMapCodecError> {
     if data.len() < Uint256::BYTES {
         return Err(SHAMapCodecError::ShortTransactionWithMetaNode(data.len()));
     }
-
-    let split = data.len() - Uint256::BYTES;
-    let (payload, tag_bytes) = data.split_at(split);
+    let (payload, key) = data.split_at(data.len() - Uint256::BYTES);
     validate_leaf_payload(SHAMapNodeType::TransactionMd, payload)?;
-    let tag = Uint256::from_slice(tag_bytes).expect("slice length should already be validated");
-    let item = SHAMapItem::new(tag, payload.to_vec());
-
-    Ok(make_shared_intrusive(match known_hash {
+    let item = SHAMapItem::new(Uint256::from_slice(key).unwrap(), payload.to_vec());
+    Ok(match known {
         Some(hash) => {
             SHAMapTreeNode::new_leaf_with_hash(SHAMapNodeType::TransactionMd, item, 0, hash)
         }
         None => SHAMapTreeNode::new_leaf(SHAMapNodeType::TransactionMd, item, 0),
-    }))
+    })
 }
-
 fn make_account_state_node(
     data: &[u8],
-    known_hash: Option<SHAMapHash>,
+    known: Option<SHAMapHash>,
 ) -> Result<SharedIntrusive<SHAMapTreeNode>, SHAMapCodecError> {
     if data.len() < Uint256::BYTES {
         return Err(SHAMapCodecError::ShortAccountStateNode(data.len()));
     }
-
-    let split = data.len() - Uint256::BYTES;
-    let (payload, tag_bytes) = data.split_at(split);
+    let (payload, key) = data.split_at(data.len() - Uint256::BYTES);
     validate_leaf_payload(SHAMapNodeType::AccountState, payload)?;
-    let tag = Uint256::from_slice(tag_bytes).expect("slice length should already be validated");
-    if tag.is_zero() {
+    let key = Uint256::from_slice(key).unwrap();
+    if key.is_zero() {
         return Err(SHAMapCodecError::InvalidAccountStateNode);
     }
-
-    let item = SHAMapItem::new(tag, payload.to_vec());
-    Ok(make_shared_intrusive(match known_hash {
+    let item = SHAMapItem::new(key, payload.to_vec());
+    Ok(match known {
         Some(hash) => {
             SHAMapTreeNode::new_leaf_with_hash(SHAMapNodeType::AccountState, item, 0, hash)
         }
         None => SHAMapTreeNode::new_leaf(SHAMapNodeType::AccountState, item, 0),
-    }))
+    })
 }
-
 fn validate_leaf_payload(node_type: SHAMapNodeType, data: &[u8]) -> Result<(), SHAMapCodecError> {
     if data.len() < MIN_SHAMAP_ITEM_BYTES {
-        return Err(SHAMapCodecError::ShortLeafNode {
+        Err(SHAMapCodecError::ShortLeafNode {
             node_type,
             len: data.len(),
-        });
+        })
+    } else {
+        Ok(())
     }
-    Ok(())
 }
-
 fn make_full_inner(
     data: &[u8],
-    known_hash: Option<SHAMapHash>,
+    known: Option<SHAMapHash>,
 ) -> Result<SharedIntrusive<SHAMapTreeNode>, SHAMapCodecError> {
     if data.len() != BRANCH_FACTOR * Uint256::BYTES {
         return Err(SHAMapCodecError::InvalidFullInnerSize(data.len()));
     }
-
-    let node = make_shared_intrusive(SHAMapTreeNode::new_inner_with_capacity(0, BRANCH_FACTOR));
-    {
-        let mut kind = node.kind.write();
-        let SHAMapTreeNodeKind::Inner(inner) = &mut *kind else {
-            unreachable!("new_inner must create an inner node");
-        };
-
-        for (branch, chunk) in data.chunks_exact(Uint256::BYTES).enumerate() {
-            let hash = SHAMapHash::new(
-                Uint256::from_slice(chunk).expect("chunk length should match uint256"),
-            );
-            node.arrays().tagged().set_hash_at_index(branch, hash);
-            if hash.is_non_zero() {
-                inner.is_branch |= 1 << branch;
-            }
+    let node = SHAMapTreeNode::new_inner_with_capacity(0, BRANCH_FACTOR);
+    let i = node.inner();
+    let _g = i.lock();
+    let mut branches: u16 = 0;
+    for (b, chunk) in data.chunks_exact(Uint256::BYTES).enumerate() {
+        let hash = SHAMapHash::new(Uint256::from_slice(chunk).unwrap());
+        i.tagged().set_hash_at_index(b, hash);
+        if hash.is_non_zero() {
+            branches |= 1 << b
         }
-        node.arrays()
-            .tagged_mut()
-            .resize(inner.is_branch, inner.branch_count());
-        node.is_branch.store(inner.is_branch, Ordering::Relaxed);
     }
-
-    if let Some(hash) = known_hash {
-        node.set_hash(hash);
+    i.tagged_mut()
+        .resize(branches, branches.count_ones() as usize);
+    i.is_branch.store(branches, Ordering::Relaxed);
+    drop(_g);
+    if let Some(hash) = known {
+        node.set_hash(hash)
     } else {
-        node.update_hash();
+        node.update_hash()
     }
-
     Ok(node)
 }
-
 fn make_compressed_inner(data: &[u8]) -> Result<SharedIntrusive<SHAMapTreeNode>, SHAMapCodecError> {
-    let chunk_size = Uint256::BYTES + 1;
-    if !data.len().is_multiple_of(chunk_size) || data.len() > chunk_size * BRANCH_FACTOR {
+    let chunk = Uint256::BYTES + 1;
+    if !data.len().is_multiple_of(chunk) || data.len() > chunk * BRANCH_FACTOR {
         return Err(SHAMapCodecError::InvalidCompressedInnerSize(data.len()));
     }
-
-    let node = make_shared_intrusive(SHAMapTreeNode::new_inner_with_capacity(0, BRANCH_FACTOR));
-    {
-        let mut kind = node.kind.write();
-        let SHAMapTreeNodeKind::Inner(inner) = &mut *kind else {
-            unreachable!("new_inner must create an inner node");
-        };
-
-        for chunk in data.chunks_exact(chunk_size) {
-            let (hash_bytes, position_bytes) = chunk.split_at(Uint256::BYTES);
-            let position = position_bytes[0];
-            if position as usize >= BRANCH_FACTOR {
-                return Err(SHAMapCodecError::InvalidCompressedInnerBranch(position));
-            }
-
-            let hash = SHAMapHash::new(
-                Uint256::from_slice(hash_bytes).expect("chunk length should match uint256"),
-            );
-            node.arrays()
-                .tagged()
-                .set_hash_at_index(position as usize, hash);
-            if hash.is_non_zero() {
-                inner.is_branch |= 1 << position;
-            }
+    let node = SHAMapTreeNode::new_inner_with_capacity(0, BRANCH_FACTOR);
+    let i = node.inner();
+    let _g = i.lock();
+    let mut branches: u16 = 0;
+    for c in data.chunks_exact(chunk) {
+        let (h, p) = c.split_at(Uint256::BYTES);
+        let b = p[0] as usize;
+        if b >= BRANCH_FACTOR {
+            return Err(SHAMapCodecError::InvalidCompressedInnerBranch(p[0]));
         }
-        node.arrays()
-            .tagged_mut()
-            .resize(inner.is_branch, inner.branch_count());
-        node.is_branch.store(inner.is_branch, Ordering::Relaxed);
+        let hash = SHAMapHash::new(Uint256::from_slice(h).unwrap());
+        i.tagged().set_hash_at_index(b, hash);
+        if hash.is_non_zero() {
+            branches |= 1 << b
+        }
     }
-
+    i.tagged_mut()
+        .resize(branches, branches.count_ones() as usize);
+    i.is_branch.store(branches, Ordering::Relaxed);
+    drop(_g);
     node.update_hash();
     Ok(node)
 }
-
-fn compute_inner_hash(inner: &SHAMapInnerNodeData, arrays: &InnerNodeArrays) -> SHAMapHash {
-    if inner.is_branch == 0 {
+fn compute_inner_hash(branches: u16, arrays: &TaggedPointer) -> SHAMapHash {
+    if branches == 0 {
         return SHAMapHash::default();
     }
-
-    let mut hasher = Sha512::new();
-    hasher.update(HASH_PREFIX_INNER_NODE.to_be_bytes());
-    arrays.tagged().iter_children(inner.is_branch, |_, hash| {
-        hasher.update(hash.as_uint256().data());
-    });
-    let digest = hasher.finalize();
-    let mut out = [0_u8; Uint256::BYTES];
+    let mut h = Sha512::new();
+    h.update(HASH_PREFIX_INNER_NODE.to_be_bytes());
+    arrays.iter_children(branches, |_, x| h.update(x.as_uint256().data()));
+    let digest = h.finalize();
+    let mut out = [0; Uint256::BYTES];
     out.copy_from_slice(&digest[..Uint256::BYTES]);
     SHAMapHash::new(Uint256::from_array(out))
 }
-
 fn compute_leaf_hash(node_type: SHAMapNodeType, item: &SHAMapItem) -> SHAMapHash {
     let prefix = match node_type {
         SHAMapNodeType::Inner => panic!("inner nodes do not have leaf hashes"),
@@ -1392,43 +1275,43 @@ fn compute_leaf_hash(node_type: SHAMapNodeType, item: &SHAMapItem) -> SHAMapHash
         SHAMapNodeType::TransactionMd => HASH_PREFIX_TX_NODE,
         SHAMapNodeType::AccountState => HASH_PREFIX_LEAF_NODE,
     };
-    let hash = if matches!(node_type, SHAMapNodeType::TransactionNm) {
+    SHAMapHash::new(if node_type == SHAMapNodeType::TransactionNm {
         sha512_half_bytes(prefix, [item.data()])
     } else {
         sha512_half_bytes(prefix, [item.data(), item.key().data()])
-    };
-
-    SHAMapHash::new(hash)
+    })
 }
-
 fn sha512_half_bytes<I, T>(prefix: u32, parts: I) -> Uint256
 where
     I: IntoIterator<Item = T>,
     T: AsRef<[u8]>,
 {
-    let mut hasher = Sha512::new();
-    hasher.update(prefix.to_be_bytes());
-    for part in parts {
-        hasher.update(part.as_ref());
+    let mut h = Sha512::new();
+    h.update(prefix.to_be_bytes());
+    for p in parts {
+        h.update(p.as_ref())
     }
-
-    let digest = hasher.finalize();
-    let mut bytes = [0u8; Uint256::BYTES];
-    bytes.copy_from_slice(&digest[..Uint256::BYTES]);
-    Uint256::from_array(bytes)
+    let d = h.finalize();
+    let mut out = [0; Uint256::BYTES];
+    out.copy_from_slice(&d[..Uint256::BYTES]);
+    Uint256::from_array(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         BRANCH_FACTOR, HASH_PREFIX_INNER_NODE, HASH_PREFIX_LEAF_NODE, HASH_PREFIX_TX_NODE,
-        SHAMapCodecError, SHAMapItem, SHAMapNodeType, SHAMapTreeNode, SHAMapTreeNodeKind,
-        TaggedPointer, WIRE_TYPE_ACCOUNT_STATE, WIRE_TYPE_COMPRESSED_INNER, WIRE_TYPE_INNER,
+        SHAMapCodecError, SHAMapInnerNode, SHAMapItem, SHAMapLeafNode, SHAMapNodeType,
+        SHAMapTreeNode, TaggedPointer, WIRE_TYPE_ACCOUNT_STATE, WIRE_TYPE_COMPRESSED_INNER,
+        WIRE_TYPE_INNER,
     };
     use basics::base_uint::Uint256;
-    use basics::intrusive_pointer::{IntrusiveObject, make_shared_intrusive};
+    use basics::intrusive_pointer::SharedIntrusive;
     use basics::sha_map_hash::SHAMapHash;
     use std::sync::atomic::Ordering;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
 
     fn sample_uint256(fill: u8) -> Uint256 {
         Uint256::from_array([fill; 32])
@@ -1499,12 +1382,12 @@ mod tests {
         let branch_5_index = tagged
             .child_index(src_branches, 5)
             .expect("branch 5 should be present");
-        let child = make_shared_intrusive(SHAMapTreeNode::new_leaf_with_hash(
+        let child = SHAMapTreeNode::new_leaf_with_hash(
             SHAMapNodeType::TransactionNm,
             SHAMapItem::new(sample_uint256(5), vec![7; 12]),
             0,
             sample_hash(5),
-        ));
+        );
         let child_weak = child.downgrade();
 
         tagged.set_hash_at_index(branch_1_index, sample_hash(1));
@@ -1545,7 +1428,7 @@ mod tests {
             .expect("compressed inner should decode")
             .expect("compressed inner should return a node");
         assert_eq!(compressed_node.branch_count(), 2);
-        assert_eq!(compressed_node.arrays().tagged().capacity(), 2);
+        assert_eq!(compressed_node.inner().tagged().capacity(), 2);
         assert_eq!(compressed_node.get_child_hash(2), sample_hash(0x11));
         assert_eq!(compressed_node.get_child_hash(15), sample_hash(0x22));
 
@@ -1560,14 +1443,39 @@ mod tests {
             .expect("full inner should decode")
             .expect("full inner should return a node");
         assert_eq!(full_node.branch_count(), 7);
-        assert_eq!(full_node.arrays().tagged().capacity(), BRANCH_FACTOR);
+        assert_eq!(full_node.inner().tagged().capacity(), BRANCH_FACTOR);
         assert_eq!(full_node.get_child_hash(11), sample_hash(12));
         assert_eq!(full_node.get_child_hash(12), SHAMapHash::default());
     }
 
     #[test]
+    fn concrete_runtime_layouts_match_cpp_measurements() {
+        assert_eq!(std::mem::size_of::<SHAMapInnerNode>(), 64);
+        assert_eq!(std::mem::align_of::<SHAMapInnerNode>(), 8);
+        assert_eq!(std::mem::size_of::<SHAMapLeafNode>(), 56);
+        assert_eq!(std::mem::align_of::<SHAMapLeafNode>(), 8);
+        assert_eq!(std::mem::size_of::<SharedIntrusive<SHAMapTreeNode>>(), 8);
+        assert_eq!(
+            std::mem::size_of::<Option<SharedIntrusive<SHAMapTreeNode>>>(),
+            8
+        );
+    }
+
+    #[test]
+    fn compact_nodes_do_not_allocate_generic_owner_registry_entries() {
+        let inner = SHAMapTreeNode::new_inner(1);
+        let leaf = SHAMapTreeNode::new_leaf(
+            SHAMapNodeType::AccountState,
+            SHAMapItem::new(sample_uint256(0x91), vec![0x22; 12]),
+            1,
+        );
+        assert!(!inner.ref_counts.has_registered_owner_metadata());
+        assert!(!leaf.ref_counts.has_registered_owner_metadata());
+    }
+
+    #[test]
     fn common_node_fields_match_cpp_roles() {
-        let node = make_shared_intrusive(SHAMapTreeNode::new_inner(9));
+        let node = SHAMapTreeNode::new_inner(9);
         assert!(node.is_inner());
         assert!(!node.is_leaf());
         assert_eq!(node.get_type(), SHAMapNodeType::Inner);
@@ -1582,12 +1490,12 @@ mod tests {
 
     #[test]
     fn inner_node_keeps_branch_occupancy_separate_from_child_hashes() {
-        let parent = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
-        let child = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let parent = SHAMapTreeNode::new_inner(1);
+        let child = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(sample_uint256(3), vec![1; 12]),
             0,
-        ));
+        );
 
         parent.set_child(2, Some(child));
         assert!(!parent.is_empty_branch(2));
@@ -1601,13 +1509,13 @@ mod tests {
 
     #[test]
     fn inner_partial_destructor_clears_loaded_children_but_keeps_hashes() {
-        let parent = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
-        let child = make_shared_intrusive(SHAMapTreeNode::new_leaf_with_hash(
+        let parent = SHAMapTreeNode::new_inner(1);
+        let child = SHAMapTreeNode::new_leaf_with_hash(
             SHAMapNodeType::TransactionNm,
             SHAMapItem::new(sample_uint256(4), vec![2; 12]),
             0,
             sample_hash(5),
-        ));
+        );
         let child_weak = child.downgrade();
 
         parent.set_child_hash(1, sample_hash(5));
@@ -1615,23 +1523,28 @@ mod tests {
         drop(child);
         assert!(!child_weak.expired());
 
-        IntrusiveObject::partial_destructor(&*parent);
-
+        let parent_raw = &*parent as *const SHAMapTreeNode;
+        let parent_weak = parent.downgrade();
+        drop(parent);
+        assert!(parent_weak.expired());
         assert!(child_weak.expired());
-        assert_eq!(parent.get_child_hash(1), sample_hash(5));
-        assert!(parent.get_child(1).is_none());
-        assert!(!parent.is_empty_branch(1));
+        // Weak ownership retains the allocation shell and immutable topology.
+        let partially_destroyed = unsafe { &*parent_raw };
+        assert_eq!(partially_destroyed.get_child_hash(1), sample_hash(5));
+        assert!(partially_destroyed.get_child(1).is_none());
+        assert!(!partially_destroyed.is_empty_branch(1));
+        drop(parent_weak);
     }
 
     #[test]
     fn clone_with_cowid_preserves_structure() {
-        let parent = make_shared_intrusive(SHAMapTreeNode::new_inner(7));
-        let child = make_shared_intrusive(SHAMapTreeNode::new_leaf_with_hash(
+        let parent = SHAMapTreeNode::new_inner(7);
+        let child = SHAMapTreeNode::new_leaf_with_hash(
             SHAMapNodeType::TransactionMd,
             SHAMapItem::new(sample_uint256(2), vec![3; 16]),
             0,
             sample_hash(6),
-        ));
+        );
         parent.set_hash(sample_hash(1));
         parent.set_child_hash(3, sample_hash(6));
         parent.share_child(3, &child);
@@ -1644,8 +1557,7 @@ mod tests {
         assert_eq!(clone.get_child_hash(3), sample_hash(6));
         assert!(clone.get_child(3).is_some());
         assert!(clone.is_full_below(22));
-        let kind = clone.kind.write();
-        assert!(matches!(&*kind, SHAMapTreeNodeKind::Inner(_)));
+        assert!(clone.is_inner());
     }
 
     #[test]
@@ -1658,21 +1570,10 @@ mod tests {
         ];
         let item = SHAMapItem::new(key, data);
 
-        let transaction = make_shared_intrusive(SHAMapTreeNode::new_leaf(
-            SHAMapNodeType::TransactionNm,
-            item.clone(),
-            1,
-        ));
-        let account_state = make_shared_intrusive(SHAMapTreeNode::new_leaf(
-            SHAMapNodeType::AccountState,
-            item.clone(),
-            1,
-        ));
-        let transaction_with_meta = make_shared_intrusive(SHAMapTreeNode::new_leaf(
-            SHAMapNodeType::TransactionMd,
-            item,
-            1,
-        ));
+        let transaction = SHAMapTreeNode::new_leaf(SHAMapNodeType::TransactionNm, item.clone(), 1);
+        let account_state = SHAMapTreeNode::new_leaf(SHAMapNodeType::AccountState, item.clone(), 1);
+        let transaction_with_meta =
+            SHAMapTreeNode::new_leaf(SHAMapNodeType::TransactionMd, item, 1);
 
         assert_eq!(
             transaction.get_hash().as_uint256(),
@@ -1692,13 +1593,129 @@ mod tests {
     }
 
     #[test]
-    fn set_item_recomputes_leaf_hash_and_reports_when_it_changed() {
+    fn concurrent_hash_read_waits_for_compact_node_writer() {
+        use super::hash_lock_test_hooks::{PAUSE_WRITER, TARGET, WRITER_ACQUIRED, reset};
+
+        reset();
+        let node = SHAMapTreeNode::new_inner(1);
+        let next = sample_hash(0xE1);
+        TARGET.store((&*node as *const SHAMapTreeNode) as usize, Ordering::SeqCst);
+        PAUSE_WRITER.store(true, Ordering::SeqCst);
+
+        let writer = {
+            let node = node.clone();
+            thread::spawn(move || node.set_hash(next))
+        };
+        while !WRITER_ACQUIRED.load(Ordering::SeqCst) {
+            thread::yield_now();
+        }
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let reader = {
+            let node = node.clone();
+            thread::spawn(move || {
+                done_tx.send(node.get_hash()).expect("hash reader receiver");
+            })
+        };
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "hash reader must not access UnsafeCell while writer owns its stripe"
+        );
+
+        PAUSE_WRITER.store(false, Ordering::SeqCst);
+        writer.join().expect("hash writer should join");
+        assert_eq!(
+            done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("hash reader should resume"),
+            next
+        );
+        reader.join().expect("hash reader should join");
+        reset();
+    }
+
+    #[test]
+    fn leaf_unshare_waits_for_item_lock_and_rejects_post_unshare_mutation() {
+        use super::leaf_lock_test_hooks::{ACQUIRED, PAUSE_AFTER_ACQUIRE, UNSHARE_ENTERED, reset};
+
+        reset();
         let key = sample_uint256(0xAB);
-        let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let leaf = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(key, vec![1; 12]),
             9,
-        ));
+        );
+        let updated = SHAMapItem::new(key, vec![2; 12]);
+        let expected = updated.clone();
+
+        PAUSE_AFTER_ACQUIRE.store(true, Ordering::SeqCst);
+        let writer = {
+            let leaf = leaf.clone();
+            thread::spawn(move || leaf.set_item(updated))
+        };
+        while ACQUIRED.load(Ordering::SeqCst) == 0 {
+            thread::yield_now();
+        }
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let unshare = {
+            let leaf = leaf.clone();
+            thread::spawn(move || {
+                leaf.unshare();
+                done_tx.send(()).expect("unshare completion receiver");
+            })
+        };
+        while UNSHARE_ENTERED.load(Ordering::SeqCst) == 0 {
+            thread::yield_now();
+        }
+        // The writer owns LeafLock and has not entered the item UnsafeCell yet;
+        // unshare has started but must not clear its lock bit or return.
+        assert!(done_rx.try_recv().is_err());
+        assert_eq!(leaf.cowid(), 9);
+
+        PAUSE_AFTER_ACQUIRE.store(false, Ordering::SeqCst);
+        assert!(writer.join().expect("leaf writer should complete"));
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("unshare should complete once the item lock is released");
+        unshare.join().expect("unshare thread should join");
+
+        assert_eq!(leaf.cowid(), 0);
+        assert_eq!(leaf.peek_item(), Some(expected.clone()));
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            leaf.set_item(SHAMapItem::new(key, vec![3; 12]));
+        }));
+        assert!(rejected.is_err());
+        assert_eq!(leaf.peek_item(), Some(expected));
+        reset();
+    }
+
+    #[test]
+    fn leaf_lock_preserves_high_bit_cowid() {
+        let key = sample_uint256(0xCD);
+        let cowid = 0x8000_1234;
+        let leaf = SHAMapTreeNode::new_leaf(
+            SHAMapNodeType::AccountState,
+            SHAMapItem::new(key, vec![1; 12]),
+            cowid,
+        );
+
+        assert_eq!(leaf.cowid(), cowid);
+        assert_eq!(leaf.peek_item(), Some(SHAMapItem::new(key, vec![1; 12])));
+        assert!(leaf.set_item(SHAMapItem::new(key, vec![2; 12])));
+        assert_eq!(leaf.cowid(), cowid);
+        leaf.unshare();
+        assert_eq!(leaf.cowid(), 0);
+    }
+
+    #[test]
+    fn set_item_recomputes_leaf_hash_and_reports_when_it_changed() {
+        let key = sample_uint256(0xAB);
+        let leaf = SHAMapTreeNode::new_leaf(
+            SHAMapNodeType::AccountState,
+            SHAMapItem::new(key, vec![1; 12]),
+            9,
+        );
         let original_hash = leaf.get_hash();
 
         assert!(leaf.set_item(SHAMapItem::new(key, vec![2; 12])));
@@ -1713,19 +1730,19 @@ mod tests {
 
     #[test]
     fn canonicalize_child_reuses_existing_loaded_child() {
-        let parent = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
-        let child = make_shared_intrusive(SHAMapTreeNode::new_leaf_with_hash(
+        let parent = SHAMapTreeNode::new_inner(1);
+        let child = SHAMapTreeNode::new_leaf_with_hash(
             SHAMapNodeType::TransactionNm,
             SHAMapItem::new(sample_uint256(5), vec![7; 12]),
             0,
             sample_hash(9),
-        ));
-        let competing_child = make_shared_intrusive(SHAMapTreeNode::new_leaf_with_hash(
+        );
+        let competing_child = SHAMapTreeNode::new_leaf_with_hash(
             SHAMapNodeType::TransactionNm,
             SHAMapItem::new(sample_uint256(6), vec![8; 12]),
             0,
             sample_hash(9),
-        ));
+        );
 
         parent.set_child_hash(4, sample_hash(9));
         let first = parent.canonicalize_child(4, child.clone());
@@ -1740,21 +1757,17 @@ mod tests {
     }
 
     #[test]
-    fn canonicalize_child_preserves_existing_full_below_mark_on_attached_child() {
-        let parent = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
-        let child = make_shared_intrusive(SHAMapTreeNode::new_leaf_with_hash(
-            SHAMapNodeType::TransactionNm,
-            SHAMapItem::new(sample_uint256(7), vec![9; 12]),
-            0,
-            sample_hash(0x19),
-        ));
+    fn canonicalize_child_preserves_existing_full_below_mark_on_attached_inner() {
+        let parent = SHAMapTreeNode::new_inner(1);
+        let child = SHAMapTreeNode::new_inner(0);
+        child.set_hash(sample_hash(0x19));
         child.set_full_below_gen(22);
 
         parent.set_child_hash(4, sample_hash(0x19));
         let attached = parent.canonicalize_child(4, child.clone());
 
         assert!(same_node(&attached, &child));
-        assert_eq!(attached.full_below_gen.load(Ordering::Relaxed), 22);
+        assert!(attached.is_full_below(22));
     }
 
     #[test]
@@ -1762,12 +1775,12 @@ mod tests {
         let key = sample_uint256(0xAB);
         let hash = sample_hash(0xCD);
         let payload = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
-        let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf_with_hash(
+        let leaf = SHAMapTreeNode::new_leaf_with_hash(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(key, payload.clone()),
             0,
             hash,
-        ));
+        );
 
         let wire = leaf
             .serialize_for_wire()
@@ -1810,7 +1823,7 @@ mod tests {
 
     #[test]
     fn inner_wire_and_prefix_codecs_match_cpp_layouts() {
-        let sparse = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let sparse = SHAMapTreeNode::new_inner(1);
         sparse.set_child_hash(2, sample_hash(0x11));
         sparse.set_child_hash(15, sample_hash(0x22));
 
@@ -1839,7 +1852,7 @@ mod tests {
         assert_eq!(sparse_round_trip.get_child_hash(2), sample_hash(0x11));
         assert_eq!(sparse_round_trip.get_child_hash(15), sample_hash(0x22));
 
-        let dense = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        let dense = SHAMapTreeNode::new_inner(1);
         for branch in 0..12 {
             dense.set_child_hash(branch, sample_hash(branch as u8 + 1));
         }
@@ -1866,12 +1879,12 @@ mod tests {
 
     #[test]
     fn update_hash_deep_refreshes_loaded_child_hashes_before_hashing_parent() {
-        let parent = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
-        let child = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let parent = SHAMapTreeNode::new_inner(1);
+        let child = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(sample_uint256(9), vec![7; 12]),
             0,
-        ));
+        );
 
         parent.set_child_hash(5, sample_hash(1));
         parent.share_child(5, &child);
@@ -1892,12 +1905,12 @@ mod tests {
         let key = sample_uint256(0x44);
         let hash = sample_hash(0xAA);
         let payload = vec![9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 1, 2];
-        let node = make_shared_intrusive(SHAMapTreeNode::new_leaf_with_hash(
+        let node = SHAMapTreeNode::new_leaf_with_hash(
             SHAMapNodeType::TransactionMd,
             SHAMapItem::new(key, payload.clone()),
             0,
             hash,
-        ));
+        );
 
         let prefix = node
             .serialize_with_prefix()

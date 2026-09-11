@@ -1,4 +1,4 @@
-use crate::database_runtime::node_object_cache::NodeObjectCache;
+use crate::database_runtime::node_object_cache::{NodeObjectCache, NodeObjectCacheMode};
 use crate::{
     Backend, FetchReport, FetchType, JournalLevel, NodeObject, NodeObjectType, NodeStoreJournal,
     Scheduler, Task, batch_write_preallocation_size,
@@ -379,13 +379,24 @@ impl DatabaseInner {
         fetch_report: &mut FetchReport,
         duplicate: bool,
     ) -> Option<Arc<NodeObject>> {
-        self.delegate.fetch_node_object(
-            hash,
-            ledger_seq,
-            fetch_report,
-            duplicate,
-            self.journal.as_ref(),
-        )
+        loop {
+            let generation = self.store_generation.load(Ordering::Acquire);
+            let node_object = self.delegate.fetch_node_object(
+                hash,
+                ledger_seq,
+                fetch_report,
+                duplicate,
+                self.journal.as_ref(),
+            );
+
+            // A rotating delegate advances this identity before changing the
+            // durable backend pair. A read that crossed that fence must retry
+            // against the newly published pair instead of returning an object
+            // owned only by a retired archive.
+            if self.store_generation.load(Ordering::Acquire) == generation {
+                return node_object;
+            }
+        }
     }
 
     fn fetch_node_object(
@@ -468,6 +479,27 @@ impl DatabaseRuntime {
         config: &Section,
         journal: Arc<dyn NodeStoreJournal>,
     ) -> Result<Self, String> {
+        Self::new_with_node_object_cache_mode(
+            delegate,
+            scheduler,
+            read_threads,
+            config,
+            journal,
+            NodeObjectCacheMode::Enabled,
+        )
+    }
+
+    /// Constructs a runtime with an explicit NodeObject cache ownership mode.
+    /// Public callers retain the enabled-cache behavior through [`Self::new`];
+    /// rotating storage uses disabled mode so archive reads cannot be retained.
+    pub(crate) fn new_with_node_object_cache_mode(
+        delegate: Arc<dyn DatabaseDelegate>,
+        scheduler: Arc<dyn Scheduler>,
+        read_threads: usize,
+        config: &Section,
+        journal: Arc<dyn NodeStoreJournal>,
+        cache_mode: NodeObjectCacheMode,
+    ) -> Result<Self, String> {
         assert!(
             read_threads != 0,
             "xrpl::NodeStore::Database::new : nonzero threads input"
@@ -483,7 +515,7 @@ impl DatabaseRuntime {
             return Err("Invalid rq_bundle".to_owned());
         }
 
-        let node_object_cache = NodeObjectCache::from_config(config)?;
+        let node_object_cache = NodeObjectCache::new(cache_mode, config)?;
         let default_read_queue_budget =
             default_read_queue_budget(read_threads, request_bundle as usize)?;
         // Explicit operator settings may narrow or expand this shared logical
@@ -1118,6 +1150,7 @@ mod tests {
                 "node_object_cache_capacity_entries",
                 "node_object_cache_durable_loads",
                 "node_object_cache_entries",
+                "node_object_cache_eviction_policy",
                 "node_object_cache_hits",
                 "node_object_cache_idle_seconds",
                 "node_object_cache_invalidations",
@@ -1126,6 +1159,8 @@ mod tests {
                 "node_object_cache_promotions",
                 "node_object_cache_rejected",
                 "node_object_cache_ttl_seconds",
+                "node_object_cache_weighted_capacity_bytes",
+                "node_object_cache_weighted_size_bytes",
                 "node_read_bytes",
                 "node_reads_duration_us",
                 "node_reads_hit",
@@ -1140,6 +1175,10 @@ mod tests {
         );
         assert_eq!(counts.get("read_queue"), Some(&JsonValue::Unsigned(0)));
         assert_eq!(
+            counts.get("node_object_cache_eviction_policy"),
+            Some(&JsonValue::String("lru".to_owned()))
+        );
+        assert_eq!(
             counts.get("node_object_cache_capacity_entries"),
             Some(&JsonValue::String("1000000".to_owned()))
         );
@@ -1147,6 +1186,10 @@ mod tests {
             counts.get("node_object_cache_capacity_bytes_is_estimate"),
             Some(&JsonValue::Bool(true))
         );
+        assert!(matches!(
+            counts.get("node_object_cache_weighted_size_bytes"),
+            Some(JsonValue::String(value)) if value.parse::<u64>().is_ok()
+        ));
         assert!(matches!(
             counts.get("read_threads_total"),
             Some(JsonValue::Signed(value)) if *value >= 1

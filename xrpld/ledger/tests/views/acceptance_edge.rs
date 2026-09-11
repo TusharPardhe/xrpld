@@ -16,16 +16,16 @@ fn sample_uint256(fill: u8) -> Uint256 {
 
 #[test]
 fn ledger_set_accepted_with_incorrect_close_time_sets_no_consensus_flag() {
-    let tx_root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let tx_root = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::TransactionNm,
         SHAMapItem::new(sample_uint256(0xA1), vec![0x61; 20]),
         0,
-    ));
-    let state_root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    );
+    let state_root = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         SHAMapItem::new(sample_uint256(0xA2), vec![0x62; 20]),
         0,
-    ));
+    );
     let mut ledger = Ledger::from_maps(
         LedgerHeader {
             seq: 805,

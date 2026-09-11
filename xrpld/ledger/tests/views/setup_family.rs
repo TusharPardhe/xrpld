@@ -449,12 +449,12 @@ fn ledger_setup_from_state_map_with_family_decodes_xrp_fee_fields() {
 #[test]
 fn ledger_setup_from_state_map_with_family_returns_false_for_missing_amendment_node() {
     let missing_amendments_hash = sample_hash(0xD8);
-    let fee_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let fee_leaf = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         SHAMapItem::new(fees_key(), encode_fee_settings_entry(10, 20, 30, false)),
         0,
-    ));
-    let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    );
+    let root = SHAMapTreeNode::new_inner(1);
     root.set_child_hash(
         usize::from(amendments_key().data()[0] >> 4),
         missing_amendments_hash,

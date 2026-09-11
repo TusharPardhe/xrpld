@@ -12,11 +12,11 @@ fn sample_uint256(fill: u8) -> Uint256 {
 #[test]
 fn ledger_tx_exists_reports_exact_membership() {
     let tx_key = sample_uint256(0x41);
-    let tx_root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let tx_root = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::TransactionNm,
         SHAMapItem::new(tx_key, vec![0xAB; 20]),
         0,
-    ));
+    );
     let ledger = Ledger::from_maps(
         LedgerHeader {
             seq: 900,
@@ -39,12 +39,12 @@ fn ledger_tx_exists_reports_exact_membership() {
 #[test]
 fn ledger_tx_exists_resolves_backed_transaction_branches() {
     let tx_key = sample_uint256(0x41);
-    let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let leaf = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::TransactionNm,
         SHAMapItem::new(tx_key, vec![0xAB; 20]),
         0,
-    ));
-    let root = make_shared_intrusive(SHAMapTreeNode::new_inner(0));
+    );
+    let root = SHAMapTreeNode::new_inner(0);
     root.set_child_hash(4, leaf.get_hash());
     root.update_hash_deep();
 
@@ -81,7 +81,7 @@ fn ledger_tx_exists_resolves_backed_transaction_branches() {
 
 #[test]
 fn ledger_tx_exists_does_not_need_fetch_for_missing_child_paths() {
-    let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    let root = SHAMapTreeNode::new_inner(1);
     root.set_child_hash(
         0,
         ledger::calculate_ledger_hash(&LedgerHeader {

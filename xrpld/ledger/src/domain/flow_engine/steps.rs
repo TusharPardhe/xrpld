@@ -6,6 +6,7 @@
 //! compared with a requested XRP delivery.
 
 use super::{AmmContext, SelfCrossCancellation, StepKind};
+use crate::domain::ripple_calc::OfferCrossing;
 use crate::domain::ripple_state_helpers;
 use crate::{ApplyView, ViewError};
 use protocol::{
@@ -148,6 +149,7 @@ pub struct StepContext<'a> {
     pub strand_src: &'a AccountID,
     pub strand_dst: &'a AccountID,
     pub strand_deliver: Asset,
+    pub offer_crossing: OfferCrossing,
     pub quality_threshold: Option<Quality>,
     /// Present only for direct/default OfferCreate crossings. It is separate
     /// from the flow sandbox so self-offer cancellations survive a dry flow.
@@ -196,8 +198,14 @@ impl FlowStep for StepKind {
                 if !requested_out.matches_currency(*currency) {
                     return Err(Ter::TEF_INTERNAL);
                 }
-                let (input, output) =
-                    execute_direct_fwd(view, src, dst, requested_out.amount(), context.strand_dst)?;
+                let (input, output) = execute_direct_fwd(
+                    view,
+                    src,
+                    dst,
+                    requested_out.amount(),
+                    context.strand_dst,
+                    context.offer_crossing != OfferCrossing::No && dst == context.strand_dst,
+                )?;
                 Ok(StepAmounts::direct(input, output, *currency))
             }
             StepKind::XrpEndpoint { account, is_last } => {
@@ -307,8 +315,14 @@ impl FlowStep for StepKind {
                 if !requested_in.matches_currency(*currency) {
                     return Err(Ter::TEF_INTERNAL);
                 }
-                let (input, output) =
-                    execute_direct_fwd(view, src, dst, requested_in.amount(), context.strand_dst)?;
+                let (input, output) = execute_direct_fwd(
+                    view,
+                    src,
+                    dst,
+                    requested_in.amount(),
+                    context.strand_dst,
+                    context.offer_crossing != OfferCrossing::No && dst == context.strand_dst,
+                )?;
                 Ok(StepAmounts::direct(input, output, *currency))
             }
             StepKind::XrpEndpoint { account, is_last } => {
@@ -448,6 +462,13 @@ impl StepKind {
                     view, src, dst, *currency,
                 )?;
                 let redeeming = direction == DebtDirection::Redeems;
+                // rippled constructs DirectIOfferCrossingStep rather than the
+                // payment DirectStep. It ignores trust-line quality fields but
+                // still propagates the actual debt direction to a following
+                // BookStep for transfer-rate handling.
+                if context.offer_crossing != OfferCrossing::No {
+                    return Ok(Some((quality_one(), redeeming)));
+                }
                 let (quality_out, quality_in) = if redeeming {
                     qualities_src_redeems(view, src, dst, *currency)?
                 } else {
@@ -730,6 +751,7 @@ fn execute_direct_fwd<V: ApplyView>(
     dst: &AccountID,
     input: &STAmount,
     strand_dst: &AccountID,
+    final_offer_crossing: bool,
 ) -> Result<(STAmount, STAmount), Ter> {
     if input.signum() <= 0 {
         return Ok((input.zeroed(), input.zeroed()));
@@ -744,9 +766,18 @@ fn execute_direct_fwd<V: ApplyView>(
     }
 
     let currency = input.issue().currency;
-    let (max_flow, debt_dir) =
+    let (max_flow, debt_dir) = if final_offer_crossing {
+        // DirectIOfferCrossingStep::maxFlow: a final issuer-to-taker step
+        // deliberately ignores a pre-existing trust-line limit. This permits
+        // directSendNoFee to create the receiver's zero-limit trust line.
+        (
+            input.iou(),
+            crate::domain::ripple_calc::direct_step::DebtDirection::Issues,
+        )
+    } else {
         crate::domain::ripple_calc::direct_step::max_payment_flow(view, src, dst, currency)
-            .map_err(|_| Ter::TEF_BAD_LEDGER)?;
+            .map_err(|_| Ter::TEF_BAD_LEDGER)?
+    };
     if max_flow.is_zero() || max_flow.signum() <= 0 {
         return Ok((input.zeroed(), input.zeroed()));
     }
@@ -874,7 +905,57 @@ fn xrp_liquid<V: ApplyView>(view: &mut V, account: &AccountID) -> Result<i64, Vi
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use protocol::{ApplyFlags, LedgerEntryType, STLedgerEntry};
+
     use super::*;
+    use crate::{ApplyViewImpl, Ledger, RawView};
+
+    #[test]
+    fn offer_crossing_direct_quality_preserves_redeeming_direction() {
+        let src = AccountID::from_array([0x11; 20]);
+        let dst = AccountID::from_array([0x22; 20]);
+        let currency = protocol::currency_from_string("USD");
+        let line_keylet = protocol::line(src, dst, currency);
+        let mut line =
+            STLedgerEntry::from_type_and_key(LedgerEntryType::RippleState, line_keylet.key);
+        line.set_field_amount(
+            sf("sfBalance"),
+            STAmount::from_iou_amount(
+                sf("sfAmount"),
+                protocol::IOUAmount::from_parts(25, 0).expect("positive redeeming balance"),
+                Issue::new(currency, src),
+            ),
+        );
+        let mut base = Ledger::from_ledger_seq_and_close_time(1, 1, false);
+        base.raw_insert(Arc::new(line)).expect("seed trust line");
+        let mut view = ApplyViewImpl::new(Arc::new(base), ApplyFlags::NONE);
+        let step = StepKind::Direct { src, dst, currency };
+        let context = StepContext {
+            strand_src: &src,
+            strand_dst: &dst,
+            strand_deliver: Asset::Issue(Issue::new(currency, dst)),
+            offer_crossing: OfferCrossing::Yes,
+            quality_threshold: None,
+            self_cross_cancellation: None,
+            amm_context: AmmContext::new(src, false),
+            offer_usage: Rc::new(Cell::new(0)),
+            previous_redeems: Rc::new(Cell::new(false)),
+            has_previous_step: Rc::new(Cell::new(false)),
+            previous_step_is_book: Rc::new(Cell::new(false)),
+        };
+
+        let (quality, redeeming) = step
+            .quality_upper_bound(&mut view, false, &context)
+            .expect("read Direct quality")
+            .expect("Direct quality is available");
+        assert_eq!(quality, quality_one());
+        assert!(
+            redeeming,
+            "unit offer-crossing quality must retain debt direction"
+        );
+    }
 
     #[test]
     fn tagged_amount_rejects_cross_asset_send_max_comparison() {

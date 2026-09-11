@@ -985,7 +985,6 @@ mod tests {
     use crate::tree_node::{SHAMapNodeType, SHAMapTreeNode};
     use crate::tree_node_cache::TreeNodeCache;
     use basics::base_uint::Uint256;
-    use basics::intrusive_pointer::make_shared_intrusive;
     use basics::tagged_cache::ManualClock;
     use std::sync::Arc;
     use time::Duration;
@@ -1010,19 +1009,11 @@ mod tests {
         let cache = TreeNodeCache::new("tree", 8, Duration::seconds(1), ManualClock::new(0));
         let key = Uint256::from_array([0xA1; 32]);
         let item = SHAMapItem::new(key, vec![7; 12]);
-        let canonical = make_shared_intrusive(SHAMapTreeNode::new_leaf(
-            SHAMapNodeType::AccountState,
-            item.clone(),
-            0,
-        ));
+        let canonical = SHAMapTreeNode::new_leaf(SHAMapNodeType::AccountState, item.clone(), 0);
         let mut cached = canonical.clone();
         assert!(!cache.canonicalize_replace_client(canonical.get_hash().as_uint256(), &mut cached));
 
-        let duplicate = make_shared_intrusive(SHAMapTreeNode::new_leaf(
-            SHAMapNodeType::AccountState,
-            item,
-            0,
-        ));
+        let duplicate = SHAMapTreeNode::new_leaf(SHAMapNodeType::AccountState, item, 0);
         let expected_bytes = canonical
             .serialize_with_prefix()
             .expect("leaf should serialize with a prefix");
@@ -1058,11 +1049,11 @@ mod tests {
         let mut tree = StorageTree::new(1, false, 91, cache);
         tree.root().set_child(
             3,
-            Some(make_shared_intrusive(SHAMapTreeNode::new_leaf(
+            Some(SHAMapTreeNode::new_leaf(
                 SHAMapNodeType::AccountState,
                 SHAMapItem::new(key, vec![5; 12]),
                 1,
-            ))),
+            )),
         );
         tree.root().update_hash_deep();
 
@@ -1085,25 +1076,25 @@ mod tests {
             ManualClock::new(0),
         ));
         let key = Uint256::from_array([0xC1; 32]);
-        let canonical = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let canonical = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(key, vec![6; 12]),
             0,
-        ));
+        );
         let mut cached = canonical.clone();
         assert!(!cache.canonicalize_replace_client(canonical.get_hash().as_uint256(), &mut cached));
 
         let mut tree = StorageTree::new(2, true, 92, cache);
         tree.root().set_child(
             4,
-            Some(make_shared_intrusive(SHAMapTreeNode::new_leaf_with_hash(
+            Some(SHAMapTreeNode::new_leaf_with_hash(
                 SHAMapNodeType::AccountState,
                 canonical
                     .peek_item()
                     .expect("canonical leaf should carry an item"),
                 2,
                 canonical.get_hash(),
-            ))),
+            )),
         );
         tree.root().update_hash_deep();
 
@@ -1133,11 +1124,11 @@ mod tests {
             ManualClock::new(0),
         ));
         let key = Uint256::from_array([0xD1; 32]);
-        let canonical = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        let canonical = SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(key, vec![8; 12]),
             0,
-        ));
+        );
         let mut cached = canonical.clone();
         assert!(!cache.canonicalize_replace_client(canonical.get_hash().as_uint256(), &mut cached));
 
@@ -1151,14 +1142,14 @@ mod tests {
         let mut tree = StorageTree::new_with_family(2, true, 93, &family);
         tree.root().set_child(
             5,
-            Some(make_shared_intrusive(SHAMapTreeNode::new_leaf_with_hash(
+            Some(SHAMapTreeNode::new_leaf_with_hash(
                 SHAMapNodeType::AccountState,
                 canonical
                     .peek_item()
                     .expect("canonical leaf should carry an item"),
                 2,
                 canonical.get_hash(),
-            ))),
+            )),
         );
         tree.root().update_hash_deep();
 

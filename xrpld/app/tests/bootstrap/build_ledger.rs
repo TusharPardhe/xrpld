@@ -114,11 +114,11 @@ fn sample_parent_ledger(seq: u32) -> Ledger {
 }
 
 fn sample_parent_with_tx(seq: u32, tx_id: Uint256) -> Ledger {
-    let tx_root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+    let tx_root = SHAMapTreeNode::new_leaf(
         SHAMapNodeType::TransactionNm,
         SHAMapItem::new(tx_id, vec![0xAB; 20]),
         0,
-    ));
+    );
 
     Ledger::from_maps(
         LedgerHeader {
@@ -137,7 +137,7 @@ fn sample_parent_with_tx(seq: u32, tx_id: Uint256) -> Ledger {
 }
 
 fn sample_parent_with_unreadable_tx_branch(seq: u32, tx_id: Uint256) -> Ledger {
-    let tx_root = make_shared_intrusive(SHAMapTreeNode::new_inner(0));
+    let tx_root = SHAMapTreeNode::new_inner(0);
     let branch = usize::from(tx_id.data()[0] >> 4);
     tx_root.set_child_hash(
         branch,
