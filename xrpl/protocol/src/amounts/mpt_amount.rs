@@ -76,7 +76,7 @@ impl From<MPTAmount> for bool {
 
 impl AddAssign for MPTAmount {
     fn add_assign(&mut self, rhs: Self) {
-        self.value += rhs.value;
+        self.value = self.value.wrapping_add(rhs.value);
     }
 }
 
@@ -91,7 +91,7 @@ impl Add for MPTAmount {
 
 impl SubAssign for MPTAmount {
     fn sub_assign(&mut self, rhs: Self) {
-        self.value -= rhs.value;
+        self.value = self.value.wrapping_sub(rhs.value);
     }
 }
 
@@ -108,13 +108,13 @@ impl Mul<i64> for MPTAmount {
     type Output = Self;
 
     fn mul(self, rhs: i64) -> Self::Output {
-        Self::from_value(self.value * rhs)
+        Self::from_value(self.value.wrapping_mul(rhs))
     }
 }
 
 impl MulAssign<i64> for MPTAmount {
     fn mul_assign(&mut self, rhs: i64) {
-        self.value *= rhs;
+        self.value = self.value.wrapping_mul(rhs);
     }
 }
 
@@ -144,7 +144,7 @@ impl Neg for MPTAmount {
     type Output = Self;
 
     fn neg(self) -> Self::Output {
-        Self::from_value(-self.value)
+        Self::from_value(self.value.wrapping_neg())
     }
 }
 

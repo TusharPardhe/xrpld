@@ -112,7 +112,7 @@ impl From<XRPAmount> for bool {
 
 impl AddAssign for XRPAmount {
     fn add_assign(&mut self, rhs: Self) {
-        self.drops += rhs.drops;
+        self.drops = self.drops.wrapping_add(rhs.drops);
     }
 }
 
@@ -127,7 +127,7 @@ impl Add for XRPAmount {
 
 impl SubAssign for XRPAmount {
     fn sub_assign(&mut self, rhs: Self) {
-        self.drops -= rhs.drops;
+        self.drops = self.drops.wrapping_sub(rhs.drops);
     }
 }
 
@@ -142,13 +142,13 @@ impl Sub for XRPAmount {
 
 impl AddAssign<i64> for XRPAmount {
     fn add_assign(&mut self, rhs: i64) {
-        self.drops += rhs;
+        self.drops = self.drops.wrapping_add(rhs);
     }
 }
 
 impl SubAssign<i64> for XRPAmount {
     fn sub_assign(&mut self, rhs: i64) {
-        self.drops -= rhs;
+        self.drops = self.drops.wrapping_sub(rhs);
     }
 }
 
@@ -156,7 +156,7 @@ impl Mul<i64> for XRPAmount {
     type Output = Self;
 
     fn mul(self, rhs: i64) -> Self::Output {
-        Self::from_drops(self.drops * rhs)
+        Self::from_drops(self.drops.wrapping_mul(rhs))
     }
 }
 
@@ -170,7 +170,7 @@ impl Mul<XRPAmount> for i64 {
 
 impl MulAssign<i64> for XRPAmount {
     fn mul_assign(&mut self, rhs: i64) {
-        self.drops *= rhs;
+        self.drops = self.drops.wrapping_mul(rhs);
     }
 }
 
@@ -192,7 +192,7 @@ impl Neg for XRPAmount {
     type Output = Self;
 
     fn neg(self) -> Self::Output {
-        Self::from_drops(-self.drops)
+        Self::from_drops(self.drops.wrapping_neg())
     }
 }
 

@@ -4023,7 +4023,6 @@ mod tests {
     }
 }
 pub use domain::credential_helpers;
-pub use domain::lending_helpers;
 pub use domain::mptoken_helpers;
 pub use domain::mul_ratio;
 pub use domain::nftoken_helpers;
@@ -4032,4 +4031,9 @@ pub use domain::payment_channel_helpers;
 pub use domain::permissioned_dex_helpers;
 pub use domain::ripple_state_helpers;
 pub use domain::token_helpers::{add_empty_holding_with_tx, can_add_holding, remove_empty_holding};
+pub use domain::vault_adapter;
 pub use domain::vault_helpers;
+pub use domain::vault_lwab;
+pub use domain::{lending_adapter, lending_helpers};
+
+pub use domain::lending_lwab;

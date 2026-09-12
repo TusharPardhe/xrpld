@@ -216,7 +216,13 @@ impl DigestAwareReadView for Ledger {
 }
 
 pub fn has_expired(view: &impl ReadView, exp: Option<u32>) -> bool {
-    exp.is_some_and(|exp| view.parent_close_time().as_seconds() >= exp)
+    exp.is_some_and(|expiry| {
+        crate::domain::lending_adapter::lossless::has_expired(
+            view.parent_close_time().as_seconds(),
+            expiry,
+            false,
+        )
+    })
 }
 
 pub fn view_get_enabled_amendments(view: &impl ReadView) -> Result<BTreeSet<Uint256>, ViewError> {
