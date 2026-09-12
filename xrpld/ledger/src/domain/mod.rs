@@ -11,10 +11,14 @@ pub mod canonical_tx_set;
 pub mod cleaner;
 pub mod config;
 pub mod credential_helpers;
+pub mod lending_adapter;
 pub mod lending_helpers;
 pub mod mptoken_helpers;
 pub mod nftoken_helpers;
+pub mod vault_adapter;
 pub mod vault_helpers;
+#[path = "vault_adapter/lwab.rs"]
+pub mod vault_lwab;
 
 pub mod directory;
 pub mod fees;
@@ -39,3 +43,6 @@ pub mod timeout_counter;
 pub mod token_helpers;
 pub mod transaction_state_sf;
 pub mod trustline;
+
+#[path = "lending_adapter/lwab.rs"]
+pub mod lending_lwab;

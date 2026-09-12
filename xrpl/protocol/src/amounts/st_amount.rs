@@ -589,6 +589,140 @@ impl STAmount {
     }
 }
 
+/// Returns whether two comparable amounts can be added without integral
+/// overflow or IOU precision loss under `mode`.
+///
+/// This is the fallible-arithmetic predicate counterpart of rippled's
+/// `canAdd`: failures while evaluating its IOU precision gate are reported as
+/// `false`, never as a panic.
+pub fn can_add(a: &STAmount, b: &STAmount, mode: basics::number::RoundingMode) -> bool {
+    let _rounding = basics::number::NumberRoundModeGuard::new(mode);
+
+    if !a.are_comparable(b) {
+        return false;
+    }
+    if a.value == 0 || b.value == 0 {
+        return true;
+    }
+    if a.integral() {
+        return signed_integral_value(a)
+            .zip(signed_integral_value(b))
+            .is_some_and(|(left, right)| left.checked_add(right).is_some());
+    }
+
+    (|| -> Result<bool, AmountError> {
+        let one = STAmount::try_new_with_asset(sf_generic(), crate::no_issue(), 1, 0, false)?;
+        let max_loss = STAmount::try_new_with_asset(sf_generic(), crate::no_issue(), 1, -4, false)?;
+
+        let lhs = try_iou_add(&try_iou_sub(a, b)?, b)?.try_divide(a, crate::no_issue())?;
+        let rhs = try_iou_add(&try_iou_sub(b, a)?, a)?.try_divide(b, crate::no_issue())?;
+        let lhs = try_iou_sub(&lhs, &one)?;
+        let rhs = try_iou_sub(&rhs, &one)?;
+        let lhs = absolute_amount(lhs);
+        let rhs = absolute_amount(rhs);
+        Ok(try_iou_add(&lhs, &rhs)? <= max_loss)
+    })()
+    .unwrap_or(false)
+}
+
+/// Returns whether `b` may be subtracted from `a` without violating the
+/// integral balance/overflow constraints. Comparable IOUs may always be
+/// subtracted.
+pub fn can_subtract(a: &STAmount, b: &STAmount) -> bool {
+    if !a.are_comparable(b) {
+        return false;
+    }
+    if b.value == 0 {
+        return true;
+    }
+    if !a.integral() {
+        return true;
+    }
+
+    signed_integral_value(a)
+        .zip(signed_integral_value(b))
+        .is_some_and(|(left, right)| {
+            !(right > 0 && left < right) && left.checked_sub(right).is_some()
+        })
+}
+
+/// Rounds a non-integral amount to the `10^scale` grid using an explicit
+/// rounding mode. Integral values, zero, and values already at or above the
+/// requested scale are returned unchanged.
+///
+/// The rounding guard restores the caller's thread-local Number mode on every
+/// return path, including an out-of-range result.
+pub fn round_to_exponent(
+    value: &STAmount,
+    scale: i32,
+    mode: basics::number::RoundingMode,
+) -> Result<STAmount, AmountError> {
+    if value.integral() || value.value == 0 || value.offset >= scale {
+        return Ok(value.clone());
+    }
+
+    let _rounding = basics::number::NumberRoundModeGuard::new(mode);
+    let reference = STAmount::try_new_with_asset(
+        value.fname(),
+        value.asset,
+        ST_AMOUNT_MIN_MANTISSA,
+        scale,
+        value.is_negative,
+    )?;
+    let sum = try_iou_add(value, &reference)?;
+    try_iou_sub(&sum, &reference)
+}
+
+fn signed_integral_value(value: &STAmount) -> Option<i64> {
+    let magnitude = value.value;
+    if value.is_negative {
+        if magnitude == (i64::MAX as u64) + 1 {
+            Some(i64::MIN)
+        } else {
+            i64::try_from(magnitude).ok()?.checked_neg()
+        }
+    } else {
+        i64::try_from(magnitude).ok()
+    }
+}
+
+fn try_iou_add(left: &STAmount, right: &STAmount) -> Result<STAmount, AmountError> {
+    debug_assert!(!left.integral() && !right.integral());
+    let sum = left
+        .iou()
+        .checked_add(right.iou())
+        .map_err(|_| AmountError::IssuedOutOfRange)?;
+    STAmount::try_new_with_asset(
+        left.fname(),
+        left.asset,
+        sum.mantissa().unsigned_abs(),
+        sum.exponent(),
+        sum.mantissa() < 0,
+    )
+}
+
+fn try_iou_sub(left: &STAmount, right: &STAmount) -> Result<STAmount, AmountError> {
+    debug_assert!(!left.integral() && !right.integral());
+    let difference = left
+        .iou()
+        .checked_sub(right.iou())
+        .map_err(|_| AmountError::IssuedOutOfRange)?;
+    STAmount::try_new_with_asset(
+        left.fname(),
+        left.asset,
+        difference.mantissa().unsigned_abs(),
+        difference.exponent(),
+        difference.mantissa() < 0,
+    )
+}
+
+fn absolute_amount(mut value: STAmount) -> STAmount {
+    if value.negative() {
+        value.negate();
+    }
+    value
+}
+
 pub fn is_legal_net(value: &STAmount) -> bool {
     value.is_legal_net()
 }

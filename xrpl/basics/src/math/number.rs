@@ -364,12 +364,23 @@ impl NumberParts {
         exponent: i32,
         scale: MantissaScale,
     ) -> Result<Self, NumberNormalizeError> {
-        Self::unchecked(
-            mantissa < 0,
-            external_to_internal_mantissa(mantissa),
+        let negative = mantissa < 0;
+        let mantissa = external_to_internal_mantissa(mantissa);
+        if mantissa <= NUMBER_MAX_REP as u64 {
+            return Self::unchecked(negative, mantissa, exponent).try_normalize_exact(scale);
+        }
+
+        // INT64_MIN is the only external i64 whose magnitude exceeds Number::rep.
+        // Mirror rippled Number(rep, exponent): externalToInternal then doNormalize.
+        Self::normalize_arithmetic_parts(
+            negative,
+            u128::from(mantissa),
             exponent,
+            mantissa_range_min(scale),
+            mantissa_range_max(scale),
+            scale,
         )
-        .try_normalize_exact(scale)
+        .map_err(|_| NumberNormalizeError::ExponentOverflow)
     }
 
     pub fn external_parts(self) -> Result<(i64, i32), NumberNormalizeError> {

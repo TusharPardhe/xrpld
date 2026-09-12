@@ -391,7 +391,10 @@ pub use signature_check::{
 };
 pub use so_template::{SOEStyle, SOETxMPTIssue, SOElement, SOTemplate, TemplateError};
 pub use st_account::STAccount;
-pub use st_amount::{STAmount, has_invalid_amount, is_legal_mpt, is_legal_net};
+pub use st_amount::{
+    AmountError, STAmount, can_add, can_subtract, has_invalid_amount, is_legal_mpt, is_legal_net,
+    round_to_exponent,
+};
 pub use st_bit_string::{
     STBitString, STUInt128, STUInt160, STUInt192, STUInt256, UInt128Kind, UInt160Kind, UInt192Kind,
     UInt256Kind,
