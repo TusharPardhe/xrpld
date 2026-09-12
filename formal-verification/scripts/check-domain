@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+domain=${1:?domain required: protocol|vault|lending}
+shift
+"$root/scripts/check-rust"
+export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2}
+manifest="$root/rust/Cargo.toml"
+common=(--offline --manifest-path "$manifest" -p verification-regressions)
+case "$domain" in
+  protocol)
+    cargo test "${common[@]}" \
+      --test protocol-amount-floor-parity \
+      --test protocol-int-amount-number-conversion \
+      --test protocol-iou-number-conversion \
+      --test protocol-st-amount-surface \
+      --test protocol-iou-amount-internal -- --test-threads=1
+    ;;
+  vault)
+    cargo test "${common[@]}" --test vault-adapter -- --test-threads=1
+    ;;
+  lending)
+    cargo test "${common[@]}" \
+      --test lending-adapter --test lending-lwab-accept \
+      --test lending-lwab-delete -- --test-threads=1
+    ;;
+  *)
+    printf 'unknown domain: %s\n' "$domain" >&2
+    exit 2
+    ;;
+esac
+if [ "${SKIP_LEAN:-0}" != 1 ]; then
+  "$root/scripts/check-lean" "$domain"
+fi
+if [ "${RUN_PARITY:-0}" = 1 ]; then
+  "$root/scripts/run-parity" "${PARITY_PROFILE:-debug}" "$@"
+fi

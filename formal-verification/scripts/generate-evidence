@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+profile=${1:-debug}
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+out="$root/evidence/runs/$stamp-$profile"
+mkdir -p "$out"
+cat > "$out/metadata.txt" <<EOF
+created_utc=$stamp
+profile=$profile
+quaxar_revision=$(git -C "$root/.." rev-parse HEAD)
+lean_toolchain=$(cat "$root/lean/lean-toolchain")
+versions=$root/versions.toml
+EOF
+"$root/scripts/run-parity" "$@" 2>&1 | tee "$out/parity.log"
+printf 'Generated %s; review before copying into evidence/baselines.\n' "$out"

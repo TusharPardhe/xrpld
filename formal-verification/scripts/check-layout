@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+fail() { printf 'layout error: %s\n' "$*" >&2; exit 1; }
+
+for path in \
+  lean/XRPL/Model lean/XRPL/Properties lean/XRPL/FFI \
+  rust/crates/verification-wire/src rust/crates/lean-ffi/src \
+  rust/crates/lean-ffi/native rust/crates/parity-harness/src \
+  rust/tests/protocol rust/tests/vault rust/tests/lending \
+  vectors/schemas coverage scripts docs/decisions docs/theorem-catalog \
+  evidence/baselines evidence/runs evidence/archive
+do
+  test -d "$root/$path" || fail "missing directory $path"
+done
+for path in README.md ARCHITECTURE.md CLAIMS.md SOURCE-OF-TRUTH.md MIGRATION.md versions.toml \
+  coverage/protocol.toml coverage/vault.toml coverage/lending.toml coverage/claims.toml
+do
+  test -f "$root/$path" || fail "missing file $path"
+done
+
+repo=$(git -C "$root" rev-parse --show-toplevel)
+if git -C "$repo" ls-files | grep -E '(^|/)(\.lake|target|__pycache__|\.cache)(/|$)' | grep -q .; then
+  fail 'generated build/cache path is tracked'
+fi
+needle='/U'"sers/"
+if grep -RInE "$needle" --exclude-dir=.git --exclude-dir=.lake --exclude-dir=target \
+    --exclude-dir=archive "$root"; then
+  fail 'absolute developer path in active source/configuration'
+fi
+
+lean_files=$(find "$root/lean" -type f -not -path '*/.lake/*' | wc -l | tr -d ' ')
+test "$lean_files" -ge 390 || fail "incomplete Lean migration: $lean_files files"
+public_tests=$(find "$root/rust/tests/protocol" "$root/rust/tests/vault" \
+  "$root/rust/tests/lending" -type f -name '*.rs' | wc -l | tr -d ' ')
+test "$public_tests" -eq 9 || fail "expected 9 migrated public test files, found $public_tests"
+test -f "$root/rust/tests/source-coupled/vault_lwab_internal.rs" || \
+  fail 'missing preserved private Vault LWAB test source'
+
+if find "$root/rust/crates" -name '*.rs' -exec awk 'END { exit !(NR > 200) }' {} \; -print | grep -q .; then
+  fail 'bridge Rust source exceeds 200 lines'
+fi
+if find "$root/rust/crates/lean-ffi/src" -type f \( -name '*.c' -o -name '*.h' \) -print | grep -q .; then
+  fail 'native FFI source must live under lean-ffi/native'
+fi
+native_count=$(find "$root/rust/crates/lean-ffi/native" -maxdepth 1 -type f \
+  \( -name '*.c' -o -name '*.h' \) | wc -l | tr -d ' ')
+test "$native_count" -eq 13 || fail "expected 13 native bridge files, found $native_count"
+
+if grep -RInE 'use (lean_ffi|basics|protocol|ledger)(::|;)|extern "C"' \
+    "$root/rust/crates/verification-wire/src"; then
+  fail 'verification-wire depends on FFI or Quaxar'
+fi
+if grep -RInE 'use (basics|protocol|ledger)(::|;)|parity[_-]harness' \
+    "$root/rust/crates/lean-ffi/src" "$root/rust/crates/lean-ffi/native"; then
+  fail 'lean-ffi depends on Quaxar or the harness'
+fi
+if grep -RInE '\b(sorry|admit|axiom|native_decide|unsafe)\b' \
+    "$root/lean/XRPL/Properties/Lending" \
+    "$root/lean/XRPL/Properties/LoanBroker" 2>/dev/null; then
+  fail 'prohibited proof shortcut in scoped new proof modules'
+fi
+
+printf 'layout ok: lean=%s public-tests=%s native-ffi=%s\n' \
+  "$lean_files" "$public_tests" "$native_count"

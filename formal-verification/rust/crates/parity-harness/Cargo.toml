@@ -1,0 +1,13 @@
+[package]
+name = "parity-harness"
+version = "0.1.0"
+edition = "2024"
+publish = false
+build = "build.rs"
+
+[dependencies]
+verification-wire = { path = "../verification-wire", version = "=0.1.0" }
+lean-ffi = { path = "../lean-ffi", version = "=0.1.0" }
+basics = { path = "../../../../xrpl/basics", version = "=0.8.0" }
+ledger = { path = "../../../../xrpld/ledger", version = "=0.8.0" }
+protocol = { path = "../../../../xrpl/protocol", version = "=0.8.0" }

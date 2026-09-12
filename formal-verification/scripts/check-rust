@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+"$root/scripts/check-layout"
+cargo metadata --offline --no-deps --format-version=1 \
+  --manifest-path "$root/rust/Cargo.toml" >/dev/null
+cargo fmt --manifest-path "$root/rust/Cargo.toml" --all -- --check
+printf 'rust workspace metadata and formatting ok\n'

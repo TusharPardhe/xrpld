@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+profile=${1:-debug}
+case "$profile" in debug|release) shift || true;; *) echo 'profile must be debug or release' >&2; exit 2;; esac
+"$root/scripts/check-rust"
+if [ -z "${LEAN_PREFIX:-}" ]; then
+  command -v lean >/dev/null || { echo 'set LEAN_PREFIX or place pinned lean on PATH' >&2; exit 2; }
+  LEAN_PREFIX=$(lean --print-prefix)
+  export LEAN_PREFIX
+fi
+export LEAN_MODEL_LIB=${LEAN_MODEL_LIB:-"$root/lean/.lake/build/lib"}
+: "${LEAN_DEPS_LIB:?set LEAN_DEPS_LIB to the directory containing libLeanDeps.a}"
+if [ ! -f "$LEAN_MODEL_LIB/libXRPL_XRPLModel.a" ]; then
+  "$root/scripts/check-lean" model
+fi
+export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2}
+args=(run --offline --manifest-path "$root/rust/Cargo.toml" -p parity-harness)
+if [ "$profile" = release ]; then args+=(--release); fi
+cargo "${args[@]}" -- "$@"
