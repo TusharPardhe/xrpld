@@ -1,0 +1,46 @@
+[package]
+name = "verification-regressions"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+basics = { path = "../../../xrpl/basics", version = "=0.8.0" }
+ledger = { path = "../../../xrpld/ledger", version = "=0.8.0" }
+protocol = { path = "../../../xrpl/protocol", version = "=0.8.0" }
+
+[[test]]
+name = "protocol-amount-floor-parity"
+path = "protocol/amount_floor_parity.rs"
+
+[[test]]
+name = "protocol-int-amount-number-conversion"
+path = "protocol/int_amount_number_conversion.rs"
+
+[[test]]
+name = "protocol-iou-number-conversion"
+path = "protocol/iou_number_conversion.rs"
+
+[[test]]
+name = "protocol-st-amount-surface"
+path = "protocol/st_amount_surface.rs"
+
+[[test]]
+name = "protocol-iou-amount-internal"
+path = "protocol/iou_amount_internal.rs"
+
+[[test]]
+name = "lending-adapter"
+path = "lending/adapter.rs"
+
+[[test]]
+name = "lending-lwab-accept"
+path = "lending/lwab_accept.rs"
+
+[[test]]
+name = "lending-lwab-delete"
+path = "lending/lwab_delete.rs"
+
+[[test]]
+name = "vault-adapter"
+path = "vault/adapter.rs"

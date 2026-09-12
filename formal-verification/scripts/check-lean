@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+"$root/scripts/check-layout"
+export LEAN_NUM_THREADS=${LEAN_NUM_THREADS:-2}
+cd "$root/lean"
+case "${1:-all}" in
+  protocol)
+    lake build XRPL.Properties.Protocol.Number.Properties \
+      XRPL.Properties.Protocol.IntAmount.Properties \
+      XRPL.Properties.Protocol.IOUAmount.Properties
+    ;;
+  vault)
+    lake build XRPL.Properties.Vault.Vault XRPL.FFI.Vault.Wire
+    ;;
+  lending)
+    lake build XRPL.Properties.Lending.Terminal \
+      XRPL.Properties.Lending.Wire \
+      XRPL.Properties.LoanBroker.LoanBroker \
+      XRPL.FFI.Lending.Transitions
+    ;;
+  model)
+    lake build XRPLModel:static
+    ;;
+  all)
+    lake build XRPL.Properties.Properties XRPLModel:static
+    ;;
+  *)
+    printf 'usage: %s [protocol|vault|lending|model|all]\n' "$0" >&2
+    exit 2
+    ;;
+esac

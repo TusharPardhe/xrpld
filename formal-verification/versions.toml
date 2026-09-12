@@ -1,0 +1,28 @@
+schema_version = 1
+
+[lean]
+toolchain = "leanprover/lean4:v4.28.0"
+package = "XRPL"
+
+[rippled]
+repository = "https://github.com/XRPLF/rippled.git"
+source_revision = "9fe0fea2629ac455af4d38ec529dc7652f7fcbbb"
+role = "behavioral compatibility authority"
+
+[quaxar]
+repository = "https://github.com/TusharPardhe/quaxar.git"
+stacked_base_revision = "7df371464d57459f4ba3bb06f09d8ead47ef571c"
+implementation_branch = "formal-verification-implementations"
+
+[wire]
+protocol = 1
+vault_lwab = 1
+lending_lwab = 1
+
+[rust]
+edition = "2024"
+quaxar_workspace = "0.8.0"
+verification_wire = "0.1.0"
+lean_ffi = "0.1.0"
+parity_harness = "0.1.0"
+verification_regressions = "0.1.0"

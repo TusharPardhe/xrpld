@@ -1,0 +1,9 @@
+lean/.lake/
+rust/target/
+rust/**/target/
+evidence/runs/*
+!evidence/runs/README.md
+!evidence/runs/.gitkeep
+*.core
+core
+.DS_Store

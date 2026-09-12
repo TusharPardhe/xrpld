@@ -1,0 +1,56 @@
+# Stable IDs classify intent. Only semantic vectors count toward semantic export coverage.
+[[vector]]
+id = "P-NUMBER-001"
+domain = "protocol"
+class = "semantic"
+status = "executable"
+source = "rust/crates/parity-harness/src/protocol/number.rs"
+
+[[vector]]
+id = "P-IOU-001"
+domain = "protocol"
+class = "boundary"
+status = "executable"
+source = "rust/crates/parity-harness/src/protocol/iou.rs"
+
+[[vector]]
+id = "P-ST-001"
+domain = "protocol"
+class = "guard"
+status = "executable"
+source = "rust/crates/parity-harness/src/protocol/vectors/stamount_cases.rs"
+
+[[vector]]
+id = "V-ROUTE-001"
+domain = "vault"
+class = "semantic"
+status = "executable"
+source = "rust/crates/parity-harness/src/vault/vault_wire.rs"
+
+[[vector]]
+id = "V-GUARD-001"
+domain = "vault"
+class = "guard"
+status = "executable"
+source = "rust/crates/parity-harness/src/vault/vault_wire.rs"
+
+[[vector]]
+id = "L-ROUTE-001"
+domain = "lending"
+class = "semantic"
+status = "executable"
+source = "rust/crates/parity-harness/src/lending/"
+
+[[vector]]
+id = "L-REG-001"
+domain = "lending"
+class = "regression"
+status = "executable"
+source = "rust/tests/lending/"
+
+[[vector]]
+id = "LWAB-MAL-001"
+domain = "lending"
+class = "malformed-codec"
+status = "executable-codec-only"
+source = "rust/crates/parity-harness/src/lending/vectors/lending_malformed.rs"
